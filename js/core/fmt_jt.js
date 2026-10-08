@@ -1,0 +1,45 @@
+// JT (ISO 14306) container reader: file header, table of contents and segment headers.
+//
+// Read:   the 80-byte version string, the byte order, the TOC (segment id, offset, length, type) of JT 8, 9 and 10 files and
+//         the header of every segment (its id, type and length are checked against the TOC; the zlib flag of the segment
+//         types that may be compressed is reported). jtSummary() describes what a file holds.
+// Not read: the geometry. Shape LOD segments keep their triangle strips in the JT codecs (bit-length, Huffman and
+//         arithmetic coded index streams with predictors, quantised or topologically compressed vertex data, Deering
+//         normals), B-rep segments in the JT B-rep or Parasolid XT form; none of these is decoded, so parseJT() always
+//         ends in an error that says what the file contains and how to export it.
+// File content is untrusted: offsets and counts are bounds-checked and the TOC size is capped.
+
+function fail(msg) { const e = new Error(msg); e.user = true; throw e; }
+const SEG = { 1: 'logical scene graph', 2: 'JT B-rep', 3: 'PMI data', 4: 'meta data', 6: 'shape', 7: 'shape LOD 0', 8: 'shape LOD 1', 9: 'shape LOD 2', 10: 'shape LOD 3', 11: 'shape LOD 4', 12: 'shape LOD 5', 13: 'shape LOD 6', 14: 'shape LOD 7', 15: 'shape LOD 8', 16: 'shape LOD 9', 17: 'XT B-rep', 18: 'wireframe', 20: 'ULP', 24: 'LWPA' };
+const hex = (u8, p) => Array.from(u8.subarray(p, p + 16), (b) => b.toString(16).padStart(2, '0')).join('');
+
+export const isJT = (u8) => u8.length > 100 && /^Version \d+\.\d+/.test(String.fromCharCode(...u8.subarray(0, 16)));
+
+/**
+ * Describe a JT file: { version, major, minor, littleEndian, segments: [{ id, type, typeName, offset, length, compressed? }],
+ * counts: { typeName: n }, shapes (number of shape LOD-0 segments), lods, brep: 'JT B-rep' | 'XT B-rep' | null }.
+ */
+export function jtSummary(u8) {
+  if (!isJT(u8)) fail('Not a JT file (the "Version n.n JT" header is missing).');
+  const N = u8.length, dv = new DataView(u8.buffer, u8.byteOffset, N), m = /^Version (\d+)\.(\d+)/.exec(String.fromCharCode(...u8.subarray(0, 80))), major = +m[1], minor = +m[2], le = u8[80] === 0, wide = major >= 10;
+  if (major < 7 || major > 12) fail(`JT version ${major}.${minor} is not known to this reader.`);
+  const u32 = (p) => dv.getUint32(p, le), toc = wide ? u32(le ? 85 : 89) + u32(le ? 89 : 85) * 4294967296 : u32(85), esz = wide ? 32 : 28;
+  if (!(toc >= 85 && toc + 4 <= N)) fail('The JT file is truncated or corrupt (table of contents).');
+  const n = dv.getInt32(toc, le), segments = [], counts = {};
+  if (!(n >= 0 && n <= 2e6) || toc + 4 + n * esz > N) fail('The JT file is truncated or corrupt (table of contents).');
+  for (let k = 0; k < n; k++) {
+    const e = toc + 4 + k * esz, offset = wide ? u32(e + (le ? 16 : 20)) + u32(e + (le ? 20 : 16)) * 4294967296 : u32(e + 16), length = u32(e + esz - 8), type = u32(e + esz - 4) >>> 24, typeName = SEG[type] || `type ${type}`, s = { id: hex(u8, e), type, typeName, offset, length };
+    // segment header: id, type, length, then for the compressible types a zlib flag
+    s.valid = offset + 24 <= N && hex(u8, offset) === s.id && u32(offset + 16) === type && u32(offset + 20) === length;
+    if (s.valid && offset + 33 <= N && [1, 2, 3, 4, 17, 18, 20, 24].includes(type)) s.compressed = u32(offset + 24) === 2 && major < 10 ? true : major >= 10 ? u32(offset + 24) >= 2 : false;
+    counts[typeName] = (counts[typeName] || 0) + 1;
+    segments.push(s);
+  }
+  return { version: `${major}.${minor}`, major, minor, littleEndian: le, segments, counts, shapes: counts['shape LOD 0'] || counts.shape || 0, lods: Object.keys(counts).filter((k) => /^shape LOD/.test(k)).length, brep: counts['XT B-rep'] ? 'XT B-rep' : counts['JT B-rep'] ? 'JT B-rep' : null };
+}
+
+/** Always fails: says what the JT file holds and why its geometry is not read. */
+export function parseJT(u8) {
+  const s = jtSummary(u8), parts = Object.entries(s.counts).map(([k, v]) => `${v} × ${k}`).join(', ');
+  return fail(`This JT ${s.version} file holds ${s.segments.length} segments (${parts || 'none'}). Its tessellation is stored in the JT ${s.major >= 9 ? 'topological mesh' : 'vertex-shape'} codecs (bit-length, Huffman and arithmetic coded streams, quantised vertices)${s.brep ? ` and its exact shape as ${s.brep}` : ''}, which are not decoded. Export the model as STEP AP242 or STL from NX, Teamcenter Visualization or the authoring CAD package.`);
+}

@@ -241,3 +241,11 @@ covered by `js/core/bridge.js`: it writes ready-to-run case files for open solve
 reads their results back. `bridge.js` exports `HANDOFF = { <suite id>: [{ match: 'lower-case fragment of the catalogue item',
 solver: 'OpenFOAM interFoam', generator: 'openfoamVof' }] }`; the Equations tab shows those items as “via external solver”
 — a third state between “solved in-app” and “reference”. Suites must not tick such items as implemented.
+
+### Further site fields (sourced, each with a `…Date`/`…Year` and `…Source` companion)
+
+`corporateTaxRate` (%), `taxRate` (% headline tax on upstream profit, with `taxRateBasis`), `fiscalRegime`, `royaltyRate`,
+`petroleumTaxRate`, `marginalTake` (%), `costIndex` (with `costIndexBase`, `costIndexSeries { t, v }`), `costEscalation` (%/y),
+`steelIndex`, `steelPrice` (US$/t iron ore), `usCpi`, `usInflation5y` (%/y), `gasPriceEurope`, `gasPriceAsia`,
+`gasPriceRegional` (US$/MMBtu), `bondYield`, `treasuryBillYield`, `policyRate` (%/y), `electricityPriceSource`.
+`site.countryCode` (ISO 3166-1 alpha-2) and `site.country` sit beside `site.data`.

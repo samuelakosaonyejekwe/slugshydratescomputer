@@ -1,17 +1,22 @@
 // Suite 1 — Fluid, PVT & Phase Behaviour.
 // Builds on the shared cubic-EOS kernel (core/thermo.js) and adds: alternative C7+ critical-property correlations and tuning,
 // PH / PS / TV flashes, saturation points and a traced phase envelope with quality lines, the standard PVT-laboratory
-// experiments (CCE, DLE, CVD, separator test, swelling), derived properties (speed of sound, compressibility, alternative
-// viscosity / conductivity / Z-factor models, black-oil correlations), aqueous-phase activity models (NRTL, UNIQUAC, Wilson,
-// Debye–Hückel family, Pitzer), Henry's-law gas solubility, the van der Waals–Platteeuw hydrate model, ideal-solution wax
-// precipitation and asphaltene screening. Units at the interface: bara, °C, mol %; SI inside.
+// experiments (CCE, DLE, CVD, separator test, swelling, multiple-contact miscibility), derived properties (speed of sound,
+// compressibility, black-oil correlations), residual-Helmholtz equations of state beside the cubic one (GERG-2008, PC-SAFT,
+// cubic-plus-association, Lee–Kesler modified BWR), Lohrenz–Bray–Clark and Pedersen corresponding-states viscosity, aqueous-phase
+// activity models (NRTL, UNIQUAC, Wilson, Debye–Hückel family, Pitzer), Henry's-law gas solubility, the van der Waals–Platteeuw
+// hydrate model (Munck constants or Kihara cell potential; structures I, II and H) with the water-side Gibbs minimum, ideal-solution
+// wax precipitation, Flory–Huggins asphaltene equilibrium and asphaltene screening. Every literature constant set is listed in
+// PROVENANCE with the source it was checked against; the sourced reference data sets live in ../data/ref/pvt.js.
+// Units at the interface: bara, °C, mol %; SI inside.
 import { brent, clamp, linspace, logspace, interp1, isNum, solveLinear } from '../core/num.js';
 import {
-  R, P_STD, T_STD, VM_STD, MW_AIR, COMP_IDS, COMP_LABELS, INHIBITORS, EOS, DEFAULT_FLUID, makeFluid, eosPhase, rachfordRice, stability, flashPT,
-  phaseProps, props, saturationP, stdFlash, streams, aqueous, waterContent, hydrateDepression, inhibitorFor, hydrateT0, pseudoProps, buildTable, lookup,
+  R, P_STD, T_STD, VM_STD, MW_AIR, COMPONENTS, COMP_IDS, COMP_LABELS, INHIBITORS, EOS, DEFAULT_FLUID, makeFluid, eosPhase, rachfordRice, stability, flashPT,
+  phaseProps, props, interfacialTension, saturationP, stdFlash, streams, aqueous, waterProps, waterContent, hydrateDepression, inhibitorFor, hydrateT0, pseudoProps, buildTable, lookup,
 } from '../core/thermo.js';
 import { psat as psatWater, density as rhoBrine } from '../core/props.js';
 import { BASE } from '../data/basecase.js';
+import { SOURCES, GERG, NIST_ISO, NIST_SAT, HYDRATE_DATA, NACL_25C, MEOH_FREEZING, C1_WATER_VLE, C1_MEOH_VLE, C1_MEOH_WATER_VLE, C1_SOLUBILITY } from '../data/ref/pvt.js';
 
 const KEL = 273.15, ATM = 1.01325, MW_W = 18.015, MW_NACL = 58.443, G0 = 9.80665;
 const sumA = (a) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s; };
@@ -219,7 +224,9 @@ function dewStart(f, beta, Pfloor, td = dewT(f, Pfloor, { Tmax: 900 })) {
     if (g(lo) < 0) return null;
     try { t = brent(g, lo, td - 0.5, 1e-6, 60); } catch { return null; }
   }
-  const fl = flashPT(f, Pfloor, t);
+  // the flash can miss a vanishing liquid fraction just inside the dew point: step further in until it resolves two phases
+  let fl = flashPT(f, Pfloor, t);
+  for (const dt of [2, 5, 10, 20]) { if (fl.phase === 'two' || beta > 0) break; t = td - dt; fl = flashPT(f, Pfloor, t); }
   if (fl.phase !== 'two') return null;
   return [...fl.K.map((k) => -Math.log(k)), Math.log(t + KEL), Math.log(Pfloor)];
 }
@@ -327,8 +334,11 @@ export const bubbleP = (f, Tc, o) => { const s = saturationPoint(f, Tc, o); retu
 export const dewP = (f, Tc, o) => { const s = saturationPoint(f, Tc, o); return s.P !== null && s.type === 'dew' ? s.P : null; };
 /** Highest temperature (°C) at which the feed is two-phase at P (bara) — the dew-point temperature — or null (bisection on the flash). */
 export function dewT(f, Pbar, { Tmin = -80, Tmax = 750, tol = 0.01 } = {}) {
-  let a = null, b = null;
-  for (let t = Tmax; t >= Tmin; t -= 25) { if (isTwo(f, Pbar, t)) { a = t; break; } b = t; }
+  let a = null, b = null, top = Tmax;
+  // start the downward search a little above the Wilson dew temperature (Σ z/K = 1) instead of at Tmax: far fewer single-phase flashes
+  { const g = (t) => { let q = 0; for (let i = 0; i < f.n; i++) { const c = f.comps[i]; q += (f.z[i] * Pbar) / (c.Pc * Math.exp(5.373 * (1 + c.w) * (1 - c.Tc / (t + KEL)))); } return q - 1; };
+    if (g(Tmin) > 0 && g(Tmax) < 0) { let t0 = Math.min(Tmax, Tmin + 25 * Math.ceil((brent(g, Tmin, Tmax, 1e-3, 60) + 60 - Tmin) / 25)); while (t0 < Tmax && isTwo(f, Pbar, t0)) t0 = Math.min(Tmax, t0 + 50); top = t0; } }
+  for (let t = top; t >= Tmin; t -= 25) { if (isTwo(f, Pbar, t)) { a = t; break; } b = t; }
   if (a === null || b === null) return null;
   while (b - a > tol) { const m = 0.5 * (a + b); if (isTwo(f, Pbar, m)) a = m; else b = m; }
   return 0.5 * (a + b);
@@ -393,20 +403,18 @@ export function derivedProps(f, x, Pbar, Tc, kind) {
 }
 const LK0 = [0.1181193, 0.265728, 0.15479, 0.030323, 0.0236744, 0.0186984, 0, 0.042724, 0.155488e-4, 0.623689e-4, 0.65392, 0.060167];
 const LKR = [0.2026579, 0.331511, 0.027655, 0.203488, 0.0313385, 0.0503618, 0.016901, 0.041577, 0.48736e-4, 0.0740336e-4, 1.226, 0.03754];
-function lkZ(c, Tr, Pr) { // vapour-like root of the Lee–Kesler modified BWR equation
+function lkVr(c, Tr, Pr, liquid = false) { // reduced volume Vr = Pc·V/(R·Tc) of the Lee–Kesler modified BWR equation (vapour-like root unless liquid)
   const B = c[0] - c[1] / Tr - c[2] / Tr ** 2 - c[3] / Tr ** 3, C = c[4] - c[5] / Tr + c[6] / Tr ** 3, D = c[8] + c[9] / Tr;
   const Z = (V) => 1 + B / V + C / V ** 2 + D / V ** 5 + (c[7] / (Tr ** 3 * V * V)) * (c[10] + c[11] / (V * V)) * Math.exp(-c[11] / (V * V));
   const g = (lv) => { const V = Math.exp(lv); return Z(V) - (Pr * V) / Tr; };
+  if (liquid) { let lo = Math.log(0.04), glo = g(lo); for (let k = 0; k < 400; k++) { const hi = lo + 0.02, ghi = g(hi); if (glo * ghi <= 0 && glo > 0) return Math.exp(brent(g, lo, hi, 1e-13)); lo = hi; glo = ghi; } return null; }
   // scan from the ideal-gas side towards small volumes for the first sign change
   let hi = Math.log((Tr / Pr) * 3), ghi = g(hi);
-  for (let k = 0; k < 400; k++) { const lo = hi - 0.02, glo = g(lo); if (glo * ghi <= 0) { const lv = brent(g, lo, hi, 1e-13); return Z(Math.exp(lv)); } hi = lo; ghi = glo; }
+  for (let k = 0; k < 400; k++) { const lo = hi - 0.02, glo = g(lo); if (glo * ghi <= 0) return Math.exp(brent(g, lo, hi, 1e-13)); hi = lo; ghi = glo; }
   return null;
 }
 /** Lee–Kesler (1975) corresponding-states compressibility factor (vapour-like root) at reduced T, P and acentric factor w. */
-export function leeKeslerZ(Tr, Pr, w = 0) {
-  const z0 = lkZ(LK0, Tr, Pr), zr = lkZ(LKR, Tr, Pr);
-  return z0 === null || zr === null ? null : z0 + (w / 0.3978) * (zr - z0);
-}
+export function leeKeslerZ(Tr, Pr, w = 0) { const r = leeKesler(Tr, Pr, w); return r ? r.Z : null; }
 const kay = (f, x) => { let Tc = 0, Pc = 0, w = 0, M = 0, Vc = 0, Zc = 0; for (let i = 0; i < f.n; i++) { const c = f.comps[i]; Tc += x[i] * c.Tc; Pc += x[i] * c.Pc; w += x[i] * c.w; M += x[i] * c.MW; Vc += x[i] * c.Vc; Zc += x[i] * (0.2905 - 0.085 * c.w); } return { Tc, Pc, w, M, Vc, Zc }; };
 /** Lee–Gonzalez–Eakin gas viscosity (Pa·s) from molar mass (g/mol), density (kg/m³) and T (K). */
 export function viscosityLGE(M, rho, TK) {
@@ -585,7 +593,10 @@ export function debyeHuckel(TK) {
   const Aphi = (Math.sqrt(2 * Math.PI * NA * rho) * lB ** 1.5) / 3;
   return { Aphi, A: (3 * Aphi) / Math.LN10, B: Math.sqrt((2 * e * e * NA * rho) / (e0 * eps * kB * TK)) * 1e-10, eps };
 }
-const pitzerNaCl = (TK) => { const d = TK - 298.15; return { b0: 0.0765 + 7.159e-4 * d, b1: 0.2664 + 7.005e-4 * d, c: 0.00127 - 1.054e-4 * d }; };
+// Pitzer parameters of Na+–Cl-: β0, β1 and Cφ with the temperature function of the USGS PHREEQC database pitzer.dat
+// (P = a0 + a1(1/T − 1/Tr) + a2 ln(T/Tr) + a3(T − Tr) + a4(T² − Tr²) + a5(1/T² − 1/Tr²), Tr = 298.15 K), read 2026-10-08.
+export const PITZER_NACL = Object.freeze({ b0: [7.534e-2, 9598.4, 35.48, -5.8731e-2, 1.798e-5, -5e5], b1: [0.2769, 1.377e4, 46.8, -6.9512e-2, 2e-5, -7.4823e5], c: [1.48e-3, -120.5, -0.2081, 0, 1.166e-7, 11121] });
+const pitzerNaCl = (TK) => { const Tr = 298.15, f = (a) => a[0] + a[1] * (1 / TK - 1 / Tr) + a[2] * Math.log(TK / Tr) + a[3] * (TK - Tr) + a[4] * (TK * TK - Tr * Tr) + a[5] * (1 / (TK * TK) - 1 / (Tr * Tr)); return { b0: f(PITZER_NACL.b0), b1: f(PITZER_NACL.b1), c: f(PITZER_NACL.c) }; };
 /** Mean ionic activity coefficient of aqueous NaCl at molality m. model: 'dh' | 'edh' | 'davies' | 'pitzer'. */
 export function gammaNaCl(model, m, TK = 298.15) {
   if (!(m > 0)) return 1;
@@ -613,11 +624,12 @@ export const waterActivityNaCl = (model, m, TK = 298.15) => (m > 0 ? Math.exp(-2
  * aqueous phase). The electrolyte and inhibitor contributions are multiplied (ln a_w additive), the salt molality being referred
  * to the water of the brine. Returns { aw, awSalt, awInh, xw, x1, molality, gammaW }.
  */
-export function waterActivity({ S = 0, inhId = 'none', inhWt = 0 }, TK, { act = 'NRTL', elec = 'pitzer' } = {}) {
-  const s = clamp(S, 0, 260) / 1000, m = s > 0 ? (s / (MW_NACL * 1e-3)) / (1 - s) : 0, awSalt = waterActivityNaCl(elec, m, TK);
+export function waterActivity({ S = 0, inhId = 'none', inhWt = 0 }, TK, { act = 'NRTL', elec = 'pitzer' } = {}, tune = null) {
+  const s = clamp(S, 0, 260) / 1000, m = s > 0 ? (s / (MW_NACL * 1e-3)) / (1 - s) : 0, awSalt = waterActivityNaCl(elec, m, TK) ** (tune?.salt ?? 1);
   const w = inhId && inhId !== 'none' ? clamp(inhWt, 0, 95) / 100 : 0, mwI = (INHIBITORS[inhId] || INHIBITORS.none).MW;
   // salt-free mole fraction of inhibitor: w kg inhibitor with (1 - w)(1 - s) kg water
-  const nI = w / mwI, nW = ((1 - w) * (1 - s)) / MW_W, x1 = nI + nW > 0 ? nI / (nI + nW) : 0, a = activityBinary(act, inhId, x1, TK);
+  const nI = w / mwI, nW = ((1 - w) * (1 - s)) / MW_W, x1 = nI + nW > 0 ? nI / (nI + nW) : 0, a0 = activityBinary(act, inhId, x1, TK);
+  const a = tune && tune.act !== undefined && tune.act !== 1 && !a0.ideal ? { ...a0, g2: a0.g2 ** tune.act, aw: (1 - x1) * a0.g2 ** tune.act } : a0; // calibration multiplier on ln γ of water
   return { aw: awSalt * a.aw, awSalt, awInh: a.aw, xw: 1 - x1, x1, molality: m, gammaW: a.g2, idealInh: w > 0 && a.ideal && act !== 'ideal' };
 }
 
@@ -647,10 +659,11 @@ export function waterContentRaoult(Pbar, Tc, aw = 1) {
 // ---- gas hydrates: van der Waals–Platteeuw ---------------------------------------------------------------------------------
 // Langmuir constants C = (A/T) exp(B/T) in 1/atm, [A (K/atm), B (K)] for the small and large cavities of structures I and II,
 // and reference properties of the empty lattice relative to water — the parameter set of Munck, Skjold-Jørgensen & Rasmussen (1988).
-const T0H = 273.15;
+const T0H = 273.15, SH_NU = [3 / 34, 2 / 34], SH_FIT = [528.66, -5623.6];
 export const HYDRATE_STRUCTURES = Object.freeze({
   sI: { nu: [1 / 23, 3 / 23], dmu0: 1264, dhL: -4858, dhI: 1151, dvL: 4.6e-6, dvI: 3.0e-6, waters: 23 },
   sII: { nu: [2 / 17, 1 / 17], dmu0: 883, dhL: -5201, dhI: 808, dvL: 5.0e-6, dvI: 3.4e-6, waters: 17 },
+  sH: { nu: SH_NU, dmu0: SH_FIT[0], dhL: SH_FIT[1], dhI: SH_FIT[1] + 6009.5, dvL: 3.77e-6, dvI: 2.14e-6, waters: 34 },
 });
 const DCP_L = -39.16; // J/mol/K, empty lattice minus liquid water
 export const LANGMUIR = Object.freeze({
@@ -664,14 +677,19 @@ export const LANGMUIR = Object.freeze({
   H2S: { sI: [[0.025e-3, 4568], [16.34e-3, 3737]], sII: [[0.0298e-3, 4878], [87.2e-3, 2633]] },
 });
 /** Langmuir constant (1/bar) of guest `id` in cavity m (0 small, 1 large) of structure s at T (K). */
-export const langmuirC = (id, s, m, TK, table = LANGMUIR) => { const c = table[id]?.[s]?.[m]; return c && c[0] > 0 ? ((c[0] / TK) * Math.exp(c[1] / TK)) / ATM : 0; };
+export const langmuirC = (id, s, m, TK, table = LANGMUIR) => {
+  if (table.kihara || s === 'sH') { const k = KIHARA.guests[id], cv = KIHARA.cav[s]?.[m]; if (k && cv) return s !== 'sH' || SH_HELP.includes(id) ? kiharaLangmuir(id, s, m, TK) : 0; if (s === 'sH') return 0; table = LANGMUIR; } // guests without a Kihara set keep the Munck constants
+  const c = table[id]?.[s]?.[m]; return c && c[0] > 0 ? ((c[0] / TK) * Math.exp(c[1] / TK)) / ATM : 0;
+};
+let HYD_ACTIVE = { table: null, sH: false }; // constants set and structure-H switch of the run in progress (null: Munck constants)
+const SH_HELP = ['C1', 'N2']; // small help gases admitted to the 5¹² and 4³5⁶6³ cavities of structure H
 /**
  * Chemical-potential differences of water (divided by RT) at T (K), P (bara) for hydrate structure s:
  * hydrate side Σ ν ln(1 + Σ C f) and water side (liquid with activity aw, or ice when that is the stable phase).
  * fug: { id: fugacity in bar }. Returns { dmuH, dmuW, ice, theta: [{ id: occupancy } small, large], drive = dmuH − dmuW (> 0: hydrate stable) }.
  */
 export function hydrateState(s, TK, Pbar, fug, aw = 1, table = LANGMUIR) {
-  const S = HYDRATE_STRUCTURES[s], theta = [{}, {}]; let dmuH = 0;
+  const S = table.ref?.[s] ? { ...HYDRATE_STRUCTURES[s], ...table.ref[s] } : HYDRATE_STRUCTURES[s], theta = [{}, {}], dcp = (s !== 'sH' && table.dcp) || [DCP_L, 0]; let dmuH = 0;
   for (let m = 0; m < 2; m++) {
     let sm = 0; const cf = {};
     for (const id in fug) { const v = langmuirC(id, s, m, TK, table) * fug[id]; if (v > 0) { cf[id] = v; sm += v; } }
@@ -679,7 +697,8 @@ export function hydrateState(s, TK, Pbar, fug, aw = 1, table = LANGMUIR) {
     dmuH += S.nu[m] * Math.log(1 + sm);
   }
   const P = Pbar * 1e5, Tm = 0.5 * (TK + T0H), base = S.dmu0 / (R * T0H), inv = 1 / T0H - 1 / TK;
-  const liq = base - (((S.dhL - DCP_L * T0H) / R) * inv + (DCP_L / R) * Math.log(TK / T0H)) + (S.dvL * P) / (R * Tm) - Math.log(Math.max(aw, 1e-6));
+  // ∫ Δh/(RT²) dT with Δcp = a + b(T − T0): Δh = Δh0 + a(T − T0) + b(T − T0)²/2
+  const liq = base - (((S.dhL - dcp[0] * T0H + (dcp[1] * T0H * T0H) / 2) / R) * inv + ((dcp[0] - dcp[1] * T0H) / R) * Math.log(TK / T0H) + (dcp[1] / (2 * R)) * (TK - T0H)) + (S.dvL * P) / (R * Tm) - Math.log(Math.max(aw, 1e-6));
   const ice = base - (S.dhI / R) * inv + (S.dvI * P) / (R * Tm);
   const dmuW = Math.max(liq, ice);
   return { dmuH, dmuW, ice: ice > liq, theta, drive: dmuH - dmuW };
@@ -700,12 +719,13 @@ const occupancy = (s, st) => {
  * T (K); the dissolved gas (Henry's law, salting-out at `molality`) lowers it further. The guest fugacities are re-flashed at the
  * solution until the temperature settles (`passes` = 1 keeps the fugacities of the guess temperature). Returns { T, structure, TsI, TsII, ice, occupancy, xGas, fug } or null.
  */
-export function hydrateTofP(f, Pbar, aw = 1, { Tmin = -45, Tmax = 50, table = LANGMUIR, molality = 0, solubility = true, guess = 10, passes = 10 } = {}) {
+export function hydrateTofP(f, Pbar, aw = 1, { Tmin = -45, Tmax = 50, table = HYD_ACTIVE.table || LANGMUIR, molality = 0, solubility = true, guess = 10, passes = 10, sH = HYD_ACTIVE.sH } = {}) {
+  const structs = sH ? ['sI', 'sII', 'sH'] : ['sI', 'sII'];
   const awAt = typeof aw === 'function' ? aw : () => aw;
   const awTot = (fug, t) => awAt(t + KEL) * (1 - (solubility ? gasSolubility(fug, Pbar, t, molality).total : 0));
   const solve = (fug) => {
     const res = {};
-    for (const s of ['sI', 'sII']) {
+    for (const s of structs) {
       const g = (t) => hydrateState(s, t + KEL, Pbar, fug, awTot(fug, t), table).drive;
       if (!(g(Tmin) > 0)) { res[s] = null; continue; }
       if (g(Tmax) > 0) { res[s] = Tmax; continue; }
@@ -717,28 +737,38 @@ export function hydrateTofP(f, Pbar, aw = 1, { Tmin = -45, Tmax = 50, table = LA
   for (let it = 0; it < passes; it++) {
     if (!Object.keys(fug).length) return null;
     res = solve(fug);
-    if (res.sI === null && res.sII === null) return null;
-    const Tn = Math.max(res.sI ?? -1e9, res.sII ?? -1e9), done = Math.abs(Tn - T) < 5e-3;
+    if (structs.every((k) => res[k] === null)) return null;
+    const Tn = Math.max(...structs.map((k) => res[k] ?? -1e9)), done = Math.abs(Tn - T) < 5e-3;
     T = it > 5 ? 0.5 * (T + Tn) : Tn;
     if (done || it === passes - 1) break;
     fug = formerFugacities(f, Pbar, T);
   }
-  const structure = (res.sII ?? -1e9) > (res.sI ?? -1e9) ? 'sII' : 'sI', st = hydrateState(structure, T + KEL, Pbar, fug, awTot(fug, T), table);
-  return { T, structure, TsI: res.sI, TsII: res.sII, ice: st.ice, occupancy: occupancy(structure, st), xGas: solubility ? gasSolubility(fug, Pbar, T, molality).total : 0, fug };
+  const structure = structs.reduce((b, k) => ((res[k] ?? -1e9) > (res[b] ?? -1e9) ? k : b), 'sI'), st = hydrateState(structure, T + KEL, Pbar, fug, awTot(fug, T), table);
+  return { T, structure, TsI: res.sI, TsII: res.sII, TsH: res.sH ?? null, ice: st.ice, occupancy: occupancy(structure, st), xGas: solubility ? gasSolubility(fug, Pbar, T, molality).total : 0, fug };
 }
 /** Lowest hydrate dissociation pressure (bara) at T (°C); null when no hydrate forms below Pmax. Returns { P, structure, occupancy }. */
-export function hydratePofT(f, Tc, aw = 1, { Pmin = 0.2, Pmax = 1500, table = LANGMUIR, molality = 0, solubility = true } = {}) {
-  const a = typeof aw === 'function' ? aw(Tc + KEL) : aw, TK = Tc + KEL;
-  const both = (P) => { const fug = formerFugacities(f, P, Tc), w = a * (1 - (solubility ? gasSolubility(fug, P, Tc, molality).total : 0)); return [hydrateState('sI', TK, P, fug, w, table), hydrateState('sII', TK, P, fug, w, table)]; };
-  const drive = (P) => { const [x, y] = both(P); return Math.max(x.drive, y.drive); };
+export function hydratePofT(f, Tc, aw = 1, { Pmin = 0.2, Pmax = 1500, table = HYD_ACTIVE.table || LANGMUIR, molality = 0, solubility = true, sH = HYD_ACTIVE.sH } = {}) {
+  const a = typeof aw === 'function' ? aw(Tc + KEL) : aw, TK = Tc + KEL, structs = sH ? ['sI', 'sII', 'sH'] : ['sI', 'sII'];
+  const both = (P) => { const fug = formerFugacities(f, P, Tc), w = a * (1 - (solubility ? gasSolubility(fug, P, Tc, molality).total : 0)); return structs.map((s) => hydrateState(s, TK, P, fug, w, table)); };
+  const drive = (P) => Math.max(...both(P).map((q) => q.drive));
   const grid = logspace(Pmin, Pmax, 36);
   if (drive(grid[0]) > 0) return { P: Pmin, structure: null, occupancy: null };
   let k = 1; while (k < grid.length && !(drive(grid[k]) > 0)) k++;
   if (k === grid.length) return null;
   let lo = Math.log(grid[k - 1]), hi = Math.log(grid[k]);
   for (let i = 0; i < 50 && hi - lo > 1e-6; i++) { const m = 0.5 * (lo + hi); if (drive(Math.exp(m)) > 0) hi = m; else lo = m; }
-  const P = Math.exp(0.5 * (lo + hi)), [sI, sII] = both(P), structure = sII.drive > sI.drive ? 'sII' : 'sI';
-  return { P, structure, occupancy: occupancy(structure, structure === 'sII' ? sII : sI) };
+  const P = Math.exp(0.5 * (lo + hi)), all = both(P), ib = all.reduce((b, q, k) => (q.drive > all[b].drive ? k : b), 0), structure = structs[ib];
+  return { P, structure, occupancy: occupancy(structure, all[ib]) };
+}
+/**
+ * Freezing point (°C) of an aqueous phase { S, inhId, inhWt }: temperature at which the water activity of the solution equals that of ice
+ * (enthalpy of fusion and heat-capacity difference as implied by the liquid and ice reference properties of the hydrate model). Null below −60 °C.
+ */
+export function freezingPoint(aq, models = {}, tune = null) {
+  const S = HYDRATE_STRUCTURES.sI, lnIce = (T) => ((S.dhI - S.dhL + DCP_L * T0H) / R) * (1 / T0H - 1 / T) - (DCP_L / R) * Math.log(T / T0H);
+  const g = (T) => lnIce(T) - Math.log(waterActivity(aq, T, models, tune).aw);
+  if (!(g(T0H) > 0)) return 0; if (g(213.15) > 0) return null;
+  return brent(g, 213.15, T0H, 1e-8, 80) - KEL;
 }
 /** Hammerschmidt hydrate depression (°C) of w wt % inhibitor. */
 export const hammerschmidt = (w, inhId) => { const i = INHIBITORS[inhId]; return i && w > 0 && w < 100 ? (i.K * w) / (i.MW * (100 - w)) : 0; };
@@ -779,6 +809,373 @@ export function asphalteneScreen({ rhoRes, pRes, pBub, sara }) {
   const s = sara || {}, den = (+s.aro || 0) + (+s.res || 0), cii = den > 0 ? ((+s.sat || 0) + (+s.asp || 0)) / den : null, ciiClass = cii === null ? 'unknown' : cii >= 0.9 ? 'unstable' : cii >= 0.7 ? 'uncertain' : 'stable';
   const score = (deBoer === 'severe' ? 2 : deBoer === 'slight' ? 1 : 0) + (ciiClass === 'unstable' ? 2 : ciiClass === 'uncertain' ? 1 : 0);
   return { deBoer, dP, limitSlight, limitSevere, cii, ciiClass, risk: score >= 3 ? 'high' : score >= 1 ? 'medium' : 'low' };
+}
+
+// ---- residual-Helmholtz equations of state: GERG-2008, PC-SAFT, cubic-plus-association ------------------------------------
+// A Helmholtz model is { ids, n, M[] (g/mol), crit[] ({ Tc, Pc, w }), rhoMax(x), ar(T, rho, x) } where ar is the residual Helmholtz
+// energy per mole divided by RT at temperature T (K), molar density rho (mol/m³) and mole fractions x. Every property follows
+// from ar and its derivatives (taken numerically here): Z = 1 + ρ ∂ar/∂ρ, ln φ_i = ∂(n ar)/∂n_i − ln Z, h_res = RT(Z − 1 − T ∂ar/∂T).
+const N_AV = 6.02214076e23;
+const d1 = (g, x, h) => (g(x - 2 * h) - 8 * g(x - h) + 8 * g(x + h) - g(x + 2 * h)) / (12 * h); // fourth-order central difference
+/** Compressibility factor of a Helmholtz model at T (K), rho (mol/m³), composition x. */
+export const hZ = (m, T, rho, x) => 1 + rho * d1((r) => m.ar(T, r, x), rho, rho * 2e-4);
+const hP = (m, T, rho, x) => rho * R * T * hZ(m, T, rho, x); // Pa
+/**
+ * Molar density (mol/m³) of a Helmholtz model at T (K), P (bara). kind 'vapour' walks up from the ideal gas, 'liquid' walks down
+ * from the close-packed side; each returns null when that branch does not reach the pressure with (∂P/∂ρ)T > 0. 'stable' takes the
+ * root of lower Gibbs energy.
+ */
+function hRoot(m, T, Pbar, x, branch) { // strict branch root: 'vapour' from the ideal-gas side, 'liquid' from the dense side
+  const P = Pbar * 1e5, top = m.rhoMax(x), g = (r) => hP(m, T, r, x) - P;
+  const walk = (r0, fac) => {
+    let a = r0, ga = g(a);
+    for (let k = 0; k < 500; k++) {
+      const b = a * fac; if (b > top || b < 1e-9) return null;
+      const gb = g(b);
+      if (!Number.isFinite(gb) || (gb - ga) * (b - a) <= 0) return null; // mechanical stability lost: this branch ends here
+      if (ga * gb <= 0) return brent(g, Math.min(a, b), Math.max(a, b), 1e-13 * b, 80);
+      a = b; ga = gb;
+    }
+    return null;
+  };
+  if (branch === 'vapour') return walk(Math.min((P / (R * T)) * 0.25, top * 0.02), 1.12);
+  let r0 = top, g0 = g(r0); for (let k = 0; k < 80 && !(g0 > 0 && Number.isFinite(g0)); k++) { r0 *= 0.97; g0 = g(r0); }
+  return g0 > 0 ? walk(r0, 0.975) : null;
+}
+export function hRho(m, T, Pbar, x, kind = 'stable') {
+  if (kind === 'vapour') return hRoot(m, T, Pbar, x, 'vapour') ?? hRoot(m, T, Pbar, x, 'liquid');
+  if (kind === 'liquid') return hRoot(m, T, Pbar, x, 'liquid') ?? hRoot(m, T, Pbar, x, 'vapour');
+  const v = hRoot(m, T, Pbar, x, 'vapour'), l = hRoot(m, T, Pbar, x, 'liquid');
+  if (v === null || l === null || Math.abs(v / l - 1) < 1e-6) return v ?? l;
+  const gib = (r) => { const Z = (Pbar * 1e5) / (r * R * T); return m.ar(T, r, x) + Z - 1 - Math.log(Z); };
+  return gib(l) < gib(v) ? l : v;
+}
+/** Fugacity coefficients (natural log) of a Helmholtz model at T, rho, x. */
+export function hLnPhi(m, T, rho, x, only = null) { // only: optional list of component indices (the others are returned as NaN)
+  const lnZ = Math.log(hZ(m, T, rho, x)), out = new Array(m.n).fill(NaN), e = 1e-4;
+  const F = (i, d) => { const N = 1 + d, xx = x.map((v, k) => (v + (k === i ? d : 0)) / N); return N * m.ar(T, rho * N, xx); }; // n·ar at constant T and V
+  for (let i = 0; i < m.n; i++) if (!only || only.includes(i)) out[i] = (x[i] > 2 * e ? d1((d) => F(i, d), 0, e) : (F(i, 2 * e) * -1 + 4 * F(i, e) - 3 * F(i, 0)) / (2 * e)) - lnZ;
+  return out;
+}
+/**
+ * Thermal and volumetric properties of a Helmholtz model at T, rho, x: { Z, P (bara), hRes (J/mol), cvRes (J/mol/K), dPdrho, dPdT }
+ * and, when the ideal-gas heat capacity cp0 (J/mol/K) is given, cv, cp (J/mol/K), speed of sound w (m/s) and Joule–Thomson coefficient jt (K/bar).
+ */
+export function hProps(m, T, rho, x, cp0 = null) {
+  const hT = T * 1e-3, a = (t) => m.ar(t, rho, x), a0 = a(T), aT = d1(a, T, hT), aTT = (-a(T - 2 * hT) + 16 * a(T - hT) - 30 * a0 + 16 * a(T + hT) - a(T + 2 * hT)) / (12 * hT * hT);
+  const Z = hZ(m, T, rho, x), dPdrho = d1((r) => hP(m, T, r, x), rho, rho * 2e-4), dPdT = d1((t) => hP(m, t, rho, x), T, hT);
+  let M = 0; for (let i = 0; i < m.n; i++) M += x[i] * m.M[i];
+  const o = { Z, P: (rho * R * T * Z) / 1e5, rho, rhoMass: rho * M * 1e-3, M, hRes: R * T * (Z - 1 - T * aT), cvRes: -R * (2 * T * aT + T * T * aTT), dPdrho, dPdT };
+  if (cp0 !== null) { o.cv = cp0 - R + o.cvRes; o.cp = o.cv + (T * dPdT * dPdT) / (rho * rho * dPdrho); o.w = Math.sqrt(Math.max(((o.cp / o.cv) * dPdrho) / (M * 1e-3), 0)); o.jt = (((T * dPdT) / (rho * rho * dPdrho) - 1 / rho) / o.cp) * 1e5; }
+  return o;
+}
+/** Vapour pressure (bara) of pure component i of a Helmholtz model at T (K) by equal fugacity; { P, rhoL, rhoV } or null. */
+export function hPsat(m, T, i = 0) {
+  const c = m.crit[i], x = m.ids.map((_, k) => (k === i ? 1 : 0));
+  if (!(T < c.Tc)) return null;
+  let P = c.Pc * Math.exp(5.373 * (1 + c.w) * (1 - c.Tc / T)), rl = null, rv = null;
+  for (let it = 0; it < 120; it++) {
+    rl = hRoot(m, T, P, x, 'liquid'); rv = hRoot(m, T, P, x, 'vapour');
+    if (rl === null) { P *= 1.06; continue; } // below the liquid spinodal pressure
+    if (rv === null) { P *= 0.94; continue; } // above the vapour spinodal pressure
+    if (rl / rv < 1.0005) return null;
+    const k = Math.exp(hLnPhi(m, T, rl, x)[i] - hLnPhi(m, T, rv, x)[i]); // φL/φV → 1 at saturation
+    P *= k; if (Math.abs(k - 1) < 1e-9) return { P, rhoL: rl, rhoV: rv };
+  }
+  return null;
+}
+/** Two-phase PT flash of a Helmholtz model by successive substitution from Wilson K-values: { phase, beta, x, y, rhoL, rhoV, K }. */
+export function hFlash(m, T, Pbar, z, K0 = null) {
+  let K = K0 || m.crit.map((c) => (c.Pc / Pbar) * Math.exp(5.373 * (1 + c.w) * (1 - c.Tc / T))), beta = 0.5, x = z, y = z, rl = null, rv = null;
+  const single = () => { const r = hRho(m, T, Pbar, z, 'stable'), liq = r / m.rhoMax(z) > 0.3; return { phase: liq ? 'liquid' : 'gas', beta: liq ? 0 : 1, x: z.slice(), y: z.slice(), rhoL: r, rhoV: r, K: z.map(() => 1) }; };
+  for (let it = 0; it < 300; it++) {
+    beta = rachfordRice(z, K);
+    if (beta <= 0 || beta >= 1) { const sK = z.reduce((s, v, i) => s + v * K[i], 0), sI = z.reduce((s, v, i) => s + v / K[i], 0); if (sK <= 1 || sI <= 1) return single(); }
+    x = z.map((v, i) => v / (1 + beta * (K[i] - 1))); y = x.map((v, i) => v * K[i]);
+    const sx = sumA(x), sy = sumA(y); x = x.map((v) => v / sx); y = y.map((v) => v / sy);
+    rl = hRoot(m, T, Pbar, x, 'liquid'); rv = hRoot(m, T, Pbar, y, 'vapour');
+    if (rl === null || rv === null) return single();
+    const pl = hLnPhi(m, T, rl, x), pvp = hLnPhi(m, T, rv, y); let err = 0, tr = 0;
+    for (let i = 0; i < m.n; i++) { const Kn = Math.exp(pl[i] - pvp[i]); err += (Kn / K[i] - 1) ** 2; K[i] = Kn; tr += Math.log(Kn) ** 2; }
+    if (tr < 1e-8) return single();
+    if (err < 1e-14) break;
+  }
+  return beta > 1e-10 && beta < 1 - 1e-10 ? { phase: 'two', beta, x, y, rhoL: rl, rhoV: rv, K } : single();
+}
+
+// GERG-2008 (Kunz & Wagner 2012) for the natural-gas components of the kernel; coefficients in ../data/ref/pvt.js (from NIST teqp).
+const GERG_KEY = { C7: 'C6' };
+/** GERG-2008 Helmholtz model for kernel component ids (subset of N2, CO2, H2S, C1 … C6); null when a component is not covered. */
+export function gergModel(ids) {
+  const gi = ids.map((id) => GERG.ids.indexOf(id)); if (gi.some((k) => k < 0)) return null;
+  const n = ids.length, P = gi.map((k) => GERG.pure[k]), Tc = P.map((p) => p.Tc), vc = P.map((p) => 1 / p.rhoc), pairs = [];
+  for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) {
+    const [i, j] = gi[a] < gi[b] ? [a, b] : [b, a], q = GERG.pairs[`${ids[i]}-${ids[j]}`]; // i is the component that comes first in the GERG order
+    pairs.push({ i, j, bT2: q[0] * q[0], YT: q[0] * q[1] * Math.sqrt(Tc[i] * Tc[j]), bV2: q[2] * q[2], Yv: (q[2] * q[3] * (Math.cbrt(vc[i]) + Math.cbrt(vc[j])) ** 3) / 8, F: q[4] || 0, dep: q[4] ? GERG.dep[q[5]] : null });
+  }
+  const pure = (p, tau, delta) => { const f = GERG.forms[p.form], lt = Math.log(tau), ld = Math.log(delta); let s = 0; for (let k = 0; k < p.n.length; k++) s += p.n[k] * Math.exp(f.t[k] * lt + f.d[k] * ld - (f.c[k] ? delta ** f.l[k] : 0)); return s; };
+  const depf = (d, tau, delta) => { const lt = Math.log(tau), ld = Math.log(delta); let s = 0; for (let k = 0; k < d.n.length; k++) s += d.n[k] * Math.exp(d.t[k] * lt + d.d[k] * ld - d.eta[k] * (delta - d.epsilon[k]) ** 2 - d.beta[k] * (delta - d.gamma[k])); return s; };
+  const reduce = (x) => { let Tr = 0, vr = 0; for (let i = 0; i < n; i++) { Tr += x[i] * x[i] * Tc[i]; vr += x[i] * x[i] * vc[i]; } for (const p of pairs) { const xi = x[p.i], xj = x[p.j]; if (!(xi > 0 && xj > 0)) continue; const c = 2 * xi * xj * (xi + xj); Tr += (c / (p.bT2 * xi + xj)) * p.YT; vr += (c / (p.bV2 * xi + xj)) * p.Yv; } return { Tr, vr }; };
+  return {
+    name: 'GERG-2008', ids, n, M: P.map((p) => p.M), crit: ids.map((id) => COMPONENTS[id]), reduce,
+    rhoMax: (x) => 3.9 / reduce(x).vr,
+    ar(T, rho, x) { const { Tr, vr } = reduce(x), tau = Tr / T, delta = rho * vr; let s = 0; for (let i = 0; i < n; i++) if (x[i] > 0) s += x[i] * pure(P[i], tau, delta); for (const p of pairs) if (p.F && x[p.i] > 0 && x[p.j] > 0) s += x[p.i] * x[p.j] * p.F * depf(p.dep, tau, delta); return s; },
+  };
+}
+
+// PC-SAFT (Gross & Sadowski 2001): hard-chain reference plus dispersion with the universal constants a, b of the original paper.
+// Pure-component segment number m, segment diameter σ (Å) and energy ε/k (K): Gross & Sadowski (2001), H2S from Tihic et al. (2006),
+// as tabulated in the open Clapeyron.jl database (PCSAFT_like.csv); binary k_ij from the same database (PCSAFT_unlike.csv).
+const PCS_A = [[0.9105631445, 0.6361281449, 2.6861347891, -26.547362491, 97.759208784, -159.59154087, 91.297774084], [-0.3084016918, 0.1860531159, -2.5030047259, 21.419793629, -65.25588533, 83.318680481, -33.74692293], [-0.0906148351, 0.4527842806, 0.5962700728, -1.7241829131, -4.1302112531, 13.77663187, -8.6728470368]];
+const PCS_B = [[0.7240946941, 2.2382791861, -4.0025849485, -21.003576815, 26.855641363, 206.55133841, -355.60235612], [-0.5755498075, 0.6995095521, 3.892567339, -17.215471648, 192.67226447, -161.82646165, -165.20769346], [0.0976883116, -0.2557574982, -9.155856153, 20.642075974, -38.804430052, 93.626774077, -29.666905585]];
+export const PCSAFT_PARAMS = Object.freeze({
+  C1: [1, 3.7039, 150.03], C2: [1.6069, 3.5206, 191.42], C3: [2.002, 3.6184, 208.11], nC4: [2.3316, 3.7086, 222.88], iC4: [2.2616, 3.7574, 216.53], nC5: [2.6896, 3.7729, 231.2], iC5: [2.562, 3.8296, 230.75],
+  C6: [3.0576, 3.7983, 236.77], N2: [1.2053, 3.313, 90.96], CO2: [2.0729, 2.7852, 169.21], H2S: [1.6941, 3.0214, 226.79], nC7: [3.4831, 3.8049, 238.4], nC10: [4.6627, 3.8384, 243.87], nC16: [6.6485, 3.9552, 254.7], nC20: [7.9849, 3.9869, 257.75],
+});
+const PCS_KIJ = { 'C1-nC4': 0.022, 'C1-nC5': 0.024, 'C1-C6': 0.021, 'C1-iC4': 0.028, 'CO2-C1': 0.065, 'CO2-C3': 0.109, 'CO2-nC4': 0.12, 'CO2-nC5': 0.143, 'N2-C6': 0.119 };
+// Pseudo-components: linear interpolation in molar mass between the n-alkane sets (n-C7, n-C10, n-C16, n-C20) of m, m·σ³ and m·ε/k.
+const PCS_ALK = [[100.2, 'nC7'], [142.29, 'nC10'], [226.45, 'nC16'], [282.55, 'nC20']];
+function pcsaftOf(c) {
+  if (c.pcs) return c.pcs;
+  if (PCSAFT_PARAMS[c.id]) return PCSAFT_PARAMS[c.id];
+  if (!c.pseudo) return null;
+  let k = 0; while (k < PCS_ALK.length - 2 && c.MW > PCS_ALK[k + 1][0]) k++;
+  const [Ma, ia] = PCS_ALK[k], [Mb, ib] = PCS_ALK[k + 1], u = (c.MW - Ma) / (Mb - Ma), A = PCSAFT_PARAMS[ia], B = PCSAFT_PARAMS[ib], li = (f) => f(A) + u * (f(B) - f(A));
+  const m = li((p) => p[0]), ms3 = li((p) => p[0] * p[1] ** 3), me = li((p) => p[0] * p[2]), base = [m, Math.cbrt(ms3 / m), me / m];
+  if (!(c.SG > 0)) return base;
+  // the n-alkane line is lighter than a real cut: the segment diameter is scaled once so that the liquid density at 15.6 °C, 1 atm equals the specific gravity
+  const key = `${c.MW.toFixed(3)}|${c.SG.toFixed(5)}`; let sg = pcsCache.get(key);
+  if (sg === undefined) { sg = base[1]; for (let it = 0; it < 3; it++) { const one = pcsaftModel([{ id: 'x', MW: c.MW, Tc: c.Tc, Pc: c.Pc, w: c.w, pcs: [base[0], sg, base[2]] }]), r = hRho(one, 288.71, 1.01325, [1], 'liquid'); if (r === null) break; sg *= Math.cbrt((r * c.MW * 1e-3) / (c.SG * 999.016)); } if (pcsCache.size > 500) pcsCache.clear(); pcsCache.set(key, sg); }
+  return [base[0], sg, base[2]];
+}
+const pcsCache = new Map();
+/** PC-SAFT Helmholtz model for a list of components ({ id, MW, Tc, Pc, w, pseudo }); null when a component has no parameters. */
+export function pcsaftModel(comps) {
+  const pr = comps.map(pcsaftOf); if (pr.some((p) => !p)) return null;
+  const n = comps.length, ms = pr.map((p) => p[0]), sg = pr.map((p) => p[1]), ek = pr.map((p) => p[2]);
+  const kij = comps.map((a) => comps.map((b) => PCS_KIJ[`${a.id}-${b.id}`] ?? PCS_KIJ[`${b.id}-${a.id}`] ?? 0));
+  const s3 = comps.map((_, i) => comps.map((__, j) => ((sg[i] + sg[j]) / 2) ** 3)), eij = comps.map((_, i) => comps.map((__, j) => Math.sqrt(ek[i] * ek[j]) * (1 - kij[i][j])));
+  const dOf = (T) => sg.map((s, i) => s * (1 - 0.12 * Math.exp((-3 * ek[i]) / T)));
+  return {
+    name: 'PC-SAFT', ids: comps.map((c) => c.id), n, M: comps.map((c) => c.MW), crit: comps.map((c) => ({ Tc: c.Tc, Pc: c.Pc, w: c.w })), params: pr,
+    rhoMax(x) { let s = 0; for (let i = 0; i < n; i++) s += x[i] * ms[i] * sg[i] ** 3; return (0.72 * 6) / (Math.PI * s) / (N_AV * 1e-30); }, // packing fraction 0.72 (close packing is 0.74)
+    ar(T, rho, x) {
+      const d = dOf(T), rn = rho * N_AV * 1e-30, z = [0, 0, 0, 0]; let mb = 0;
+      for (let i = 0; i < n; i++) { mb += x[i] * ms[i]; let p = 1; for (let k = 0; k < 4; k++) { z[k] += x[i] * ms[i] * p; p *= d[i]; } }
+      for (let k = 0; k < 4; k++) z[k] *= (Math.PI / 6) * rn;
+      const eta = z[3], om = 1 - eta, ahs = ((3 * z[1] * z[2]) / om + z[2] ** 3 / (eta * om * om) + (z[2] ** 3 / (eta * eta) - z[0]) * Math.log(om)) / z[0];
+      let ch = 0; for (let i = 0; i < n; i++) if (x[i] > 0 && ms[i] !== 1) { const h = d[i] / 2, g = 1 / om + (h * 3 * z[2]) / (om * om) + (h * h * 2 * z[2] * z[2]) / om ** 3; ch += x[i] * (ms[i] - 1) * Math.log(g); }
+      let m2e = 0, m2e2 = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) { const q = x[i] * x[j] * ms[i] * ms[j] * s3[i][j], e = eij[i][j] / T; m2e += q * e; m2e2 += q * e * e; }
+      const c1 = (mb - 1) / mb, c2 = c1 * ((mb - 2) / mb); let I1 = 0, I2 = 0, p = 1;
+      for (let k = 0; k < 7; k++) { I1 += (PCS_A[0][k] + c1 * PCS_A[1][k] + c2 * PCS_A[2][k]) * p; I2 += (PCS_B[0][k] + c1 * PCS_B[1][k] + c2 * PCS_B[2][k]) * p; p *= eta; }
+      const C1 = 1 / (1 + (mb * (8 * eta - 2 * eta * eta)) / om ** 4 + ((1 - mb) * (20 * eta - 27 * eta * eta + 12 * eta ** 3 - 2 * eta ** 4)) / (om * (2 - eta)) ** 2);
+      return mb * ahs - ch - 2 * Math.PI * rn * I1 * m2e - Math.PI * rn * mb * C1 * I2 * m2e2;
+    },
+  };
+}
+
+// Cubic-plus-association (Kontogeorgis et al. 1996; simplified CPA of Kontogeorgis et al. 1999): SRK plus the Wertheim association
+// term. Associating compounds: a0 (Pa·m⁶/mol²), b (m³/mol), c1, association energy ε (J/mol), volume β, sites of each kind
+// (4C: two donors + two acceptors, 2B: one + one) — the published sets as held in the open NeqSim component database (COMP.csv);
+// non-associating compounds use SRK from Tc, Pc and ω. Binary k_ij of the cubic part: NeqSim interaction table (INTER.csv).
+export const CPA_PARAMS = Object.freeze({
+  W: { name: 'Water', MW: 18.015, Tc: 647.3, Pc: 220.89, w: 0.344, a0: 0.12277, b: 1.4515e-5, c1: 0.67359, eps: 16655, beta: 0.0692, sites: 2 },
+  MeOH: { name: 'Methanol', MW: 32.042, Tc: 512.64, Pc: 80.96, w: 0.559, a0: 0.40531, b: 3.0978e-5, c1: 0.43102, eps: 24591, beta: 0.0161, sites: 1 },
+  MEG: { name: 'Mono-ethylene glycol', MW: 62.069, Tc: 720, Pc: 90, w: 0.5347, a0: 1.0819, b: 5.14e-5, c1: 0.6744, eps: 19752, beta: 0.0141, sites: 2 },
+});
+const CPA_KIJ = { 'W-C1': (T) => -0.827413423 + 0.0026055 * T, 'W-N2': (T) => -1.389072518 + 0.003879719 * T, 'W-CO2': (T) => -0.27686 + 0.001121 * T, 'W-C3': () => 0.11, 'W-nC4': () => 0.0875, 'W-H2S': () => 0.1913, 'W-MeOH': () => -0.153, 'W-MEG': () => -0.115, 'MeOH-C1': () => 0.0134, 'MEG-C1': () => 0.134 };
+/** CPA Helmholtz model. comps: [{ id, MW, Tc, Pc, w }] with ids 'W', 'MeOH', 'MEG' taken from CPA_PARAMS (associating). */
+export function cpaModel(comps) {
+  const n = comps.length, cs = comps.map((c) => { const p = CPA_PARAMS[c.id]; return p ? { ...p, id: c.id } : { id: c.id, MW: c.MW, Tc: c.Tc, Pc: c.Pc, w: c.w, a0: (0.42748023 * (R * c.Tc) ** 2) / (c.Pc * 1e5), b: (0.08664035 * R * c.Tc) / (c.Pc * 1e5), c1: 0.48 + 1.574 * c.w - 0.176 * c.w * c.w, sites: 0 }; });
+  const kf = cs.map((a) => cs.map((b) => CPA_KIJ[`${a.id}-${b.id}`] || CPA_KIJ[`${b.id}-${a.id}`] || null)), as = cs.map((c, i) => (c.sites ? i : -1)).filter((i) => i >= 0);
+  return {
+    name: 'CPA', ids: cs.map((c) => c.id), n, M: cs.map((c) => c.MW), crit: cs.map((c) => ({ Tc: c.Tc, Pc: c.Pc, w: c.w })),
+    rhoMax(x) { let b = 0; for (let i = 0; i < n; i++) b += x[i] * cs[i].b; return 0.985 / b; },
+    ar(T, rho, x) {
+      const sa = cs.map((c) => Math.sqrt(c.a0) * (1 + c.c1 * (1 - Math.sqrt(T / c.Tc)))); let a = 0, b = 0;
+      for (let i = 0; i < n; i++) { b += x[i] * cs[i].b; for (let j = 0; j < n; j++) a += x[i] * x[j] * sa[i] * sa[j] * (1 - (i !== j && kf[i][j] ? kf[i][j](T) : 0)); }
+      let out = -Math.log(1 - b * rho) - (a / (b * R * T)) * Math.log(1 + b * rho);
+      const act = as.filter((i) => x[i] > 0); if (!act.length) return out;
+      const g = 1 / (1 - 0.475 * b * rho), D = act.map((i) => act.map((j) => g * (Math.exp((cs[i].eps + cs[j].eps) / (2 * R * T)) - 1) * ((cs[i].b + cs[j].b) / 2) * Math.sqrt(cs[i].beta * cs[j].beta)));
+      const na = act.length, X = new Array(na).fill(0.2), w = act.map((j) => rho * x[j] * cs[j].sites);
+      if (na === 1) { const q = w[0] * D[0][0]; X[0] = (Math.sqrt(1 + 4 * q) - 1) / (2 * q); } // one associating compound: closed form
+      else for (let it = 0; it < 500; it++) { // fraction of sites not bonded: damped successive substitution
+        let err = 0;
+        for (let p = 0; p < na; p++) { let sm = 0; for (let q = 0; q < na; q++) sm += w[q] * X[q] * D[p][q]; const xn = 0.5 * (X[p] + 1 / (1 + sm)); err = Math.max(err, Math.abs(xn - X[p])); X[p] = xn; }
+        if (err < 1e-13) break;
+      }
+      act.forEach((i, p) => (out += x[i] * 2 * cs[i].sites * (Math.log(X[p]) - X[p] / 2 + 0.5)));
+      return out;
+    },
+  };
+}
+/**
+ * Water (and inhibitor) in the gas phase and gas dissolved in the aqueous phase by CPA: the dry gas (EOS fluid f, mole fractions yDry)
+ * is equilibrated at P (bara), T (°C) with an aqueous phase of inhibitor mass fraction (wt %) whose water activity is further lowered
+ * by salt (awSalt). Returns { yW, yInh (mole fractions in the gas), wc (kg water per Sm³ dry gas), inhLoss (kg per Sm³), xGas (dissolved gas mole fraction), ok }.
+ */
+export function cpaWater(f, yDry, Pbar, Tc, { inhId = 'none', inhWt = 0, awSalt = 1 } = {}) {
+  const TK = Tc + KEL, hasI = !!CPA_PARAMS[inhId] && inhWt > 0, idx = []; yDry.forEach((v, i) => { if (v > 1e-9) idx.push(i); });
+  const comps = [{ id: 'W' }, ...(hasI ? [{ id: inhId }] : []), ...idx.map((i) => f.comps[i])], m = cpaModel(comps), n0 = hasI ? 2 : 1, n = comps.length;
+  const wI = hasI ? inhWt / 100 : 0, nI = wI / CPA_PARAMS[hasI ? inhId : 'W'].MW, nW = (1 - wI) / 18.015, xI = hasI ? nI / (nI + nW) : 0, tot = idx.reduce((s, i) => s + yDry[i], 0);
+  let x = [1 - xI, ...(hasI ? [xI] : []), ...idx.map(() => 0)], y = [1e-3, ...(hasI ? [1e-4] : []), ...idx.map((i) => (yDry[i] / tot) * 0.999)], ok = true, rl = null, rv = null;
+  const aqi = hasI ? [0, 1] : [0];
+  for (let it = 0; it < 6; it++) { // water and inhibitor between the two phases (the dissolved gas barely changes the aqueous fugacities)
+    rl = hRho(m, TK, Pbar, x, 'liquid'); rv = hRho(m, TK, Pbar, y, 'vapour'); if (rl === null || rv === null) { ok = false; break; }
+    const pl = hLnPhi(m, TK, rl, x, aqi), pg = hLnPhi(m, TK, rv, y, aqi), yW = x[0] * awSalt * Math.exp(pl[0] - pg[0]), yI = hasI ? x[1] * Math.exp(pl[1] - pg[1]) : 0, dry = Math.max(1 - yW - yI, 1e-6);
+    const yn = [yW, ...(hasI ? [yI] : []), ...idx.map((i) => (yDry[i] / tot) * dry)], err = Math.abs(yn[0] - y[0]); y = yn; if (err < 1e-7 * Math.max(y[0], 1e-9)) break;
+  }
+  if (ok) { // gas dissolved in the aqueous phase from equal fugacities, one pass
+    const pl = hLnPhi(m, TK, rl, x), pg = hLnPhi(m, TK, rv, y), xg = idx.map((_, k) => y[n0 + k] * Math.exp(pg[n0 + k] - pl[n0 + k])), sg = sumA(xg);
+    x = [(1 - xI) * (1 - sg), ...(hasI ? [xI * (1 - sg)] : []), ...xg];
+  }
+  const dry = 1 - y[0] - (hasI ? y[1] : 0);
+  return { yW: y[0], yInh: hasI ? y[1] : 0, wc: ((y[0] / dry) * 18.015e-3) / VM_STD, inhLoss: hasI ? ((y[1] / dry) * CPA_PARAMS[inhId].MW * 1e-3) / VM_STD : 0, xGas: sumA(x.slice(n0)), xGasBy: Object.fromEntries(idx.map((i, k) => [f.comps[i].id, x[n0 + k]])), ok };
+}
+// ---- Lee–Kesler (modified Benedict–Webb–Rubin) as a residual-Helmholtz model -----------------------------------------------
+// ar(Tr, Vr) of one Lee–Kesler reference fluid (constants c = [b1..b4, c1..c4, d1, d2, β, γ]); Z = 1 − Vr ∂ar/∂Vr reproduces the BWR form.
+const lkAr = (c, Tr, V) => { const B = c[0] - c[1] / Tr - c[2] / Tr ** 2 - c[3] / Tr ** 3, C = c[4] - c[5] / Tr + c[6] / Tr ** 3, D = c[8] + c[9] / Tr, u = c[11] / (V * V); return B / V + C / (2 * V * V) + D / (5 * V ** 5) + (c[7] / (2 * Tr ** 3 * c[11])) * (c[10] + 1 - (c[10] + 1 + u) * Math.exp(-u)); };
+const lkState = (c, Tr, Pr, liquid) => { const V = lkVr(c, Tr, Pr, liquid); if (V === null) return null; const Z = (Pr * V) / Tr; return { Z, V, hDep: Tr * (Z - 1 - Tr * d1((t) => lkAr(c, t, V), Tr, Tr * 1e-3)), lnPhi: lkAr(c, Tr, V) + Z - 1 - Math.log(Z) }; };
+/**
+ * Lee–Kesler (1975) three-parameter corresponding states from the modified BWR equation of the simple and reference (n-octane)
+ * fluids: { Z, hDep ((H − H_ideal)/(R·Tc)), lnPhi (ln of the fugacity coefficient) } at reduced T, P and acentric factor w.
+ * liquid = true takes the dense root of both fluids.
+ */
+export function leeKesler(Tr, Pr, w = 0, liquid = false) {
+  const a = lkState(LK0, Tr, Pr, liquid), b = lkState(LKR, Tr, Pr, liquid); if (!a || !b) return null;
+  const q = w / 0.3978, mix = (k) => a[k] + q * (b[k] - a[k]);
+  return { Z: mix('Z'), hDep: mix('hDep'), lnPhi: mix('lnPhi'), Z0: a.Z, Zr: b.Z };
+}
+
+// ---- Pedersen corresponding-states viscosity (Pedersen et al. 1984; Pedersen & Fredenslund 1987) --------------------------
+// Methane is the reference fluid: viscosity correlation of Hanley, McCarty & Haynes (1975) with the low-temperature branch of
+// Pedersen & Fredenslund (1987) — coefficients as in the open NeqSim implementation (PFCTViscosityMethodMod86.java) — and the
+// methane density from GERG-2008 instead of the 1974 BWR equation of McCarty.
+const HMH = { GV: [-2.090975e5, 2.647269e5, -1.472818e5, 4.71674e4, -9.491872e3, 1.219979e3, -9.627993e1, 4.274152, -8.141531e-2], A: 1.696985927, B: -0.133372346, C: 1.4, F: 168, j: [-10.35060586, 17.571599671, -3019.3918656, 188.73011594, 0.042903609488, 145.29023444, 6127.6818706], k: [-9.74602, 18.0834, -4126.66, 44.6055, 0.976544, 81.8134, 15649.9], rhoc: 0.16266 };
+/** Viscosity of methane (Pa·s) at T (K) and density rho (kg/m³): Hanley et al. (1975), dense-liquid branch of Pedersen & Fredenslund (1987) below 91 K. */
+export function methaneViscosity(T, rho) {
+  const r = rho / 1000, th = (r - HMH.rhoc) / HMH.rhoc; let e0 = 0; for (let i = 0; i < 9; i++) e0 += HMH.GV[i] * T ** ((i - 3) / 3);
+  const e1 = (HMH.A + HMH.B * (HMH.C - Math.log(T / HMH.F)) ** 2) * r, br = (c) => Math.exp(c[0] + c[3] / T) * (Math.exp(r ** 0.1 * (c[1] + c[2] / T ** 1.5) + th * Math.sqrt(r) * (c[4] + c[5] / T + c[6] / (T * T))) - 1);
+  const ht = Math.tanh(T - 91);
+  return (e0 + e1 + ((ht + 1) / 2) * br(HMH.j) + ((1 - ht) / 2) * br(HMH.k)) * 1e-7;
+}
+let gergC1 = null;
+const methaneRho = (T, Pbar) => { gergC1 ||= gergModel(['C1']); const Tq = Math.max(T, 40), r = hRho(gergC1, Tq, Pbar, [1], 'stable'); return r === null ? null : r * 16.04246e-3; }; // kg/m³
+/**
+ * Pedersen corresponding-states viscosity (Pa·s) of a mixture of composition x at P (bara), T (K). comps: [{ Tc, Pc, MW }].
+ * Returns { mu, T0, P0 (reference-state methane conditions), Tcm, Pcm, Mmix, alpha } or null outside the reference equation.
+ */
+export function viscosityPedersen(comps, x, Pbar, TK) {
+  const n = comps.length, Tc0 = 190.564, Pc0 = 45.992, M0 = 16.043; let t1 = 0, t2 = 0, mw = 0, mn = 0;
+  for (let i = 0; i < n; i++) { if (!(x[i] > 0)) continue; mn += x[i] * comps[i].MW; mw += x[i] * comps[i].MW ** 2; const ci = Math.cbrt(comps[i].Tc / comps[i].Pc); for (let j = 0; j < n; j++) { if (!(x[j] > 0)) continue; const v = x[i] * x[j] * (ci + Math.cbrt(comps[j].Tc / comps[j].Pc)) ** 3; t1 += v * Math.sqrt(comps[i].Tc * comps[j].Tc); t2 += v; } }
+  if (!(t2 > 0)) return null;
+  const Tcm = t1 / t2, Pcm = (8 * t1) / (t2 * t2), Mmix = mn + 1.304e-4 * ((mw / mn) ** 2.303 - mn ** 2.303);
+  const r0 = methaneRho((TK * Tc0) / Tcm, (Pbar * Pc0) / Pcm); if (r0 === null) return null;
+  const rr = r0 / (10.15 * 16.043), al = 1 + 7.378e-3 * rr ** 1.847 * Mmix ** 0.5173, al0 = 1 + 7.378e-3 * rr ** 1.847 * M0 ** 0.5173; // reduced density with ρc = 10.15 mol/L
+  const T0 = ((TK * Tc0) / Tcm) * (al0 / al), P0 = ((Pbar * Pc0) / Pcm) * (al0 / al), rho0 = methaneRho(T0, P0); if (rho0 === null) return null;
+  const mu = (Tcm / Tc0) ** (-1 / 6) * (Pcm / Pc0) ** (2 / 3) * Math.sqrt(Mmix / M0) * (al / al0) * methaneViscosity(Math.max(T0, 40), rho0);
+  return Number.isFinite(mu) && mu > 0 ? { mu, T0, P0, Tcm, Pcm, Mmix, alpha: al } : null;
+}
+
+// ---- gas hydrates: Kihara cell potential (Lennard-Jones–Devonshire smoothed cell) and structure H --------------------------
+// Kihara parameters of the guest–water interaction [hard-core radius a (Å), collision diameter σ (Å), ε/k (K)]. C1–iC4: the set
+// optimised by Avaji et al. (2023, Fluid Phase Equilib. 567, 113716; open manuscript, Table 8) together with the Sloan & Koh reference
+// properties listed there; N2, CO2, nC4 and H2S: hydrate columns of the open NeqSim component database (not regressed with the
+// same reference properties — less accurate). Cavity radii (Å) and coordination numbers: Sloan & Koh as tabulated by Herri et al.
+export const KIHARA = Object.freeze({
+  kihara: true,
+  guests: { C1: [0.383, 3.1436, 155.8], C2: [0.59, 3.2998, 178.709], C3: [0.647, 3.419, 191.855], iC4: [0.8921, 3.20691, 198.332], N2: [0.359188902, 3.132506748, 126.578386713], CO2: [0.68463388, 3.03720716, 170.162382832], nC4: [0.9379, 2.9125, 209] },
+  cav: { sI: [[3.95, 20], [4.33, 24]], sII: [[3.91, 20], [4.73, 28]], sH: [[3.91, 20], [4.06, 20]] },
+  ref: { sI: { dmu0: 1263.6, dhL: -4858.9, dhI: 1151, dvL: 4.6e-6, dvI: 3.0e-6 }, sII: { dmu0: 882.8, dhL: -5202.2, dhI: 808, dvL: 5.0e-6, dvI: 3.4e-6 } },
+  dcp: [-38.12, 0.141],
+});
+const kihCache = new Map();
+/**
+ * Langmuir constant (1/bar) from the Kihara potential averaged over a spherical cell of radius Rc (Å) with z water molecules
+ * (McKoy & Sinanoğlu form of the Lennard-Jones–Devonshire theory): C = (4π/kT) ∫₀^{Rc−a} exp(−w(r)/kT) r² dr.
+ */
+export function kiharaC(a, sig, epsK, Rc, z, TK) {
+  const dl = (N, r) => ((1 - r / Rc - a / Rc) ** -N - (1 + r / Rc - a / Rc) ** -N) / N;
+  const w = (r) => 2 * z * epsK * ((sig ** 12 / (Rc ** 11 * r)) * (dl(10, r) + (a / Rc) * dl(11, r)) - (sig ** 6 / (Rc ** 5 * r)) * (dl(4, r) + (a / Rc) * dl(5, r))); // in K
+  const n = 100, top = (Rc - a) * 0.999, h = top / n; let s = 0;
+  for (let i = 1; i <= n; i++) { const r = i * h, f = Math.exp(-w(r) / TK) * r * r; s += (i === n ? 1 : i % 2 ? 4 : 2) * (Number.isFinite(f) ? f : 0); }
+  return ((4 * Math.PI) / (1.380649e-23 * TK)) * ((s * h) / 3) * 1e-30 * 1e5; // Å³ → m³, 1/Pa → 1/bar
+}
+// ln C is tabulated every 5 K (220–340 K, nodes filled on demand) for each guest and cavity and interpolated linearly in 1/T.
+function kiharaLangmuir(id, s, m, TK) {
+  const key = `${id}|${s}|${m}`; let t = kihCache.get(key); if (!t) { t = new Array(25).fill(null); kihCache.set(key, t); }
+  const T = clamp(TK, 220, 339.999), i = Math.floor((T - 220) / 5), Ta = 220 + 5 * i, u = (1 / T - 1 / Ta) / (1 / (Ta + 5) - 1 / Ta), k = KIHARA.guests[id], cv = KIHARA.cav[s][m];
+  for (const j of [i, i + 1]) if (t[j] === null) t[j] = Math.log(Math.max(kiharaC(k[0], k[1], k[2], cv[0], cv[1], 220 + 5 * j), 1e-300));
+  return Math.exp(t[i] + u * (t[i + 1] - t[i]));
+}
+// ---- solid phases: asphaltene (Flory–Huggins / Hirschberg), water-side Gibbs minimum, phase inventory ------------------------
+/** Hildebrand solubility parameter (MPa^0.5) of a liquid from the EOS: square root of the cohesive energy density −U_res/v. */
+export function solubilityParameter(f, x, Pbar, Tc) {
+  const TK = Tc + KEL, q = phaseHS(f, x, Pbar, TK, 'liquid'), p = phaseProps(f, x, Pbar, Tc, 'liquid', { thermal: false });
+  return Math.sqrt(Math.max(-(q.hRes - R * TK * (q.Z - 1)) / p.vm, 0)) / 1000;
+}
+/**
+ * Asphaltene solid–liquid equilibrium by the Flory–Huggins regular-solution model of Hirschberg et al. (1984): the largest
+ * asphaltene volume fraction the liquid can hold solves ln φ + (1 − Va/VL)(1 − φ) + χ(1 − φ)² = 0 with χ = Va(δa − δL)²/RT.
+ * Inputs: deltaL (MPa^0.5), vL (m³/mol), TK, wAsp (mass fraction of asphaltene in the liquid), rhoL (kg/m³), aspMW (g/mol), aspRho (kg/m³),
+ * aspDelta (MPa^0.5 at 25 °C, falling by the fraction aspDeltaT per K). Returns { chi, phiMax, phiA, precipWt (wt % of the liquid precipitated), stable }.
+ */
+export function asphalteneFH({ deltaL, vL, TK, wAsp, rhoL, aspMW = 750, aspRho = 1100, aspDelta = 21, aspDeltaT = 1.07e-3 }) {
+  const Va = (aspMW * 1e-3) / aspRho, dA = aspDelta * (1 - aspDeltaT * (TK - 298.15)), chi = (Va * ((dA - deltaL) * 1e3) ** 2) / (R * TK), r = Va / vL, g = (lp) => { const p = Math.exp(lp); return lp + (1 - r) * (1 - p) + chi * (1 - p) ** 2; };
+  let phiMax = 1; const grid = linspace(Math.log(1e-14), Math.log(0.999), 60);
+  for (let k = 1; k < grid.length; k++) if (g(grid[k - 1]) < 0 && g(grid[k]) >= 0) { phiMax = Math.exp(brent(g, grid[k - 1], grid[k], 1e-12, 80)); break; }
+  const phiA = clamp((wAsp * rhoL) / aspRho, 0, 1), ex = Math.max(0, phiA - phiMax);
+  return { chi, phiMax, phiA, precipWt: (100 * ex * aspRho) / rhoL, stable: !(ex > 0) };
+}
+/**
+ * Asphaltene precipitation along an isothermal depletion: at each pressure the EOS flash gives the liquid, its solubility parameter and
+ * molar volume, and the Flory–Huggins equilibrium gives the precipitated amount. wAspSto: asphaltene mass fraction of the stock-tank oil.
+ * Returns { rows: [{ P, deltaL, phiMax, phiA, precipWt }], upperOnset, lowerOnset (bara | null), maxPrecip (wt % of the liquid), pAtMax }.
+ */
+export function asphalteneCurve(f, Tc, pressures, { wAspSto = 0.025, aspMW = 750, aspRho = 1100, aspDelta = 21, aspDeltaT = 1.07e-3 } = {}) {
+  const TK = Tc + KEL, at = (P) => {
+    const s = props(f, P, Tc, { thermal: false }); if (s.phase === 'gas') return null;
+    const x = s.x, sf = stdFlash(withZ(f, x)), mSto = sf.vOil > 0 ? ((1 - sf.beta) * (sf.mwOil || s.oil.MW)) / s.oil.MW : 1; // mass of stock-tank oil per mass of live liquid
+    const dL = solubilityParameter(f, x, P, Tc), r = asphalteneFH({ deltaL: dL, vL: s.oil.vm, TK, wAsp: wAspSto * clamp(mSto, 0, 1), rhoL: s.oil.rho, aspMW, aspRho, aspDelta, aspDeltaT });
+    return { P, deltaL: dL, phiMax: r.phiMax, phiA: r.phiA, precipWt: r.precipWt, margin: r.phiA - r.phiMax };
+  };
+  const rows = pressures.map(at).filter(Boolean).sort((a, b) => b.P - a.P); let upperOnset = null, lowerOnset = null, maxPrecip = 0, pAtMax = null;
+  const cross = (a, b) => { try { return brent((P) => at(P)?.margin ?? -1, Math.min(a, b), Math.max(a, b), 1e-3, 40); } catch { return 0.5 * (a + b); } };
+  for (let k = 0; k < rows.length; k++) {
+    if (rows[k].precipWt > maxPrecip) { maxPrecip = rows[k].precipWt; pAtMax = rows[k].P; }
+    if (k > 0 && rows[k - 1].margin <= 0 && rows[k].margin > 0 && upperOnset === null) upperOnset = cross(rows[k - 1].P, rows[k].P);
+    if (k > 0 && rows[k - 1].margin > 0 && rows[k].margin <= 0) lowerOnset = cross(rows[k - 1].P, rows[k].P);
+  }
+  if (rows.length && rows[0].margin > 0) upperOnset = rows[0].P;
+  return { rows, upperOnset, lowerOnset, maxPrecip, pAtMax };
+}
+/**
+ * Water-side Gibbs-energy minimum at P (bara), T (°C): free water of an aqueous phase aq ({ S g/kg, inhId, inhWt }) converts to hydrate
+ * (structure of highest driving force) until the chemical potential of water in the concentrating brine / inhibitor solution equals that
+ * in the hydrate, the water is used up, or the gas runs out (gasPerWater: mol of hydrate formers per mol of water). Returns
+ * { phases: [names], structure, conversion (fraction of the water in hydrate), drive0 (Δμ/RT before conversion; > 0 hydrate stable), ice,
+ *   dG (J per mol of water, ≤ 0), awFinal, saltFinal (g/kg), inhFinal (wt %), hydrateKgPerKgWater, hydrationNumber, limitedBy }.
+ */
+export function waterPhaseEquilibrium(f, Pbar, Tc, aq = {}, models = {}, { table = HYD_ACTIVE.table || LANGMUIR, sH = HYD_ACTIVE.sH, gasPerWater = Infinity, allowHydrate = true, tune = null } = {}) {
+  const TK = Tc + KEL, fug = formerFugacities(f, Pbar, Tc), S0 = clamp(aq.S || 0, 0, 260) / 1000, w0 = aq.inhId && aq.inhId !== 'none' ? clamp(aq.inhWt || 0, 0, 95) / 100 : 0;
+  const structs = ['sI', 'sII', ...(sH ? ['sH'] : [])], mW0 = (1 - w0) * (1 - S0), mS = (1 - w0) * S0; // per kg of aqueous phase
+  const conc = (xi) => { const mW = mW0 * (1 - xi), tot = mW + mS + w0; return { S: clamp((1000 * mS) / Math.max(mW + mS, 1e-12), 0, 260), inhId: aq.inhId || 'none', inhWt: clamp((100 * w0) / Math.max(tot, 1e-12), 0, 95) }; };
+  const best = (xi) => { const c = conc(xi), wa = waterActivity(c, TK, models, tune), a = wa.aw * (1 - gasSolubility(fug, Pbar, Tc, wa.molality).total); let b = null; for (const s of structs) { const st = hydrateState(s, TK, Pbar, fug, a, table); if (!b || st.drive > b.st.drive) b = { s, st }; } return { ...b, c, aw: a }; };
+  const b0 = best(0), base = { structure: null, conversion: 0, drive0: b0.st.drive, ice: b0.st.ice, dG: 0, awFinal: b0.aw, saltFinal: b0.c.S, inhFinal: b0.c.inhWt, hydrateKgPerKgWater: 0, hydrationNumber: null, limitedBy: null };
+  if (!Object.keys(fug).length || !(b0.st.drive > 0) || !allowHydrate) return { ...base, phases: [b0.st.ice ? 'ice' : 'aqueous liquid'], limitedBy: !allowHydrate && b0.st.drive > 0 ? 'hydrate not permitted (metastable aqueous phase)' : null };
+  const occ = occupancy(b0.s, b0.st), nH = occ.hydrationNumber || HYDRATE_STRUCTURES[b0.s].waters / 4, xiGas = Math.min(1, gasPerWater * nH);
+  let xi = Math.min(0.9999, xiGas), limitedBy = xiGas < 1 ? 'hydrate formers' : 'water';
+  if ((mS > 0 || w0 > 0) && best(xi).st.drive > 0 === false) { xi = brent((q) => best(q).st.drive, 0, xi, 1e-10, 80); limitedBy = 'water activity (salt / inhibitor concentrating)'; }
+  else if (mS <= 0 && w0 <= 0 && xiGas >= 1) xi = 1;
+  const n = 12; let integ = 0; for (let k = 0; k <= n; k++) { const q = (xi * k) / n; integ += (k === 0 || k === n ? 0.5 : 1) * best(Math.min(q, 0.9999)).st.drive; } // ∫ drive dξ
+  const e = best(Math.min(xi, 0.9999)), mwGuest = Object.entries(occ.byGuest.reduce((o, t, m) => { for (const id in t) o[id] = (o[id] || 0) + HYDRATE_STRUCTURES[b0.s].nu[m] * t[id]; return o; }, {})).reduce((s, [id, v]) => s + v * (COMPONENTS[id]?.MW || 16), 0);
+  return { ...base, phases: xi >= 1 ? ['hydrate ' + b0.s] : ['hydrate ' + b0.s, 'aqueous liquid'], structure: b0.s, conversion: xi, dG: -R * TK * ((integ * xi) / n), awFinal: e.aw, saltFinal: e.c.S, inhFinal: e.c.inhWt, hydrateKgPerKgWater: xi * (1 + mwGuest / MW_W), hydrationNumber: nH, limitedBy };
+}
+/** Reduced molar Gibbs energies g/RT of the feed as one phase and as the equilibrium split at P (bara), T (°C): { g1, g2, dg = g2 − g1 (≤ 0), tpd }. */
+export function gibbsSplit(f, Pbar, Tc) {
+  const TK = Tc + KEL, one = eosPhase(f, f.z, Pbar, TK), fl = flashPT(f, Pbar, Tc), st = f.n > 1 ? stability(f, Pbar, TK) : { tpd: 0 };
+  const g2 = fl.phase === 'two' ? fl.beta * eosPhase(f, fl.y, Pbar, TK, 'vapour').g + (1 - fl.beta) * eosPhase(f, fl.x, Pbar, TK, 'liquid').g : one.g;
+  return { g1: one.g, g2, dg: g2 - one.g, tpd: st.tpd };
 }
 
 // ---- suite: fluid library, model assembly and reporting ------------------------------------------------------------------
@@ -840,7 +1237,62 @@ function refillTable(t, spec, f) {
   return t;
 }
 /** Tuned EOS fluid of a specification: characterisation plus optional binary-interaction overrides. Returns { ch, f, nKij }. */
-export function tunedFluid(spec, tune = {}, kijRows = []) { const ch = characterise(spec, tune), nKij = applyKij(ch.fluid, kijRows); return { ch, f: ch.fluid, nKij }; }
+export function tunedFluid(spec, tune = {}, kijRows = [], tx = TX0) {
+  const ch = characterise(spec, tune), nKij = applyKij(ch.fluid, kijRows), f = ch.fluid;
+  if (tx.shift !== 1 || tx.par !== 1 || tx.cp !== 1) for (const c of f.comps) { c.c *= tx.shift; c.par *= tx.par; c.cp = c.cp.map((q) => q * tx.cp); } // calibration multipliers: volume shift, parachor, ideal-gas heat capacity
+  return { ch, f, nKij };
+}
+// Calibration multipliers beyond the C7+ characterisation: volume shift, parachor, ideal-gas cp, gas viscosity, water density, water content of gas,
+// hydrate reference chemical potential, inhibitor activity (ln γ of water) and salt (ln a_w of the brine).
+const TX0 = Object.freeze({ shift: 1, par: 1, cp: 1, muG: 1, rhoW: 1, wc: 1, hyd: 1, act: 1, salt: 1 });
+const tuneX = (v) => ({ shift: clamp(num(v.shiftMult, 1), 0, 3), par: clamp(num(v.parMult, 1), 0.5, 1.5), cp: clamp(num(v.cpMult, 1), 0.7, 1.3), muG: clamp(num(v.muGMult, 1), 0.5, 2), rhoW: clamp(num(v.rhoWMult, 1), 0.9, 1.1), wc: clamp(num(v.wcMult, 1), 0.3, 3), hyd: clamp(num(v.hydMult, 1), 0.8, 1.2), act: clamp(num(v.actMult, 1), 0, 3), salt: clamp(num(v.saltMult, 1), 0, 3) });
+const txFluid = (tx) => tx.shift !== 1 || tx.par !== 1 || tx.cp !== 1;
+/** Hydrate constants set of a model selection ('vdwp' Munck, 'kihara') with the reference chemical potential Δμ⁰ scaled by `mult`. */
+export function hydrateTable(model = 'vdwp', mult = 1) {
+  const base = model === 'kihara' ? KIHARA : LANGMUIR; if (mult === 1) return base;
+  const ref = {}; for (const st of ['sI', 'sII', 'sH']) { const S = { ...HYDRATE_STRUCTURES[st], ...(base.ref?.[st] || {}) }; ref[st] = { ...S, dmu0: S.dmu0 * mult }; }
+  return { ...base, ref };
+}
+/**
+ * Multiple-contact miscibility pressure (bara) of an injection gas with the oil at T (°C): the lowest pressure at which repeated
+ * contacts develop a single phase — forward (equilibrium gas against fresh oil: vaporising drive) or backward (equilibrium liquid against
+ * fresh gas: condensing drive); the first contact is the first-contact miscibility test. A single-cell estimate of the slim-tube
+ * minimum miscibility pressure (combined condensing/vaporising drives can be miscible at a somewhat lower pressure).
+ * Returns { mmp, mechanism: 'first contact' | 'vaporising' | 'condensing' | null, capped }.
+ */
+export function miscibilityPressure(f, gasComp, Tc, { Pmin = 20, Pmax = 1200, contacts = 6 } = {}) {
+  const gt = Object.values(gasComp).reduce((a, b) => a + b, 0), zg = f.comps.map((c) => (c.pseudo ? 0 : (+gasComp[c.id] || 0) / gt)), zo = f.z;
+  if (!(sumA(zg) > 0.5)) return { mmp: null, mechanism: null, capped: false };
+  const mixf = (a, b) => { const z = a.map((q, i) => 0.5 * (q + b[i])), fz = withZ(f, z), fl = flashPT(fz, P_, Tc); return fl.phase === 'two' ? fl : null; };
+  let P_ = Pmin;
+  const test = (P) => { P_ = P; let g = zg, l = zo;
+    for (let k = 0; k < contacts; k++) { const a = mixf(g, zo); if (!a) return k === 0 ? 'first contact' : 'vaporising'; g = a.y; }
+    for (let k = 0; k < contacts; k++) { const a = mixf(l, zg); if (!a) return k === 0 ? 'first contact' : 'condensing'; l = a.x; }
+    return null; };
+  let mech = test(Pmax); if (mech === null) return { mmp: Pmax, mechanism: null, capped: true };
+  const low = test(Pmin); if (low !== null) return { mmp: Pmin, mechanism: low, capped: true };
+  let lo = Pmin, hi = Pmax; for (let k = 0; k < 7; k++) { const m = Math.sqrt(lo * hi), q = test(m); if (q === null) lo = m; else { hi = m; mech = q; } } // resolves the pressure to about 3 %
+  return { mmp: hi, mechanism: mech, capped: false };
+}
+function gergFor(f, x) { // GERG-2008 model of a phase: C7+ up to 1 mol % is counted as n-hexane; null when a larger heavy end or an uncovered component is present
+  let ps = 0, tot = 0; const ids = [], xs = [];
+  f.comps.forEach((c, i) => { if (!(x[i] > 0)) return; tot += x[i]; if (c.pseudo) ps += x[i]; const id = c.pseudo ? 'C6' : c.id, k = ids.indexOf(id); if (k < 0) { ids.push(id); xs.push(x[i]); } else xs[k] += x[i]; });
+  if (ps > 0.01 * tot) return null;
+  const m = gergModel(ids); return m ? { m, x: xs.map((q) => q / tot), lumped: ps / tot } : null;
+}
+/**
+ * One phase of composition x at P (bara), T (°C) by the alternative models: PC-SAFT and GERG-2008 (density kg/m³, Z, cp J/kg/K, speed of
+ * sound m/s, Joule–Thomson K/bar, residual enthalpy J/mol), Lee–Kesler with Kay's rule (vapour only) and the Pedersen viscosity (Pa·s).
+ */
+export function altPhase(f, x, Pbar, Tc, kind, { visc = true, thermal = true } = {}) {
+  const TK = Tc + KEL, cp0 = cpIg(f, x, TK), out = { pcsaft: null, gerg: null, lk: null, muPedersen: null };
+  const run = (m, xx) => { const r = hRho(m, TK, Pbar, xx, kind === 'vapour' ? 'vapour' : 'liquid'); if (r === null) return null; if (!thermal) { let M = 0; xx.forEach((q, i) => (M += q * m.M[i])); return { rho: r * M * 1e-3, Z: (Pbar * 1e5) / (r * R * TK) }; } const q = hProps(m, TK, r, xx, cp0); return Number.isFinite(q.w) ? { rho: q.rhoMass, Z: q.Z, cp: q.cp / (q.M * 1e-3), w: q.w, jt: q.jt, hRes: q.hRes } : null; };
+  try { const pm = pcsaftModel(f.comps); if (pm) out.pcsaft = run(pm, x); } catch { /* outside the model */ }
+  try { const g = gergFor(f, x); if (g) { const r = run(g.m, g.x); if (r) out.gerg = { ...r, lumped: g.lumped }; } } catch { /* outside the model */ }
+  if (kind === 'vapour') { const k = kay(f, x), l = leeKesler(TK / k.Tc, Pbar / k.Pc, k.w); if (l && l.Z > 0) out.lk = { Z: l.Z, rho: (Pbar * 1e5 * k.M * 1e-3) / (l.Z * R * TK), hRes: l.hDep * R * k.Tc }; }
+  if (visc) { const q = viscosityPedersen(f.comps, x, Pbar, TK); out.muPedersen = q ? q.mu : null; }
+  return out;
+}
 let lastModel = null; // spec and kernel options of the most recent run: used by the calibration model and the flash calculator
 const seedFor = (env, T) => { let best = null, d = Infinity; for (const s of env?.seeds || []) { const q = Math.abs(s.T - T); if (q < d) { d = q; best = s.X; } } return d < 40 ? best : null; };
 /** Complete state at P (bara), T (°C) with derivative properties of each phase present: { phase, beta, wG, sigma, x, y, gas | null, oil | null }. */
@@ -861,14 +1313,16 @@ const LAB = {
 };
 const opt = (o) => Object.entries(o).map(([value, label]) => ({ value, label }));
 
-function engine(v, ctx = {}) {
+function engine(v, ctx = {}) { const keep = HYD_ACTIVE; try { return engineCore(v, ctx); } finally { HYD_ACTIVE = keep; } }
+function engineCore(v, ctx = {}) {
   const prog = (x, m) => ctx.progress?.(x, m), warnings = [], recommendations = [], plots = [], tables = [], balances = [];
   const { spec, library } = resolveSpec(ctx.fluid, v.fluidSource), tune = tuneOf(v, spec);
   const tRes = clamp(num(v.tRes, 90), -20, 250), pRes = clamp(num(v.pRes, 300), 2, 1400), pRef = clamp(num(v.pRef, 100), 2, 1000), tSea = clamp(num(v.tSeabed, 4), -5, 60), pArr = clamp(num(v.pArr, 25), 1.05, 600), tArr = clamp(num(v.tArr, 30), -20, 150), tIn = clamp(num(spec.Tin, 70), -20, 250);
   if (!(num(v.pRes, 300) > 0)) throw new Error('The reservoir pressure must be a positive absolute pressure in bara.');
   prog(0.02, 'Characterising the fluid');
-  const { ch, f, nKij } = tunedFluid(spec, tune, v.kijTable), opts = ch.opts;
-  lastModel = { spec: JSON.parse(JSON.stringify(spec)), kij: JSON.parse(JSON.stringify(Array.isArray(v.kijTable) ? v.kijTable : [])) };
+  const tx = tuneX(v), { ch, f, nKij } = tunedFluid(spec, tune, v.kijTable, tx), opts = ch.opts;
+  HYD_ACTIVE = { table: hydrateTable(v.hydModel === 'kihara' ? 'kihara' : 'vdwp', tx.hyd), sH: v.shFormer === true };
+  lastModel = { spec: JSON.parse(JSON.stringify(spec)), kij: JSON.parse(JSON.stringify(Array.isArray(v.kijTable) ? v.kijTable : [])), aq: aqueous(spec) };
   const z7 = f.comps.reduce((s, c) => s + (c.pseudo ? c.z : 0), 0), isPseudo = f.comps.map((c) => !!c.pseudo);
 
   // -- property table for the flow solvers (kernel grid, tuned model)
@@ -876,13 +1330,15 @@ function engine(v, ctx = {}) {
   const tPmin = clamp(num(v.tblPmin, 1), 0.5, 50), tPmax = clamp(num(v.tblPmax, 600), 100, 1500), tTmin = clamp(num(v.tblTmin, -30), -60, 20), tTmax = clamp(num(v.tblTmax, 170), 60, 300);
   if (num(v.tblPmax, 600) <= num(v.tblPmin, 1) || num(v.tblTmax, 170) <= num(v.tblTmin, -30)) throw new Error('The upper limit of the property-table range must be above its lower limit.');
   const table = buildTable(spec, { nP, nT, Pmin: tPmin, Pmax: tPmax, Tmin: tTmin, Tmax: tTmax, opts, onProgress: (x) => prog(0.03 + 0.25 * x, 'Building the pressure–temperature property table') });
-  if (nKij > 0) { refillTable(table, spec, f); warnings.push({ level: 'info', msg: `${nKij} binary interaction parameter(s) are overridden by the user table; the property table was recomputed with them.` }); }
+  if (txFluid(tx) && !(nKij > 0)) refillTable(table, spec, f);
+  if (tx.muG !== 1) for (const row of table.muG) for (let j = 0; j < row.length; j++) row[j] *= tx.muG;
+  if (nKij > 0) { refillTable(table, spec, f); if (tx.muG !== 1) for (const row of table.muG) for (let j = 0; j < row.length; j++) row[j] *= tx.muG; warnings.push({ level: 'info', msg: `${nKij} binary interaction parameter(s) are overridden by the user table; the property table was recomputed with them.` }); }
   for (const c of [['reservoir', pRes, tRes], ['cold reference', pRef, tSea], ['arrival', pArr, tArr]]) if (c[1] > tPmax || c[1] < tPmin || c[2] > tTmax || c[2] < tTmin) warnings.push({ level: 'warn', msg: `The ${c[0]} condition (${c[1]} bara, ${c[2]} °C) lies outside the property-table range (${tPmin}–${tPmax} bara, ${tTmin}–${tTmax} °C): the flow solvers will clamp to the edge of the table.` });
   const std = stdFlash(f), rates = table.rates, hasLiq = std.vOil > 0 && std.beta < 1, hasOil = hasLiq && std.gor < 20000, gasSG = std.gasSG ?? f.MW / MW_AIR;
 
   // -- phase envelope
   prog(0.3, 'Tracing the phase envelope');
-  const first = saturationPoint(f, tRes), dewLike = first.P === null || first.type === 'dew';
+  const first = (() => { const X = f.n > 1 ? bubbleWilson(f, tRes) : null, q = X ? saturationPoint(f, tRes, { seed: X }) : null; return q && q.P !== null && q.X ? q : saturationPoint(f, tRes); })(), dewLike = first.P === null || first.type === 'dew';
   const env = traceEnvelope(f, { n: clamp(Math.round(num(v.nEnv, 40)), 10, 300), qualities: dewLike ? [0.5, 0.9, 0.99] : [0.1, 0.5, 0.9] });
   let sat = first;
   if (first.P !== null && !first.X) { const s2 = saturationPoint(f, tRes, { seed: seedFor(env, tRes) }); if (s2.P !== null && s2.X) sat = s2; }
@@ -892,7 +1348,8 @@ function engine(v, ctx = {}) {
   // -- states at the key conditions
   prog(0.42, 'Flashing the key conditions');
   const conds = [{ name: 'Reservoir', P: pRes, T: tRes }, { name: 'Flowline inlet', P: pRef, T: tIn }, { name: 'Cold reference (seabed)', P: pRef, T: tSea }, { name: 'Arrival', P: pArr, T: tArr }, { name: 'Standard', P: P_STD, T: T_STD }];
-  for (const c of conds) { c.s = fluidState(f, c.P, c.T); c.st = f.n > 1 ? stability(f, c.P, c.T + KEL) : { stable: true, tpd: 0 }; }
+  const muScale = (st) => { if (tx.muG !== 1 && st.gas) st.gas.mu *= tx.muG; return st; };
+  for (const c of conds) { c.s = muScale(fluidState(f, c.P, c.T)); c.st = f.n > 1 ? stability(f, c.P, c.T + KEL) : { stable: true, tpd: 0 }; }
   const res = conds[0].s, resOil = res.oil || res.gas, vRes = res.phase === 'two' ? res.beta * res.gas.vm + (1 - res.beta) * res.oil.vm : (res.oil || res.gas).vm;
   const bo = hasOil ? vRes / std.vOil : null, bg = !hasOil || res.phase !== 'oil' ? ((res.gas || res.oil).Z * (tRes + KEL) * P_STD) / (pRes * (T_STD + KEL)) : null;
 
@@ -912,7 +1369,7 @@ function engine(v, ctx = {}) {
   // -- property curves
   prog(0.58, 'Evaluating property curves');
   const nIso = clamp(Math.round(num(v.nIso, 24)), 8, 120), pTop = Math.max(pRes * 1.1, (psat || 0) * 1.15, 50), isoP = logspace(1, pTop, nIso);
-  const iso = isoP.map((P) => ({ P, s: fluidState(f, P, tRes) })), isoCold = isoP.map((P) => ({ P, s: props(f, P, tSea, { thermal: false }) }));
+  const iso = isoP.map((P) => ({ P, s: muScale(fluidState(f, P, tRes)) })), isoCold = isoP.map((P) => ({ P, s: props(f, P, tSea, { thermal: false }) }));
   const ser = (name, arr, get, extra = {}) => { const x = [], y = []; for (const r of arr) { const q = get(r); if (Number.isFinite(q)) { x.push(r.P ?? r.T); y.push(q); } } return { name, x, y, ...extra }; };
   const isoT = linspace(Math.min(tSea, 0) - 5, Math.max(tRes, tIn) + 10, Math.max(8, Math.round(nIso * 0.7))).map((T) => ({ T, s: props(f, pRef, T) }));
 
@@ -921,8 +1378,8 @@ function engine(v, ctx = {}) {
   const models = { act: ['NRTL', 'UNIQUAC', 'Wilson', 'ideal'].includes(v.actModel) ? v.actModel : 'NRTL', elec: ['pitzer', 'davies', 'edh', 'dh'].includes(v.elecModel) ? v.elecModel : 'pitzer' };
   const aqK = aqueous(spec), aqCase = { S: aqK.S, inhId: aqK.inhId, inhWt: aqK.inhWt };
   const custom = v.aqSource === 'custom', brine = custom ? brineFromIons(v.aqIons) : null, aqCus = custom ? { S: brine ? clamp(brine.S, 0, 260) : clamp(num(v.salinityIn, 3.5), 0, 26) * 10, inhId: INHIBITORS[v.inhIn] && v.inhIn !== 'none' && num(v.inhWtIn, 0) > 0 ? v.inhIn : 'none', inhWt: clamp(num(v.inhWtIn, 0), 0, 90) } : null;
-  const awOf = (aq) => (TK) => waterActivity(aq, TK, models).aw, molOf = (aq) => waterActivity(aq, 277, models).molality;
-  const awCase = waterActivity(aqCase, tSea + KEL, models);
+  const awOf = (aq) => (TK) => waterActivity(aq, TK, models, tx).aw, molOf = (aq) => waterActivity(aq, 277, models).molality;
+  const awCase = waterActivity(aqCase, tSea + KEL, models, tx);
   if (awCase.idealInh) warnings.push({ level: 'warn', msg: `No activity-coefficient parameters are held for ${INHIBITORS[aqCase.inhId].name}: its solution with water is treated as ideal (Raoult's law), which overstates the inhibition of alcohols and understates that of glycols by up to about 20 %.` });
   if (models.elec !== 'pitzer' && molOf(aqCase) > 0.7) warnings.push({ level: 'warn', msg: `The ${models.elec === 'davies' ? 'Davies' : 'Debye–Hückel'} model is used at ${molOf(aqCase).toFixed(2)} mol/kg, beyond its range of validity (about 0.5 mol/kg): select the Pitzer model for this brine.` });
 
@@ -955,10 +1412,10 @@ function engine(v, ctx = {}) {
   const sens = [['Base case', pRef, tSea, aqCase.S, margin], ['Pressure +50 %', Math.min(pRef * 1.5, 1000), tSea, aqCase.S, margin], ['Pressure −50 %', Math.max(pRef * 0.5, 2), tSea, aqCase.S, margin], ['Seabed 2 °C colder', pRef, tSea - 2, aqCase.S, margin], ['Seabed 2 °C warmer', pRef, tSea + 2, aqCase.S, margin], ['No safety margin', pRef, tSea, aqCase.S, 0], ['Fresh (condensed) water', pRef, tSea, 0, margin], ['Salinity doubled', pRef, tSea, Math.min(2 * aqCase.S, 260), margin]].map((r, i) => ({ name: r[0], P: r[1], tS: r[2], S: r[3], mg: r[4], w: i === 0 ? inhReq : reqAt(r[1], r[2], r[3], r[4]) }));
 
   // -- water content, gas solubility
-  const wcBuk = waterContent(pArr, tArr) * awOf(aqCase)(tArr + KEL), wcRaoult = waterContentRaoult(pArr, tArr, awOf(aqCase)(tArr + KEL));
+  const wcBuk = waterContent(pArr, tArr) * awOf(aqCase)(tArr + KEL) * tx.wc, wcRaoult = waterContentRaoult(pArr, tArr, awOf(aqCase)(tArr + KEL));
   const fugRef = formerFugacities(f, pRef, tSea), sol = gasSolubility(fugRef, pRef, tSea, molOf(aqCase));
   // water distribution between the gas and the aqueous phase (kg/d) for the case rates
-  const waterDist = [conds[1], conds[2], conds[3]].map((c) => { const wc = waterContent(c.P, c.T) * awOf(aqCase)(c.T + KEL), q = lookup(table, c.P, c.T), sat = wc * ((q.wG * rates.mHC) / (q.mwG * 1e-3)) * VM_STD * 86400, tot = rates.mW * 86400 * (1 - aqCase.inhWt / 100) * (1 - aqCase.S / 1000), inGas = Math.min(sat, tot); return { name: c.name, P: c.P, T: c.T, wc, tot, inGas, free: tot - inGas, satCap: sat }; });
+  const waterDist = [conds[1], conds[2], conds[3]].map((c) => { const wc = waterContent(c.P, c.T) * awOf(aqCase)(c.T + KEL) * tx.wc, q = lookup(table, c.P, c.T), sat = wc * ((q.wG * rates.mHC) / (q.mwG * 1e-3)) * VM_STD * 86400, tot = rates.mW * 86400 * (1 - aqCase.inhWt / 100) * (1 - aqCase.S / 1000), inGas = Math.min(sat, tot); return { name: c.name, P: c.P, T: c.T, wc, tot, inGas, free: tot - inGas, satCap: sat }; });
 
   // -- wax and asphaltenes
   prog(0.86, 'Wax and asphaltene screening');
@@ -1156,6 +1613,90 @@ function engine(v, ctx = {}) {
     inhibitorSensitivity: sens.map((r) => ({ name: r.name, wt: r.w })), waterDistribution: waterDist.map((r) => ({ name: r.name, inGas: r.inGas, free: r.free })), margin, watLive, waxAtSeabed: fin(waxAtSea, 0), waxCurve: { T: waxT, wt: waxT.map((t) => waxDead.solidWt(t)) }, asphalteneRisk: asph?.risk || null, sepGor: fin(sepGor), sepApi: fin(sep.api), bg: fin(bg), jtOutletT: jtOut ? jtOut.T : null, dissolvedGas: fin(sol.sm3, 0),
     qualityLines: env.quality, labAad: Object.fromEntries(Object.entries(lab.aad).map(([k, x]) => [k, fin(x)])),
   };
+  // ---- alternative equations of state, association, solid phases, miscibility, initial solid inventory -------------------------
+  prog(0.93, 'Alternative models and solid-phase equilibria');
+  const altOn = v.altEos !== 'none', altFull = v.altEos === 'all', pct = (a, b) => (Number.isFinite(a) && Number.isFinite(b) && b !== 0 ? cell(100 * (a / b - 1), 3) : '—');
+  const alt = { rows: [], zLine: null };
+  if (altOn) {
+    for (const c of altFull ? [conds[0], conds[2], conds[3]] : [conds[0], conds[3]]) for (const [kindP, st, xx] of [['vapour', c.s.gas, c.s.y], ['liquid', c.s.oil, c.s.x]]) {
+      if (!st) continue;
+      const a = altPhase(f, xx, c.P, c.T, kindP);
+      alt.rows.push({ name: c.name, phase: kindP === 'vapour' ? 'gas' : 'oil', P: c.P, T: c.T, rho: st.rho, sound: st.sound, cp: st.cp, mu: st.mu, a });
+    }
+    // gas compressibility factor of the separator gas along pressure by every model (plot)
+    if (altFull && std.beta > 0 && std.y) { const fg = withZ(f, std.y), Ps = logspace(5, Math.max(pRes, 200), 9), zs = { pr: [], pc: [], ge: [], lk: [] }, tz = Math.max(tArr, 15);
+      for (const P of Ps) { const k = phaseProps(fg, fg.z, P, tz, 'vapour', { thermal: false }), a = altPhase(fg, fg.z, P, tz, 'vapour', { visc: false, thermal: false }), zOf = (r) => (r ? (P * 1e5 * k.MW * 1e-3) / (r.rho * R * (tz + KEL)) : NaN); zs.pr.push(k.Z); zs.pc.push(zOf(a.pcsaft)); zs.ge.push(zOf(a.gerg)); zs.lk.push(a.lk ? a.lk.Z : NaN); }
+      alt.zLine = { P: Ps, T: tz, ...zs }; }
+  }
+  const altOil = alt.rows.find((r) => r.phase === 'oil' && r.name === 'Reservoir') || alt.rows.find((r) => r.phase === 'oil') || null, altGas = alt.rows.find((r) => r.phase === 'gas') || null;
+  // water in gas and inhibitor partitioning by cubic-plus-association
+  const cpaRows = [];
+  if (altOn) for (const c of [conds[3]]) { if (!c.s.gas) continue; try { const r = cpaWater(f, c.s.y, c.P, c.T, { inhId: aqCase.inhId, inhWt: aqCase.inhWt, awSalt: waterActivity({ S: aqCase.S }, c.T + KEL, models, tx).awSalt }); if (r.ok && Number.isFinite(r.wc)) cpaRows.push({ name: c.name, P: c.P, T: c.T, cpa: r.wc * tx.wc, buk: waterContent(c.P, c.T) * awOf(aqCase)(c.T + KEL) * tx.wc, raoult: waterContentRaoult(c.P, c.T, awOf(aqCase)(c.T + KEL)), inhLoss: r.inhLoss, xGas: r.xGas }); } catch { /* CPA has no root at this state */ } }
+  // hydrate: second constants set, structure H and the water-side Gibbs minimum at the cold reference point
+  const solids = ['all', 'hydrate', 'waxAsph', 'none'].includes(v.solidsAllowed) ? v.solidsAllowed : 'all', allowHyd = solids === 'all' || solids === 'hydrate', allowWax = solids === 'all' || solids === 'waxAsph';
+  const hydAlt = vdw && altFull ? (() => { const other = v.hydModel === 'kihara' ? 'vdwp' : 'kihara', r = hydrateTofP(f, pRef, 1, { table: hydrateTable(other, tx.hyd), guess: tHyd0 }); return r ? { model: other === 'kihara' ? 'Kihara cell potential' : 'Munck constants', T: r.T, structure: r.structure } : null; })() : null;
+  const formersZ = f.comps.reduce((q, c, i) => q + (LANGMUIR[c.id] ? f.z[i] : 0), 0), nWater = rates.mW / (MW_W * 1e-3), gasPerWater = nWater > 0 ? (table.rates.nHC * formersZ) / nWater : Infinity;
+  const wEq = vdw ? waterPhaseEquilibrium(f, pRef, tSea, aqCase, models, { gasPerWater, allowHydrate: allowHyd, tune: tx }) : null;
+  const hyd0In = clamp(num(v.hyd0, 0), 0, 100) / 100, solid0In = clamp(num(v.solid0, 0), 0, 60);
+  const gib = [conds[0], conds[2], conds[3]].map((c) => ({ name: c.name, ...gibbsSplit(f, c.P, c.T) }));
+  // asphaltene solid–liquid equilibrium along the depletion at reservoir temperature
+  const aspOpt = { wAspSto: clamp(num(v.saraAsp, 0), 0, 60) / 100, aspMW: clamp(num(v.aspMW, 750), 300, 5000), aspRho: clamp(num(v.aspRho, 1100), 900, 1300), aspDelta: clamp(num(v.aspDelta, 21), 15, 30), aspDeltaT: clamp(num(v.aspDeltaT, 1.07e-3), 0, 3e-3) };
+  const aspP = hasOil ? [...linspace(Math.max(pRes, (psat || pRes) * 1.2), Math.max((psat || 50) * 0.25, 5), 10)] : [], asp2 = hasOil && aspOpt.wAspSto > 0 && allowWax ? asphalteneCurve(f, tRes, aspP, aspOpt) : null;
+  // multiple-contact miscibility with the swelling gas
+  const gasInj = INJECTION_GASES[v.swellGas], mmp = gasInj && hasOil && psatType === 'bubble' && v.mmpCalc === true ? miscibilityPressure(f, gasInj.comp, tRes) : null;
+  // initial solid inventory against the equilibrium at the cold reference point
+  const waxEq = allowWax ? waxAtSea : 0, initRows = [
+    ['Hydrate (fraction of the water inventory)', cell(100 * hyd0In), wEq ? cell(100 * wEq.conversion) : '—', '%', !allowHyd ? 'hydrate phase not permitted: aqueous phase kept metastable' : wEq ? (hyd0In > wEq.conversion + 1e-9 ? `${F(100 * (hyd0In - wEq.conversion))} % of the water dissociates from hydrate` : hyd0In < wEq.conversion - 1e-9 ? `${F(100 * (wEq.conversion - hyd0In))} % of the water can still convert` : 'at equilibrium') : 'gas-gravity correlation: no phase amounts'],
+    ['Wax solids in the stock-tank oil', cell(solid0In), cell(waxEq), 'wt %', !allowWax ? 'solid hydrocarbon phases not permitted' : solid0In > waxEq + 1e-9 ? `${F(solid0In - waxEq, 2)} wt % re-dissolves at ${F(tSea)} °C` : `${F(waxEq - solid0In, 2)} wt % can still precipitate at ${F(tSea)} °C`],
+    ['Asphaltene precipitated at reservoir temperature (maximum over pressure)', '0', asp2 ? cell(asp2.maxPrecip) : '—', 'wt % of liquid', asp2 ? (asp2.maxPrecip > 0 ? `onset between ${asp2.lowerOnset !== null ? F(asp2.lowerOnset) : '—'} and ${asp2.upperOnset !== null ? F(asp2.upperOnset) : '—'} bara` : 'no precipitation predicted') : allowWax ? 'no asphaltene content or no liquid' : 'not permitted'],
+  ];
+  // additional measurements (comparison path for data types without a bundled reference set)
+  const xl = [];
+  if (v.useLab !== false) {
+    const gasAt = (P, T) => { const s = props(f, P, T, { thermal: true }); return { s, g: s.phase !== 'oil' ? derivedProps(f, s.y, P, T, 'vapour') : null, o: s.phase !== 'gas' ? derivedProps(f, s.x, P, T, 'liquid') : null }; };
+    const Q = {
+      rhoG: ['Gas density', 'kg/m³', (P, T) => gasAt(P, T).g?.rho], zG: ['Gas compressibility factor', '–', (P, T) => gasAt(P, T).g?.Z], muG: ['Gas viscosity', 'mPa·s', (P, T) => { const g = gasAt(P, T).g; return g ? g.mu * 1e3 * tx.muG : NaN; }], cpG: ['Gas heat capacity', 'kJ/kg/K', (P, T) => gasAt(P, T).g?.cp / 1000],
+      cpO: ['Oil heat capacity', 'kJ/kg/K', (P, T) => gasAt(P, T).o?.cp / 1000], soundG: ['Speed of sound in the gas', 'm/s', (P, T) => gasAt(P, T).g?.sound], soundO: ['Speed of sound in the oil', 'm/s', (P, T) => gasAt(P, T).o?.sound], co: ['Oil isothermal compressibility', '1/bar', (P, T) => gasAt(P, T).o?.kT],
+      sigma: ['Gas–oil interfacial tension', 'mN/m', (P, T) => { const s = gasAt(P, T).s; return s.phase === 'two' ? s.sigma * 1e3 : NaN; }], wc: ['Water content of the gas', 'mg/Sm³', (P, T) => waterContent(P, T) * awOf(aqCase)(T + KEL) * tx.wc * 1e6], rhoW: ['Aqueous-phase density', 'kg/m³', (P, T) => waterProps(P, T, aqK).rho * tx.rhoW],
+      psat: ['Saturation pressure', 'bara', (P, T) => saturationPoint(f, T, { seed: seedFor(env, T) }).P], hydT: ['Hydrate temperature (case aqueous phase)', '°C', (P) => { const r = vdw ? hydrateTofP(f, P, awOf(aqCase), { molality: molOf(aqCase) }) : null; return r ? r.T : corr(P) - dep; }], jt: ['Joule–Thomson coefficient of the gas', 'K/bar', (P, T) => gasAt(P, T).g?.jtBar],
+    };
+    for (const r of Array.isArray(v.labProps) ? v.labProps : []) { const q = Q[String(r.q || '').trim()], P = +r.p, T = +r.t, m = +r.value; if (!q || !isNum(P) || !isNum(T) || !isNum(m) || !(P > 0)) continue; let c = NaN; try { c = +q[2](clamp(P, 1.02, 1400), clamp(T, -40, 250)); } catch { c = NaN; } xl.push({ name: q[0], unit: q[1], P, T, m, c }); }
+    const lm = num(v.labMmp, 0); if (lm > 0 && mmp && mmp.mmp !== null) xl.push({ name: 'Slim-tube minimum miscibility pressure', unit: 'bara', P: lm, T: tRes, m: lm, c: mmp.mmp });
+    const la = num(v.labAop, 0); if (la > 0 && asp2) xl.push({ name: 'Upper asphaltene onset pressure', unit: 'bara', P: la, T: tRes, m: la, c: asp2.upperOnset ?? NaN });
+  }
+  if (alt.rows.length) {
+    tables.push({ title: 'Alternative equations of state against the cubic model', columns: ['Condition', 'Phase', 'P (bara)', 'T (°C)', `ρ ${f.eosId} (kg/m³)`, 'ρ PC-SAFT', 'Δ (%)', 'ρ GERG-2008', 'Δ (%)', 'ρ Lee–Kesler', 'Δ (%)', `Sound ${f.eosId} (m/s)`, 'Sound PC-SAFT', 'Sound GERG-2008'], rows: alt.rows.map((r) => [r.name, r.phase, cell(r.P), cell(r.T), cell(r.rho), cell(r.a.pcsaft?.rho), pct(r.a.pcsaft?.rho, r.rho), cell(r.a.gerg?.rho), pct(r.a.gerg?.rho, r.rho), cell(r.a.lk?.rho), pct(r.a.lk?.rho, r.rho), cell(r.sound), cell(r.a.pcsaft?.w), cell(r.a.gerg?.w)]), note: 'Residual-Helmholtz models evaluated on the phase compositions of the cubic flash. PC-SAFT (Gross & Sadowski 2001): pure-component parameters of the light components, C7+ pseudo-components interpolated between the n-alkane sets by molar mass. GERG-2008 (reduced to the eleven kernel components): only for phases with at most 1 mol % C7+, counted as n-hexane; “—” otherwise. Lee–Kesler: modified Benedict–Webb–Rubin equation with Kay mixing, gas phase only. The published property table remains the cubic model.' });
+    tables.push({ title: 'Viscosity models', columns: ['Condition', 'Phase', 'P (bara)', 'T (°C)', 'Lohrenz–Bray–Clark (mPa·s)', 'Pedersen corresponding states (mPa·s)', 'Δ (%)'], rows: alt.rows.map((r) => [r.name, r.phase, cell(r.P), cell(r.T), cell(r.mu * 1e3), cell(r.a.muPedersen !== null ? r.a.muPedersen * 1e3 : NaN), pct(r.a.muPedersen, r.mu)]), note: 'Pedersen et al. corresponding-states model with methane as the reference fluid (Hanley et al. viscosity correlation, GERG-2008 methane density). It needs no critical volumes; for oils heavier than about 30 °API it usually reads higher than an untuned Lohrenz–Bray–Clark model.' });
+  }
+  if (alt.zLine) plots.push({ type: 'line', title: `Compressibility factor of the separator gas at ${F(alt.zLine.T)} °C by four equations of state`, xlabel: 'Pressure (bara)', ylabel: 'Z (–)', logx: true, series: [{ name: f.eosId + ' (volume-translated)', x: alt.zLine.P, y: alt.zLine.pr }, ...[['PC-SAFT', alt.zLine.pc], ['GERG-2008', alt.zLine.ge], ['Lee–Kesler', alt.zLine.lk]].map(([name, y]) => { const xs = [], ys = []; y.forEach((q, i) => { if (Number.isFinite(q)) { xs.push(alt.zLine.P[i]); ys.push(q); } }); return { name, x: xs, y: ys, dash: true }; }).filter((q) => q.x.length > 1)], note: 'GERG-2008 is the reference-quality model for natural gas; the spread of the other curves around it is their model error.' });
+  if (cpaRows.length) tables.push({ title: 'Water in gas and inhibitor partitioning by cubic-plus-association', columns: ['Condition', 'P (bara)', 'T (°C)', 'Water in gas, CPA (mg/Sm³)', 'Bukacek (mg/Sm³)', 'Raoult + Poynting (mg/Sm³)', 'Inhibitor lost to gas (mg/Sm³)', 'Gas dissolved in the aqueous phase (mol %)'], rows: cpaRows.map((r) => [r.name, cell(r.P), cell(r.T), cell(r.cpa * 1e6), cell(r.buk * 1e6), cell(r.raoult * 1e6), cell(r.inhLoss * 1e6), cell(100 * r.xGas)]), note: 'CPA (SRK plus Wertheim association; water and MEG four-site, methanol two-site) solves the gas–aqueous equilibrium rigorously, including the inhibitor that leaves with the gas. The salt enters through the water activity of the brine. The flow suites keep the Bukacek value.' });
+  if (vdw) tables.push({ title: 'Hydrate models and stable water-side phases at the cold reference point', columns: ['Quantity', 'Value', 'Unit'], rows: [
+    [`Hydrate temperature, fresh water (${v.hydModel === 'kihara' ? 'Kihara cell potential' : 'Munck constants'})`, cell(tHyd0), '°C'], ...(hydAlt ? [[`Hydrate temperature, fresh water (${hydAlt.model})`, cell(hydAlt.T), '°C'], ['Difference between the two constants sets', cell(hydAlt.T - tHyd0, 3), '°C']] : []),
+    ...(v.shFormer === true && refFresh ? [['Structure-H temperature with the heavy former present', refFresh.TsH !== null && refFresh.TsH !== undefined ? cell(refFresh.TsH) : '—', '°C']] : []),
+    ['Driving force Δμ/RT of water before conversion (> 0: hydrate stable)', wEq ? cell(wEq.drive0) : '—', '–'], ['Stable water-side phases', wEq ? wEq.phases.join(' + ') : '—', ''], ['Water converted to hydrate at equilibrium', wEq ? cell(100 * wEq.conversion) : '—', '%'], ['Conversion limited by', wEq?.limitedBy || '—', ''],
+    ['Gibbs energy released', wEq ? cell(wEq.dG) : '—', 'J per mol of water'], ['Salinity of the remaining brine', wEq ? cell(wEq.saltFinal / 10) : '—', 'wt %'], ['Inhibitor in the remaining aqueous phase', wEq ? cell(wEq.inhFinal) : '—', 'wt %'], ['Hydrate formed', wEq ? cell(wEq.hydrateKgPerKgWater) : '—', 'kg per kg of water'],
+  ], note: 'The water-side Gibbs energy is minimised over aqueous liquid, ice and the hydrate structures: water converts until its chemical potential in the concentrating brine or inhibitor solution equals that in the hydrate, or the water or the hydrate formers run out. Formation kinetics are the solids suite\'s subject.' });
+  tables.push({ title: 'Gibbs energy of the hydrocarbon split', columns: ['Condition', 'g/RT as one phase', 'g/RT at equilibrium', 'Δg/RT (≤ 0)', 'Tangent-plane distance'], rows: gib.map((r) => [r.name, cell(r.g1, 6), cell(r.g2, 6), cell(r.dg, 3), cell(r.tpd, 3)]), note: 'The flash is the minimum of the Gibbs energy: the split never has a higher Gibbs energy than the single phase, and a negative tangent-plane distance marks an unstable feed.' });
+  if (asp2 && asp2.rows.length) {
+    tables.push({ title: `Asphaltene solid–liquid equilibrium at ${F(tRes)} °C (Flory–Huggins)`, columns: ['P (bara)', 'Liquid solubility parameter (MPa^0.5)', 'Soluble limit (vol %)', 'Asphaltene in liquid (vol %)', 'Precipitated (wt % of liquid)'], rows: asp2.rows.map((r) => [cell(r.P), cell(r.deltaL), cell(100 * r.phiMax), cell(100 * r.phiA), cell(r.precipWt)]), note: `Hirschberg-type regular-solution model: liquid solubility parameter from the cohesive energy of the equation of state, asphaltene molar mass ${F(aspOpt.aspMW, 0)} g/mol, density ${F(aspOpt.aspRho, 0)} kg/m³ and solubility parameter ${F(aspOpt.aspDelta, 2)} MPa^0.5 at 25 °C (inputs; tune the solubility parameter to a measured onset pressure). ${asp2.maxPrecip > 0 ? `Precipitation is predicted between ${asp2.lowerOnset !== null ? F(asp2.lowerOnset) : 'the lowest pressure examined'} and ${asp2.upperOnset !== null ? F(asp2.upperOnset) : '—'} bara, at most ${F(asp2.maxPrecip, 2)} wt % near ${F(asp2.pAtMax)} bara.` : 'No precipitation is predicted over the pressure range.'}` });
+    plots.push({ type: 'line', title: 'Asphaltene stability along the depletion', xlabel: 'Pressure (bara)', ylabel: 'Volume fraction (%)', series: [{ name: 'Soluble limit', x: asp2.rows.map((r) => r.P), y: asp2.rows.map((r) => Math.min(100 * r.phiMax, 100)) }, { name: 'Asphaltene in the liquid', x: asp2.rows.map((r) => r.P), y: asp2.rows.map((r) => 100 * r.phiA), dash: true }], vlines: psat !== null ? [{ x: psat, label: 'saturation' }] : [], note: 'Asphaltene precipitates where its content exceeds the soluble limit; the limit is lowest near the bubble point, where the liquid is lightest.' });
+  }
+  if (mmp && mmp.mmp !== null) tables.push({ title: `Miscibility of ${gasInj.name.toLowerCase()} with the reservoir fluid at ${F(tRes)} °C`, columns: ['Quantity', 'Value', 'Unit'], rows: [['Multiple-contact miscibility pressure', mmp.capped && !mmp.mechanism ? `> ${F(mmp.mmp, 0)}` : cell(mmp.mmp), 'bara'], ['Mechanism', mmp.mechanism || 'not miscible below the limit', ''], ['Reservoir pressure', cell(pRes), 'bara'], ['Displacement at reservoir pressure', mmp.mechanism && pRes >= mmp.mmp ? 'miscible' : 'immiscible', '']], note: 'Single-cell multiple-contact test with the equation of state (six forward and six backward contacts, pressure resolved to about 3 %): an estimate of the slim-tube minimum miscibility pressure. A slim-tube displacement with a combined condensing/vaporising drive can be miscible at a somewhat lower pressure.' });
+  tables.push({ title: `Initial solid inventory against equilibrium at ${F(pRef)} bara, ${F(tSea)} °C`, columns: ['Solid phase', 'Initial', 'Equilibrium', 'Unit', 'Consequence'], rows: initRows, note: `Solid phases permitted: ${{ all: 'hydrate, ice, wax and asphaltene', hydrate: 'hydrate and ice only', waxAsph: 'wax and asphaltene only', none: 'none (fluid phases only)' }[solids]}. The initial amounts are inputs (for example the state after a shut-in); the equilibrium amounts are what the thermodynamic model allows at the cold reference point.` });
+  if (xl.length) tables.push({ title: 'Additional measurements against the model', columns: ['Measurement', 'P (bara)', 'T (°C)', 'Measured', 'Model', 'Unit', 'Deviation (%)'], rows: xl.map((r) => [r.name, cell(r.P), cell(r.T), cell(r.m), cell(r.c), r.unit, pct(r.c, r.m)]), note: 'Comparison path for measurement types that have no bundled reference set (interfacial tension, water content, calorimetry, speed of sound, compressibility, slim tube, asphaltene onset): enter the points in the “Other measurements” table.' });
+  if (v.shFormer === true && refFresh && refFresh.structure === 'sH') warnings.push({ level: 'warn', msg: `With a structure-H former in the liquid the hydrate is stable up to ${F(refFresh.T)} °C at ${F(pRef)} bara as structure H — warmer than structures I and II would allow.` });
+  if (asp2 && asp2.maxPrecip > 0) warnings.push({ level: 'warn', msg: `The asphaltene solid-phase model predicts up to ${F(asp2.maxPrecip, 2)} wt % precipitation near ${F(asp2.pAtMax)} bara at ${F(tRes)} °C (upper onset ${asp2.upperOnset !== null ? F(asp2.upperOnset) + ' bara' : 'above the range'}); confirm with a measured onset pressure and tune the asphaltene solubility parameter.` });
+  if (mmp && mmp.mechanism && pRes < mmp.mmp) recommendations.push(`${gasInj.name} is not multiple-contact miscible with the oil at ${F(pRes)} bara: the estimated miscibility pressure is ${F(mmp.mmp)} bara (${mmp.mechanism}); a slim-tube test would confirm it.`);
+  if (wEq && wEq.conversion > 0 && wEq.conversion < 1) recommendations.push(`At the cold reference point ${F(100 * wEq.conversion)} % of the water can convert to hydrate before the remaining aqueous phase (${F(wEq.saltFinal / 10)} wt % salt, ${F(wEq.inhFinal)} wt % inhibitor) is self-inhibited: the plugging potential is bounded by that amount.`);
+  if (altGas && altGas.a.gerg && Math.abs(altGas.a.gerg.rho / altGas.rho - 1) > 0.03) warnings.push({ level: 'info', msg: `The ${f.eosId} gas density at ${altGas.name.toLowerCase()} conditions differs from GERG-2008 by ${F(100 * (altGas.rho / altGas.a.gerg.rho - 1))} %: use the GERG value for fiscal or line-pack calculations.` });
+  kpis.push({ label: 'Oil viscosity, Pedersen', value: altOil && altOil.a.muPedersen !== null ? rd(altOil.a.muPedersen * 1e3, 3) : '—', unit: 'mPa·s', help: 'Corresponding-states cross-check of the Lohrenz–Bray–Clark value' },
+    { label: 'Asphaltene onset', value: asp2 && asp2.upperOnset !== null ? rd(asp2.upperOnset) : '—', unit: 'bara', status: asp2 && asp2.maxPrecip > 0 ? 'warn' : 'ok', help: 'Upper onset pressure of the Flory–Huggins solid-phase model at reservoir temperature' });
+  Object.assign(outputs, {
+    altEos: alt.rows.map((r) => ({ name: r.name, phase: r.phase, rho: fin(r.rho), rhoPcSaft: fin(r.a.pcsaft?.rho), rhoGerg: fin(r.a.gerg?.rho), rhoLeeKesler: fin(r.a.lk?.rho), muPedersen: fin(r.a.muPedersen) })),
+    waterContentCpa: cpaRows.length ? fin(cpaRows[0].cpa) : null, inhibitorLossToGas: cpaRows.length ? fin(cpaRows[0].inhLoss) : null, hydrateConstants: v.hydModel === 'kihara' ? 'kihara' : 'munck', hydrateTAlt: hydAlt ? fin(hydAlt.T) : null,
+    hydrateConversion: wEq ? fin(wEq.conversion) : null, hydratePhases: wEq ? wEq.phases : null, hydrateGibbs: wEq ? fin(wEq.dG) : null, solidsPermitted: solids, initialHydrate: hyd0In, initialSolids: solid0In,
+    asphalteneOnset: asp2 ? { upper: fin(asp2.upperOnset), lower: fin(asp2.lowerOnset), maxPrecip: fin(asp2.maxPrecip, 0) } : null, mmp: mmp ? fin(mmp.mmp) : null, mmpMechanism: mmp ? mmp.mechanism : null, calibrationMultipliers: { ...tx },
+  });
   const kind = !hasOil || rates.gor > 50000 ? 'dry gas' : psatType === 'dew' || (psat === null && rates.gor > 900) ? (rates.gor > 10000 ? 'wet gas' : 'gas condensate') : rates.gor > 350 ? 'volatile oil' : 'black oil';
   const summary = `${spec.name || 'The case fluid'} behaves as a ${kind} (${f.eosId}, ${f.n} components): ${psat !== null ? `${psatType} point ${F(psat)} bara at ${F(tRes)} °C` : `no saturation pressure at ${F(tRes)} °C`}${rates.gor !== null && hasOil ? `, GOR ${F(rates.gor)} Sm³/Sm³, ${F(std.api)} °API` : `, gas gravity ${F(gasSG, 3)}`}; hydrate equilibrium ${F(tHyd)} °C at ${F(pRef)} bara (${subcool > 0 ? `${F(subcool)} °C subcooling at the seabed` : 'outside the hydrate region at the seabed'})${wat !== null ? `, wax appearance ${F(wat)} °C` : ''}.`;
   prog(1, 'Done');
@@ -1164,20 +1705,37 @@ function engine(v, ctx = {}) {
 
 // ---- calibration model ----------------------------------------------------------------------------------------------------------
 const calCache = new Map();
-/** Predictions for one laboratory point: saturation pressure at calT, liquid density, viscosity and solution GOR at (calP, calT). */
+/**
+ * Predictions for one laboratory point at (calP, calT): saturation pressure at calT, liquid density, viscosity and solution GOR, and —
+ * evaluated only when a row asks for them — formation-volume factor, properties of the produced (stock-tank flash) gas, liquid heat
+ * capacity and compressibility, interfacial tension, water content, aqueous density, water activity and hydrate temperature for the
+ * aqueous phase of the row (calSal wt % NaCl, calInhWt wt % of the design inhibitor) and the multiple-contact miscibility pressure.
+ */
 export function calibrationModel(v) {
-  const src = FLUID_LIBRARY[v.fluidSource] ? resolveSpec(null, v.fluidSource).spec : lastModel?.spec || mergeSpec(null), tune = tuneOf(v, src);
-  const T = clamp(num(v.calT, num(v.tRes, 90)), -20, 250), P = clamp(num(v.calP, num(v.pRes, 300)), 1.02, 1400);
-  const key = JSON.stringify([v.fluidSource, src.comp, src.c7MW, src.c7SG, tune, v.kijTable || null]);
+  const src = FLUID_LIBRARY[v.fluidSource] ? resolveSpec(null, v.fluidSource).spec : lastModel?.spec || mergeSpec(null), tune = tuneOf(v, src), tx = tuneX(v);
+  const T = clamp(num(v.calT, num(v.tRes, 90)), -20, 250), P = clamp(num(v.calP, num(v.pRef, 100)), 1.02, 1400);
+  const key = JSON.stringify([v.fluidSource, src.comp, src.c7MW, src.c7SG, tune, v.kijTable || null, tx.shift, tx.par, tx.cp]);
   let m = calCache.get(key);
-  if (!m) { m = { f: tunedFluid(src, tune, v.kijTable).f, sat: new Map() }; if (calCache.size > 400) calCache.clear(); calCache.set(key, m); }
+  if (!m) { m = { f: tunedFluid(src, tune, v.kijTable, tx).f, sat: new Map() }; if (calCache.size > 400) calCache.clear(); calCache.set(key, m); }
   const f = m.f;
   let sat = m.sat.get(T);
   if (!sat) { const seedKey = `${v.fluidSource}|${T}`, seed = calCache.get(seedKey); sat = saturationPoint(f, T, { seed: seed || null }); if (sat.X) calCache.set(seedKey, sat.X); m.sat.set(T, sat); }
   const s = pv(f, P, T), liq = s.phase === 'gas' ? null : s.oil;
   let rs = null;
   if (liq) { const fl = stdFlash(withZ(f, s.x)); rs = fl.vOil > 0 ? fl.vGas / fl.vOil : null; }
-  return { psat: sat.P ?? NaN, rho: (liq || s.gas).rho, mu: (liq || s.gas).mu * 1e3, rs: rs ?? NaN };
+  const out = { psat: sat.P ?? NaN, rho: (liq || s.gas).rho, mu: (liq || s.gas).mu * 1e3, rs: rs ?? NaN };
+  const lazy = (k, fn) => Object.defineProperty(out, k, { enumerable: true, configurable: true, get() { let q; try { q = +fn(); } catch { q = NaN; } if (!Number.isFinite(q)) q = NaN; Object.defineProperty(out, k, { value: q, enumerable: true, configurable: true }); return q; } });
+  const inhId = INHIBITORS[v.inhDesign] && v.inhDesign !== 'none' ? v.inhDesign : 'MEG', inhWt = clamp(num(v.calInhWt, 0), 0, 90), S = clamp(num(v.calSal, (lastModel?.aq?.S ?? 35) / 10), 0, 26) * 10, aq = { S, inhId: inhWt > 0 ? inhId : 'none', inhWt };
+  const models = { act: ['NRTL', 'UNIQUAC', 'Wilson', 'ideal'].includes(v.actModel) ? v.actModel : 'NRTL', elec: ['pitzer', 'davies', 'edh', 'dh'].includes(v.elecModel) ? v.elecModel : 'pitzer' }, awT = (TK) => waterActivity(aq, TK, models, tx).aw;
+  let gm = null, lm = null;
+  const gas = () => (gm ||= (() => { const st = stdFlash(f), fg = withZ(f, st.beta > 0 ? st.y : f.z); return derivedProps(fg, fg.z, P, T, 'vapour'); })()), liqD = () => (lm ||= liq ? derivedProps(f, s.x, P, T, 'liquid') : gas());
+  lazy('bo', () => { if (!liq) return NaN; const fl = stdFlash(withZ(f, s.x)); return fl.vOil > 0 ? liq.vm / fl.vOil : NaN; });
+  lazy('rhoG', () => gas().rho); lazy('zG', () => gas().Z); lazy('muG', () => gas().mu * 1e3 * tx.muG); lazy('sound', () => gas().sound);
+  lazy('cp', () => liqD().cp / 1000); lazy('co', () => liqD().kT * 1e4); lazy('sigma', () => (s.phase === 'two' ? s.sigma * 1e3 : NaN));
+  lazy('rhoW', () => waterProps(P, T, { S, inhWt, inh: INHIBITORS[inhId] }).rho * tx.rhoW); lazy('wc', () => waterContent(P, T) * awT(T + KEL) * tx.wc * 1e6); lazy('aw', () => awT(T + KEL));
+  lazy('hydT', () => { const r = hydrateTofP(f, P, awT, { table: hydrateTable(v.hydModel === 'kihara' ? 'kihara' : 'vdwp', tx.hyd), sH: v.shFormer === true, molality: waterActivity(aq, 277, models).molality, guess: 10 }); return r ? r.T : NaN; });
+  lazy('mmp', () => miscibilityPressure(f, (INJECTION_GASES[v.swellGas] || INJECTION_GASES.lean).comp, T).mmp);
+  return out;
 }
 
 // ---- verification -----------------------------------------------------------------------------------------------------------------
@@ -1238,9 +1796,9 @@ function verifyChecks() {
   chk('Structure selection: 1 % propane turns methane hydrate into structure II', 2, hydrateTofP(makeFluid({ comp: { C1: 99, C3: 1 } }), 43.6).structure === 'sII' ? 2 : 1, 0, 'Lowest dissociation pressure decides the structure');
   chk('Inhibitor response: 50 wt % MEG on methane hydrate at 99 bara', 22.6, (() => { const m = makeFluid({ comp: { C1: 100 } }); return hydrateTofP(m, 98.9).T - hydrateTofP(m, 98.9, (TK) => waterActivity({ inhId: 'MEG', inhWt: 50 }, TK).aw).T; })(), 2, 'Measured depression of about 22–23 K (Robinson & Ng type data)');
   chk('Debye–Hückel osmotic constant of water at 25 °C', 0.3915, debyeHuckel(298.15).Aphi, 0.002, 'From the density and dielectric constant of water');
-  chk('Pitzer osmotic coefficient of 1 mol/kg NaCl at 25 °C', 0.9355, osmoticNaCl('pitzer', 1), 0.003, 'Robinson & Stokes tabulation');
-  chk('Pitzer osmotic coefficient of 6 mol/kg NaCl at 25 °C', 1.2706, osmoticNaCl('pitzer', 6), 0.01, 'Robinson & Stokes tabulation');
-  chk('Pitzer mean activity coefficient of 1 mol/kg NaCl at 25 °C', 0.657, gammaNaCl('pitzer', 1), 0.005, 'Robinson & Stokes tabulation');
+  chk('Pitzer osmotic coefficient of 1 mol/kg NaCl at 25 °C', 0.936, osmoticNaCl('pitzer', 1), 0.003, 'Hamer & Wu (1972) Table 16');
+  chk('Pitzer osmotic coefficient of 6 mol/kg NaCl at 25 °C', 1.27, osmoticNaCl('pitzer', 6), 0.01, 'Hamer & Wu (1972) Table 16');
+  chk('Pitzer mean activity coefficient of 1 mol/kg NaCl at 25 °C', 0.657, gammaNaCl('pitzer', 1), 0.005, 'Hamer & Wu (1972) Table 16');
   chk('Davies mean activity coefficient of 0.1 mol/kg NaCl at 25 °C', 0.778, gammaNaCl('davies', 0.1), 0.01, 'Measured value 0.778');
   { const m = 2, d = 1e-4, lhs = (osmoticNaCl('pitzer', m + d) * (m + d) - osmoticNaCl('pitzer', m - d) * (m - d)) / (2 * d) - 1, rhs = (m * (Math.log(gammaNaCl('pitzer', m + d)) - Math.log(gammaNaCl('pitzer', m - d)))) / (2 * d);
     chk('Gibbs–Duhem consistency of the Pitzer model', 0, lhs - rhs, 1e-6, 'd[m(φ − 1)]/dm = m d ln γ±/dm at 2 mol/kg'); }
@@ -1258,8 +1816,170 @@ function verifyChecks() {
     chk('Property-table interpolation error (oil density at an off-grid point)', d.oil.rho, q.rhoO, 0.01 * d.oil.rho, 'Bilinear look-up in ln P and T against a direct flash at 77 bara, 43 °C, kg/m³'); }
   { const a = calibrationModel({ tcMult: 1.02, pcMult: 0.97, calT: 90, calP: 150 }), b = calibrationModel({ tcMult: 1.02, pcMult: 0.97, calT: 90, calP: 150 });
     chk('Regression reproducibility', a.psat, b.psat, 0, 'Identical parameters give bit-identical predictions (deterministic model)'); }
+  // ---- sourced constants, Helmholtz models, association, corresponding states, solids --------------------------------------------
+  { const ref = (fl, T, P) => NIST_ISO.find((r) => r.f === fl && r.T === T && r.P === P), a = ref('C1', 300, 101), g = gergModel(['C1']), pc = pcsaftModel([{ ...COMPONENTS.C1 }]), sat = NIST_SAT.find((r) => r.f === 'C1' && r.T === 155);
+    chk('Kernel constants: critical temperature of methane equals the source value', 190.564, COMPONENTS.C1.Tc, 1e-9, 'CoolProp fluid file (Setzmann & Wagner reference equation), K');
+    chk('GERG-2008: methane density at 300 K, 101 bar', a.rho, hRho(g, 300, 101, [1]) * g.M[0] * 1e-3, 0.002 * a.rho, 'NIST WebBook value, kg/m³ (within 0.2 %)');
+    chk('GERG-2008: vapour pressure of methane at 155 K', sat.P, hPsat(g, 155).P, 0.003 * sat.P, 'NIST WebBook saturation line, bar');
+    chk('PC-SAFT: vapour pressure of methane at 155 K', sat.P, hPsat(pc, 155).P, 0.02 * sat.P, 'NIST WebBook saturation line, bar (Gross & Sadowski parameters, within 2 %)');
+    chk('PC-SAFT: ideal-gas limit of Z', 1, hZ(pc, 300, 0.4, [1]), 1e-4, 'Methane at 0.4 mol/m³ (about 0.01 bar), 300 K');
+    const b = ref('C1', 300, 1), q = hProps(g, 300, hRho(g, 300, 1, [1]), [1], cpIg(c1, [1], 300));
+    chk('Helmholtz formulation: speed of sound of methane at 300 K, 1 bar (GERG-2008)', b.w, q.w, 0.004 * b.w, 'From the residual Helmholtz energy and its derivatives plus the kernel ideal-gas heat capacity; NIST value, m/s');
+    const mu = ref('C1', 300, 101); chk('Pedersen viscosity: methane at 300 K, 101 bar', mu.mu, viscosityPedersen([COMPONENTS.C1], [1], 101, 300).mu * 1e6, 0.03 * mu.mu, 'Reference fluid of the corresponding-states model; NIST value, µPa·s');
+    chk('Methane reference viscosity (Hanley et al.) at 300 K, 1 bar', b.mu, methaneViscosity(300, b.rho) * 1e6, 0.02 * b.mu, 'Dilute-gas limit of the reference correlation; NIST value, µPa·s');
+    const lk = leeKesler(300 / 190.564, 101 / 45.992, 0.01142), zN = (101e5 * 16.0428e-3) / (a.rho * R * 300); chk('Lee–Kesler (modified BWR): Z of methane at 300 K, 101 bar', zN, lk.Z, 0.012, 'NIST value from the reference density');
+    const e = ref('C1', 300, 1), hN = (a.h - e.h) * 16.0428, hi = leeKesler(300 / 190.564, 1 / 45.992, 0.01142); chk('Lee–Kesler enthalpy departure: methane 1 → 101 bar at 300 K', hN, (lk.hDep - hi.hDep) * R * 190.564, 0.06 * Math.abs(hN), 'Isothermal enthalpy change from the NIST WebBook, J/mol (within 6 %)'); }
+  { const m = gergModel(['C1', 'C2', 'CO2', 'N2']), x = [0.85, 0.08, 0.04, 0.03], T = 280, r = hRho(m, T, 80, x), P = hProps(m, T, r, x).P, d = 0.02, lp = (p) => hLnPhi(m, T, hRho(m, T, p, x), x), a = lp(P + d), b = lp(P - d); let sm = 0; x.forEach((xi, i) => (sm += (xi * (a[i] - b[i])) / (2 * d)));
+    chk('Helmholtz formulation: Gibbs–Duhem consistency of the GERG-2008 fugacity coefficients', 1, sm / ((hZ(m, T, r, x) - 1) / P), 2e-4, 'Σ x ∂ln φ/∂P divided by (Z − 1)/P for a four-component natural gas at 280 K, 80 bar');
+    const gT = (t) => { const rr = hRho(m, t, 80, x), l = hLnPhi(m, t, rr, x); let s = 0; x.forEach((xi, i) => (s += xi * l[i])); return s; };
+    chk('Helmholtz formulation: residual enthalpy against the Gibbs–Helmholtz relation', 1, hProps(m, T, r, x).hRes / ((-R * T * T * (gT(T + 0.05) - gT(T - 0.05))) / 0.1), 2e-4, 'RT(Z − 1 − T ∂ar/∂T) against −RT² ∂(Σ x ln φ)/∂T'); }
+  { const w = C1_WATER_VLE.find((r) => r.T > 298 && r.T < 299) || C1_WATER_VLE[0], y = cpaWater(c1, [1], w.P, w.T - KEL).yW; chk('Cubic-plus-association: water in methane', w.yw, y, 0.35 * w.yw, `Frost et al. (2014) at ${w.T} K, ${w.P} bar, mole fraction (single measurement, within 35 %)`);
+    const m = cpaModel([{ id: 'W' }]), rw = hRho(m, 298.15, 1, [1], 'liquid') * 18.015e-3; chk('Cubic-plus-association: density of liquid water at 25 °C', 997, rw, 30, 'Published CPA water parameters reproduce the liquid density within about 3 %, kg/m³');
+    const ps = hPsat(m, 373.15); chk('Cubic-plus-association: vapour pressure of water at 100 °C', 1.013, ps ? ps.P : NaN, 0.04, 'One atmosphere at the normal boiling point, bar'); }
+  { const r1 = HYDRATE_DATA.pure.rows.find((r) => r.y.C1 === 100), r2 = HYDRATE_DATA.sH.rows.find((r) => r.ds === 986), m1 = makeFluid({ comp: { C1: 100 } });
+    chk('Kihara cell-potential hydrate option: methane point of Deaton & Frost', r1.T, hydrateTofP(m1, r1.P, 1, { table: KIHARA, sH: false, guess: r1.T - KEL }).T + KEL, 1.2, `NIST hydrate database: ${r1.T} K at ${r1.P} bar`);
+    chk('Kihara Langmuir constant: tabulated interpolation against the direct integral', 1, langmuirC('C1', 'sI', 1, 281.3, KIHARA) / kiharaC(...KIHARA.guests.C1, ...KIHARA.cav.sI[1], 281.3), 5e-4, 'ln C interpolated in 1/T on a 5 K grid');
+    chk('Structure-H hydrate: methane + methylcyclohexane point not used in the regression', r2.T, hydrateTofP(m1, r2.P, 1, { table: LANGMUIR, sH: true, guess: r2.T - KEL }).T + KEL, 0.6, `NIST hydrate database set 986: ${r2.T} K at ${r2.P} bar`);
+    const eq = waterPhaseEquilibrium(m1, 100, 4, { S: 35 }, {}, { table: LANGMUIR, sH: false }), back = hydrateTofP(m1, 100, (TK) => waterActivity({ S: eq.saltFinal }, TK).aw, { table: LANGMUIR, sH: false, molality: waterActivity({ S: eq.saltFinal }, 277).molality, guess: 4 });
+    chk('Water-side Gibbs minimum: the residual brine is at hydrate equilibrium', 4, back ? back.T : NaN, 0.35, 'Methane, 100 bara, 4 °C, 3.5 wt % brine: the hydrate temperature of the brine left after conversion, solved independently, equals the system temperature');
+    chk('Water-side Gibbs minimum: fresh water converts completely', 1, waterPhaseEquilibrium(m1, 100, 4, { S: 0 }, {}, { table: LANGMUIR, sH: false }).conversion, 1e-9, 'No solute to stop the conversion and excess gas');
+    chk('Gibbs energy decreases on hydrate formation', 1, eq.dG < 0 ? 1 : 0, 0, `ΔG = ${eq.dG.toFixed(0)} J per mol of water`); }
+  { const g = gibbsSplit(f, 100, 60); chk('Gibbs-energy minimisation: the two-phase split lowers the Gibbs energy', 1, g.dg < 0 && g.tpd < 0 ? 1 : 0, 0, `Δg/RT = ${g.dg.toFixed(4)}, tangent-plane distance ${g.tpd.toFixed(3)} at 100 bara, 60 °C`);
+    const h = NACL_25C.find((r) => r.m === 1), h6 = NACL_25C.find((r) => r.m === 6); chk('Pitzer (PHREEQC parameters): osmotic coefficient at 1 and 6 mol/kg', h.phi + h6.phi, osmoticNaCl('pitzer', 1) + osmoticNaCl('pitzer', 6), 0.006, 'Hamer & Wu (1972) Table 16');
+    const fz = MEOH_FREEZING.find((r) => r.w === 20.6); chk('Freezing point of 20.6 wt % methanol', fz.tf, freezingPoint({ inhId: 'MeOH', inhWt: 20.6 }), 0.8, 'Tabulated value −15.6 °C');
+    const fh = asphalteneFH({ deltaL: 16, vL: 2e-4, TK: 350, wAsp: 0.03, rhoL: 800, aspMW: 750, aspRho: 1100, aspDelta: 21, aspDeltaT: 0 }), Va = 0.75 / 1100, rr = Va / 2e-4;
+    chk('Asphaltene Flory–Huggins equilibrium: residual of the solubility equation', 0, Math.log(fh.phiMax) + (1 - rr) * (1 - fh.phiMax) + fh.chi * (1 - fh.phiMax) ** 2, 1e-8, 'ln φ + (1 − Va/VL)(1 − φ) + χ(1 − φ)² at the returned soluble limit');
+    chk('Asphaltene Flory–Huggins equilibrium: complete miscibility when the solubility parameters match', 1, asphalteneFH({ deltaL: 21, vL: 2e-4, TK: 350, wAsp: 0.03, rhoL: 800, aspDelta: 21, aspDeltaT: 0 }).phiMax, 1e-12, 'χ = 0 and Va > VL: no solid phase');
+    const lean = miscibilityPressure(f, INJECTION_GASES.lean.comp, 90).mmp, rich = miscibilityPressure(f, INJECTION_GASES.rich.comp, 90).mmp; chk('Multiple-contact miscibility: enrichment lowers the miscibility pressure', 1, rich < lean ? 1 : 0, 0, `Lean gas ${lean.toFixed(0)} bara, enriched gas ${rich.toFixed(0)} bara at 90 °C`);
+    const a = calibrationModel({ calT: 60, calP: 80 }), b = calibrationModel({ calT: 60, calP: 80, shiftMult: 1.3, parMult: 1.1 }); chk('Calibration parameters act on their targets', 1, Math.abs(b.rho - a.rho) > 0.5 && Math.abs(b.sigma / a.sigma - 1) > 0.05 ? 1 : 0, 0, `Volume-shift multiplier 1.3 moves the liquid density from ${a.rho.toFixed(1)} to ${b.rho.toFixed(1)} kg/m³; parachor multiplier 1.1 the interfacial tension from ${a.sigma.toFixed(2)} to ${b.sigma.toFixed(2)} mN/m`); }
   return out;
 }
+
+// ---- sourced reference data sets (rows in ../data/ref/pvt.js) with the engine's blind predictions ------------------------------
+const pureCache = new Map();
+const pureFluid = (id) => { let f = pureCache.get(id); if (!f) { f = makeFluid({ comp: { [id]: 100 } }); pureCache.set(id, f); } return f; };
+const pureKind = (r) => (r.ph === 'l' ? 'liquid' : 'vapour');
+const purePhase = (r) => derivedProps(pureFluid(r.f), [1], r.P, r.T - KEL, pureKind(r));
+const mixCache = new Map();
+const mixFluid = (y) => { const k = JSON.stringify(y); let f = mixCache.get(k); if (!f) { f = makeFluid({ comp: y }); if (mixCache.size > 300) mixCache.clear(); mixCache.set(k, f); } return f; };
+const saltOf = (r) => (r.ws !== undefined ? r.ws * 10 : r.xs ? (1000 * r.xs * MW_NACL) / (r.xs * MW_NACL + (1 - r.xs) * MW_W) : 0); // g NaCl per kg brine
+const hydModelT = (table, sH = false) => (r) => { const S = saltOf(r), aq = { S, inhId: r.inh || 'none', inhWt: r.w || 0 }, plain = !(S > 0) && !(r.w > 0); const h = hydrateTofP(mixFluid(r.y), r.P, plain ? 1 : (TK) => waterActivity(aq, TK).aw, { table, sH, molality: plain ? 0 : waterActivity(aq, 277).molality, guess: r.T - KEL, Tmax: 60 }); return h ? h.T + KEL : NaN; };
+const gasLabel = (y) => Object.entries(y).map(([k, q]) => `${k} ${q}`).join(', ');
+const withGas = (rows) => rows.map((r) => ({ ...r, gas: gasLabel(r.y), aq: r.w ? `${r.w} wt % ${r.inh}` : r.ws !== undefined ? `${r.ws} wt % NaCl` : r.xs ? `${(saltOf(r) / 10).toFixed(2)} wt % NaCl` : 'water' }));
+const C_FL = { key: 'f', label: 'Fluid', type: 'text' }, C_T = { key: 'T', label: 'Temperature', unit: 'K' }, C_P = { key: 'P', label: 'Pressure', unit: 'bar' };
+const isoZ = NIST_ISO.filter((r) => r.ph !== 'l').map((r) => ({ ...r, Z: +((r.P * 1e5 * COMPONENTS[r.f].MW * 1e-3) / (r.rho * R * r.T)).toPrecision(5) }));
+const isoLiq = [...NIST_ISO.filter((r) => r.ph === 'l'), ...NIST_SAT.filter((r) => r.T / COMPONENTS[r.f].Tc < 0.9).map((r) => ({ f: r.f, T: r.T, P: r.P, rho: r.rhoL, ph: 'l', sat: true }))];
+const satRows = NIST_SAT.map((r) => ({ ...r, dh: +(r.hV - r.hL).toPrecision(5), sigma: +(r.sig * 1e3).toPrecision(4) }));
+const pureSat = (r) => { const f = pureFluid(r.f), P = purePsat(r.f, r.T); return { f, P, l: phaseProps(f, [1], P, r.T - KEL, 'liquid', { thermal: false }), v: phaseProps(f, [1], P, r.T - KEL, 'vapour', { thermal: false }) }; };
+const nistSrc = (what) => ({ ...SOURCES.nist, citation: SOURCES.nist.citation + ` — ${what}` }), hydSrc = (k) => ({ ...SOURCES.nistHyd, citation: `${HYDRATE_DATA[k].cite}. As compiled in: ${SOURCES.nistHyd.citation}` });
+const hydCols = [{ key: 'gas', label: 'Dry gas (mol %)', type: 'text' }, { key: 'aq', label: 'Aqueous phase', type: 'text' }, C_P, { key: 'T', label: 'Measured dissociation temperature', unit: 'K' }];
+const gergPure = new Map(), gergOf = (id) => { let m = gergPure.get(id); if (!m) { m = gergModel([id]); gergPure.set(id, m); } return m; };
+const pcsPure = new Map(), pcsOf = (id) => { let m = pcsPure.get(id); if (!m) { m = pcsaftModel([{ ...COMPONENTS[id] }]); pcsPure.set(id, m); } return m; };
+const hDens = (mOf) => (r) => { const m = mOf(r.f), q = hRho(m, r.T, r.P, [1], r.ph === 'l' ? 'liquid' : r.ph === 'v' ? 'vapour' : 'stable'); return q === null ? NaN : q * m.M[0] * 1e-3; };
+const c1 = () => pureFluid('C1'), wcOfY = (y) => ((y / (1 - y)) * MW_W * 1e-3) / VM_STD * 1e6; // mg/Sm³
+const VALIDATION = [
+  { id: 'nist-gas-z', title: 'Compressibility factor of gases and supercritical fluids, 250–450 K, 1–1000 bar', quantity: 'Compressibility factor Z', unit: '–', kind: 'reference-fluid', source: nistSrc('isotherms of methane, ethane, propane, n-butane, carbon dioxide, nitrogen and hydrogen sulphide'),
+    columns: [C_FL, C_T, C_P, { key: 'Z', label: 'Z from the reference density' }], rows: isoZ, target: 'Z', model: (r) => purePhase(r).Z, tolerance: { mape: 3 }, note: 'Volume-translated Peng–Robinson with the kernel constants, no fitting. Largest deviations sit at the highest pressures and near the critical point; the GERG-2008 option reproduces the same data within 0.1 %.' },
+  { id: 'nist-liquid-density', title: 'Liquid density of light hydrocarbons, CO₂ and H₂S (compressed and saturated)', quantity: 'Density', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('compressed-liquid isotherms and saturated-liquid lines'),
+    columns: [C_FL, C_T, C_P, { key: 'rho', label: 'Reference density', unit: 'kg/m³' }], rows: isoLiq, target: 'rho', model: (r) => phaseProps(pureFluid(r.f), [1], r.P, r.T - KEL, 'liquid', { thermal: false }).rho, tolerance: { mape: 5 }, note: 'A cubic equation of state with a constant volume shift: a few per cent is the expected accuracy, worst towards the critical temperature.' },
+  { id: 'nist-vapour-pressure', title: 'Vapour pressure (bubble = dew pressure of the pure components)', quantity: 'Saturation pressure', unit: 'bar', kind: 'reference-fluid', source: nistSrc('saturation lines'),
+    columns: [C_FL, C_T, { key: 'P', label: 'Reference vapour pressure', unit: 'bar' }], rows: NIST_SAT, target: 'P', model: (r) => purePsat(r.f, r.T), tolerance: { mape: 2.5 }, note: 'Equal-fugacity solution of the Peng–Robinson equation with the acentric factors of the kernel; the phase boundary of each pure component from 0.55 to 0.98 of its critical temperature.' },
+  { id: 'nist-heat-capacity', title: 'Isobaric heat capacity of gases, supercritical fluids and liquids', quantity: 'Heat capacity cp', unit: 'J/g/K', kind: 'reference-fluid', source: nistSrc('isotherms (calorimetric properties of the reference equations of state)'),
+    columns: [C_FL, C_T, C_P, { key: 'cp', label: 'Reference cp', unit: 'J/g/K' }], rows: NIST_ISO, target: 'cp', model: (r) => purePhase(r).cp / 1000, tolerance: { mape: 8 }, note: 'Ideal-gas polynomial plus the residual heat capacity of the cubic equation. Liquid heat capacities of a cubic equation are its weakest calorimetric property.' },
+  { id: 'nist-enthalpy-vaporisation', title: 'Enthalpy of vaporisation along the saturation line', quantity: 'Enthalpy difference vapour − liquid', unit: 'kJ/kg', kind: 'reference-fluid', source: nistSrc('saturation lines (enthalpy of the coexisting phases)'),
+    columns: [C_FL, C_T, { key: 'dh', label: 'Reference enthalpy of vaporisation', unit: 'kJ/kg' }], rows: satRows, target: 'dh', model: (r) => { const s = pureSat(r); return (phaseHS(s.f, [1], s.P, r.T, 'vapour').h - phaseHS(s.f, [1], s.P, r.T, 'liquid').h) / COMPONENTS[r.f].MW; }, tolerance: { mape: 7 }, note: 'Residual enthalpies of both phases with the analytic temperature derivative of the attraction term, at the model\'s own vapour pressure.' },
+  { id: 'nist-speed-of-sound', title: 'Speed of sound in gases, supercritical fluids and liquids', quantity: 'Speed of sound', unit: 'm/s', kind: 'reference-fluid', source: nistSrc('isotherms'),
+    columns: [C_FL, C_T, C_P, { key: 'w', label: 'Reference speed of sound', unit: 'm/s' }], rows: NIST_ISO, target: 'w', model: (r) => purePhase(r).sound, tolerance: { mape: 12 }, note: 'Gas-phase values agree within a few per cent; in compressed liquids the cubic equation is known to be poor (the translated volume does not correct (∂P/∂v)), which dominates the average. Use the GERG-2008 or PC-SAFT option where the liquid speed of sound matters.' },
+  { id: 'nist-joule-thomson', title: 'Joule–Thomson coefficient of gases and supercritical fluids', quantity: 'Joule–Thomson coefficient', unit: 'K/bar', kind: 'reference-fluid', source: nistSrc('isotherms'),
+    columns: [C_FL, C_T, C_P, { key: 'jt', label: 'Reference coefficient', unit: 'K/bar' }], rows: NIST_ISO.filter((r) => r.ph !== 'l'), target: 'jt', model: (r) => purePhase(r).jtBar, tolerance: { rmse: 0.08 }, note: 'Includes the inversion region at high pressure, where the coefficient changes sign; judged by the absolute error.' },
+  { id: 'nist-compressibility', title: 'Isothermal compressibility from the reference densities of methane and carbon dioxide', quantity: 'Density change over a 100-bar (50-bar) step', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('isotherms; differences between neighbouring pressures'),
+    columns: [C_FL, C_T, { key: 'P', label: 'Lower pressure', unit: 'bar' }, { key: 'P2', label: 'Upper pressure', unit: 'bar' }, { key: 'drho', label: 'Reference density increase', unit: 'kg/m³' }],
+    rows: (() => { const o = []; for (let k = 1; k < NIST_ISO.length; k++) { const a = NIST_ISO[k - 1], b = NIST_ISO[k]; if (a.f === b.f && a.T === b.T && a.ph === b.ph && ['C1', 'CO2', 'C2'].includes(a.f)) o.push({ f: a.f, T: a.T, P: a.P, P2: b.P, ph: a.ph, drho: +(b.rho - a.rho).toPrecision(5) }); } return o; })(), target: 'drho',
+    model: (r) => { const f = pureFluid(r.f), k = pureKind(r); return phaseProps(f, [1], r.P2, r.T - KEL, k, { thermal: false }).rho - phaseProps(f, [1], r.P, r.T - KEL, k, { thermal: false }).rho; }, tolerance: { mape: 15 }, note: 'The compressibility is the slope of density with pressure: the density increase over each pressure step is compared.' },
+  { id: 'nist-viscosity-lbc', title: 'Viscosity by Lohrenz–Bray–Clark', quantity: 'Viscosity', unit: 'µPa·s', kind: 'reference-fluid', source: nistSrc('isotherms (reference viscosity correlations)'),
+    columns: [C_FL, C_T, C_P, { key: 'mu', label: 'Reference viscosity', unit: 'µPa·s' }], rows: NIST_ISO, target: 'mu', model: (r) => purePhase(r).mu * 1e6, tolerance: { mape: 12 }, note: 'Untuned; dense-fluid values depend on the fourth power of a polynomial in reduced density and so on the density error of the cubic equation.' },
+  { id: 'nist-viscosity-pedersen', title: 'Viscosity by the Pedersen corresponding-states model', quantity: 'Viscosity', unit: 'µPa·s', kind: 'reference-fluid', source: nistSrc('isotherms (reference viscosity correlations)'),
+    columns: [C_FL, C_T, C_P, { key: 'mu', label: 'Reference viscosity', unit: 'µPa·s' }], rows: NIST_ISO, target: 'mu', model: (r) => { const q = viscosityPedersen([COMPONENTS[r.f]], [1], r.P, r.T); return q ? q.mu * 1e6 : NaN; }, tolerance: { mape: 8 }, note: 'Methane itself is reproduced within about 1 % (reference fluid); carbon dioxide near its critical point is the worst case.' },
+  { id: 'nist-surface-tension', title: 'Surface tension of pure hydrocarbons, CO₂ and H₂S (parachor method)', quantity: 'Surface tension', unit: 'mN/m', kind: 'reference-fluid', source: nistSrc('saturation lines (surface tension)'),
+    columns: [C_FL, C_T, { key: 'sigma', label: 'Reference surface tension', unit: 'mN/m' }], rows: satRows.filter((r) => r.sigma > 0.5 && r.f !== 'N2'), target: 'sigma', model: (r) => { const s = pureSat(r); return interfacialTension(s.f, [1], [1], s.l.vm, s.v.vm) * 1e3; }, tolerance: { mape: 22 }, note: 'Macleod–Sugden with the kernel parachors and the saturated densities of the equation of state: the fourth power amplifies any density error, so the deviation grows from a few per cent at low reduced temperature to −40 % and more above 0.9 Tc. Nitrogen is left out: its tabulated parachor (41) is the value effective in hydrocarbon mixtures and under-predicts the surface tension of pure nitrogen by about 80 %.' },
+  { id: 'nist-hpht-density', title: 'High-pressure, high-temperature density (400–450 K, 300–1000 bar)', quantity: 'Density', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('isotherms of methane (450 K), propane and carbon dioxide (400 K)'),
+    columns: [C_FL, C_T, C_P, { key: 'rho', label: 'Reference density', unit: 'kg/m³' }], rows: NIST_ISO.filter((r) => r.T >= 400 && r.P >= 300), target: 'rho', model: (r) => purePhase(r).rho, tolerance: { mape: 5 }, note: 'High-pressure/high-temperature range of the property table.' },
+  { id: 'nist-deepwater-density', title: 'High-pressure, low-temperature density (≤ 280 K, 50–600 bar: deep-water flowline conditions)', quantity: 'Density', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('isotherms of methane (250 and 277.15 K), nitrogen (250 K), ethane and carbon dioxide (280 K)'),
+    columns: [C_FL, C_T, C_P, { key: 'rho', label: 'Reference density', unit: 'kg/m³' }], rows: NIST_ISO.filter((r) => r.T <= 280 && r.P >= 50), target: 'rho', model: (r) => purePhase(r).rho, tolerance: { mape: 5 }, note: 'Seabed-temperature range at flowline and shut-in pressures; the hydrate sets below cover the same range for the solid boundary.' },
+  { id: 'gerg-density', title: 'GERG-2008 option: density of all seven fluids over the whole range', quantity: 'Density', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('isotherms'),
+    columns: [C_FL, C_T, C_P, { key: 'rho', label: 'Reference density', unit: 'kg/m³' }], rows: NIST_ISO, target: 'rho', model: hDens(gergOf), tolerance: { mape: 0.2 }, note: 'Checks the bundled GERG-2008 coefficients and the Helmholtz machinery against the reference equations of state behind the WebBook (GERG-2008 uses shorter pure-fluid equations, hence the small residual for propane and n-butane).' },
+  { id: 'pcsaft-density', title: 'PC-SAFT option: density of all seven fluids over the whole range', quantity: 'Density', unit: 'kg/m³', kind: 'reference-fluid', source: nistSrc('isotherms'),
+    columns: [C_FL, C_T, C_P, { key: 'rho', label: 'Reference density', unit: 'kg/m³' }], rows: NIST_ISO, target: 'rho', model: hDens(pcsOf), tolerance: { mape: 2 }, note: 'Gross & Sadowski parameters without polar terms: carbon dioxide (a quadrupolar molecule) near its critical point carries the largest errors.' },
+  { id: 'hydrate-pure', title: 'Hydrate dissociation of single guests in pure water (CH₄, C₂H₆, C₃H₈, i-C₄H₁₀, CO₂, H₂S)', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('pure'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.pure.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 1.2, bias: 0.8 }, note: 'van der Waals–Platteeuw with the Munck constants, guest fugacities from Peng–Robinson and Henry\'s-law gas solubility. Hydrogen sulphide is predicted about 1.4 K too cold on average.' },
+  { id: 'hydrate-high-pressure', title: 'Hydrate dissociation at high pressure: methane to 680 bar, nitrogen to 960 bar', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('highP'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.highP.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 2.2, bias: 1.8 }, note: 'Deep-water shut-in pressures. The Munck constants under-predict the temperature by 1–2 K here (hydrate forms warmer than predicted — add margin, or select the Kihara constants, which are within about 0.8 K on this set).' },
+  { id: 'hydrate-mixtures', title: 'Hydrate dissociation of gas mixtures: CH₄–C₂H₆, CH₄–C₃H₈, CH₄–CO₂–H₂S and natural gas', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('mix'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.mix.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 1.6, bias: 1 }, note: 'Structure selection (I or II) is part of the prediction. Methane–propane at 70–690 bar shows the largest bias (about −2.4 K).' },
+  { id: 'hydrate-kihara', title: 'Kihara cell-potential option on the same pure, high-pressure and mixture points', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: { ...SOURCES.nistHyd, citation: `${HYDRATE_DATA.pure.cite} | ${HYDRATE_DATA.highP.cite} | ${HYDRATE_DATA.mix.cite}. As compiled in: ${SOURCES.nistHyd.citation}` },
+    columns: hydCols, rows: withGas([...HYDRATE_DATA.pure.rows.filter((_, i) => i % 2 === 0), ...HYDRATE_DATA.highP.rows.filter((_, i) => i % 2 === 0), ...HYDRATE_DATA.mix.rows.filter((_, i) => i % 2 === 0)]), target: 'T', model: hydModelT(KIHARA), tolerance: { rmse: 1.5, bias: 1 }, note: 'Langmuir constants from the Kihara potential in the Lennard-Jones–Devonshire cell (parameters of Avaji et al. 2023 for C1–iC4, NeqSim database for N2, CO2, n-C4; H2S keeps the Munck constants). Tends to predict about 0.5–1 K too warm (conservative).' },
+  { id: 'hydrate-methanol', title: 'Methanol-inhibited methane hydrate (0.6–20 wt % methanol)', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('meoh'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.meoh.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 1.3, bias: 1.1 }, note: 'Water activity from NRTL (low-temperature parameters regressed in this work to ice-point data, not to these points). The bias equals that of uninhibited methane (−0.6 K): the inhibitor response itself is within about 0.5 K up to 20 wt %.' },
+  { id: 'hydrate-meg', title: 'MEG-inhibited hydrates of methane, ethane and methane–propane (5–50 wt % MEG)', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('meg'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.meg.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 3, bias: 2.5 }, note: 'Up to 30 wt % the error is that of the uninhibited gas (about −1 to −2 K). At 40 and 50 wt % MEG on the methane–propane gas the model predicts 3–6 K more depression than measured (non-conservative: it would under-dose); the independent CPA water activity gives the same sign, so the inhibitor requirement above 35 wt % MEG should be confirmed experimentally. The tolerance is left where the model actually is.' },
+  { id: 'hydrate-brine', title: 'Methane hydrate in sodium-chloride brines (saline-water hydrate equilibrium)', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('nacl'),
+    columns: hydCols, rows: withGas(HYDRATE_DATA.nacl.rows), target: 'T', model: hydModelT(LANGMUIR), tolerance: { rmse: 1.6, bias: 1.2 }, note: 'Water activity of the brine from the Pitzer model with the PHREEQC parameters. De Roo et al. (1983) is matched within 0.8 K; the 1951 data of Kobayashi et al. lie about 1.8 K warmer than the model.' },
+  { id: 'hydrate-structure-h', title: 'Structure-H hydrate of methane with methylcyclohexane', quantity: 'Dissociation temperature', unit: 'K', kind: 'experiment', source: hydSrc('sH'),
+    columns: [{ key: 'ds', label: 'Database set' }, C_P, { key: 'T', label: 'Measured dissociation temperature', unit: 'K' }], rows: HYDRATE_DATA.sH.rows.filter((r) => r.ds !== 275), target: 'T', model: hydModelT(LANGMUIR, true), tolerance: { rmse: 0.5 }, note: 'The two lumped structure-H constants were regressed to database set 275 (Nakamura et al. 2003, 19 points, not shown here); the rows are the three other sets (Tohidi et al., Mehta & Sloan, Thomas & Behar type measurements), which were not used.' },
+  { id: 'nacl-osmotic', title: 'Osmotic coefficient of NaCl(aq) at 25 °C, 0.001–6.14 mol/kg', quantity: 'Osmotic coefficient', unit: '–', kind: 'experiment', source: SOURCES.hamerWu,
+    columns: [{ key: 'm', label: 'Molality', unit: 'mol/kg' }, { key: 'phi', label: 'Evaluated osmotic coefficient' }], rows: NACL_25C, target: 'phi', model: (r) => osmoticNaCl('pitzer', r.m), tolerance: { mape: 0.3 }, note: 'Pitzer model with the Na–Cl parameters of the PHREEQC database: the water activity of brines follows directly from this coefficient.' },
+  { id: 'nacl-activity', title: 'Mean ionic activity coefficient of NaCl(aq) at 25 °C', quantity: 'Mean activity coefficient', unit: '–', kind: 'experiment', source: SOURCES.hamerWu,
+    columns: [{ key: 'm', label: 'Molality', unit: 'mol/kg' }, { key: 'g', label: 'Evaluated activity coefficient' }], rows: NACL_25C, target: 'g', model: (r) => gammaNaCl('pitzer', r.m), tolerance: { mape: 0.5 }, note: 'Same Pitzer parameters; the Davies and Debye–Hückel options are valid only below about 0.5 mol/kg.' },
+  { id: 'methanol-freezing', title: 'Freezing point of aqueous methanol, 4–34 wt %', quantity: 'Freezing point', unit: '°C', kind: 'experiment', source: SOURCES.meohFreeze,
+    columns: [{ key: 'w', label: 'Methanol', unit: 'wt %' }, { key: 'tf', label: 'Freezing point', unit: '°C' }], rows: MEOH_FREEZING, target: 'tf', model: (r) => freezingPoint({ inhId: 'MeOH', inhWt: r.w }), tolerance: { maxAbs: 1 }, note: 'Ice–solution equilibrium with the NRTL water activity. The low-temperature NRTL parameters were regressed in this work to ice-point values of this kind, so this set shows consistency rather than an independent validation.' },
+  { id: 'water-content-cpa', title: 'Water content of methane in equilibrium with liquid water, 284–323 K, 50–200 bar (CPA)', quantity: 'Water in gas', unit: 'mg/Sm³', kind: 'experiment', source: SOURCES.frost,
+    columns: [C_T, C_P, { key: 'wc', label: 'Measured water content', unit: 'mg/Sm³' }], rows: C1_WATER_VLE.map((r) => ({ ...r, wc: +wcOfY(r.yw).toPrecision(4) })), target: 'wc', model: (r) => cpaWater(c1(), [1], r.P, r.T - KEL).wc * 1e6, tolerance: { mape: 20 }, note: 'Cubic-plus-association with the published water parameters and the water–methane interaction of the NeqSim table. The measurements themselves scatter by 10–20 % between neighbouring points.' },
+  { id: 'water-content-bukacek', title: 'Water content of methane: Bukacek correlation used by the flow suites', quantity: 'Water in gas', unit: 'mg/Sm³', kind: 'experiment', source: SOURCES.frost,
+    columns: [C_T, C_P, { key: 'wc', label: 'Measured water content', unit: 'mg/Sm³' }], rows: C1_WATER_VLE.map((r) => ({ ...r, wc: +wcOfY(r.yw).toPrecision(4) })), target: 'wc', model: (r) => waterContent(r.P, r.T - KEL) * 1e6, tolerance: { mape: 20 }, note: 'The kernel correlation (sweet gas, fresh water) on the same points.' },
+  { id: 'methane-solubility', title: 'Solubility of methane in water at 283 and 298 K, 12–100 bar', quantity: 'Dissolved methane', unit: 'mol/kg', kind: 'experiment', source: SOURCES.bottger,
+    columns: [C_T, C_P, { key: 'm', label: 'Measured molality', unit: 'mol/kg' }], rows: C1_SOLUBILITY, target: 'm', model: (r) => { const f = c1(), x = gasSolubility({ C1: Math.exp(eosPhase(f, [1], r.P, r.T, 'vapour').lnphi[0]) * r.P }, r.P, r.T - KEL).x.C1; return (x / (1 - x)) * (1000 / MW_W); }, tolerance: { mape: 10 }, note: 'Henry\'s law with the Peng–Robinson gas fugacity and the Poynting correction — the dissolved-gas term of the hydrate model and of the water balance.' },
+  { id: 'methanol-in-gas', title: 'Methanol and water in methane over aqueous methanol (280–323 K, 50–180 bar)', quantity: 'Methanol in gas', unit: 'mol ppm', kind: 'experiment', source: SOURCES.frost,
+    columns: [C_T, C_P, { key: 'xw', label: 'Water mole fraction in the liquid' }, { key: 'ppm', label: 'Measured methanol in gas', unit: 'mol ppm' }], rows: C1_MEOH_WATER_VLE.map((r) => ({ ...r, ppm: +(r.ym * 1e6).toPrecision(4) })), target: 'ppm',
+    model: (r) => { const wI = ((1 - r.xw) * 32.042) / ((1 - r.xw) * 32.042 + r.xw * MW_W); return cpaWater(c1(), [1], r.P, r.T - KEL, { inhId: 'MeOH', inhWt: 100 * wI }).yInh * 1e6; }, tolerance: { mape: 35 }, note: 'Inhibitor partitioning into the gas by cubic-plus-association (methanol two-site, water four-site, cross-association by the CR-1 rule). Only nine points, with a stated experimental uncertainty of 10–20 %; the comparison is an order-of-magnitude check of the methanol loss.' },
+];
+// ---- provenance of every constant set ----------------------------------------------------------------------------------------------
+const RET = '2026-10-08', GH = 'https://raw.githubusercontent.com/';
+const PV = (item, used, source, url, status, note) => ({ item, used, source, url, retrieved: RET, status, note });
+/** Where each constant set of this suite and of the thermodynamic kernel was checked ('verified' only when the source was opened and the numbers compared). */
+export const PROVENANCE = [
+  PV('Critical temperature, critical pressure, acentric factor, molar mass and critical volume of N2, CO2, H2S, C1–nC6', 'kernel COMPONENTS: every equation-of-state and viscosity calculation', 'CoolProp fluid files (reference equation of state of each fluid)', GH + 'CoolProp/CoolProp/master/dev/fluids/Methane.json (and Ethane, n-Propane, IsoButane, n-Butane, Isopentane, n-Pentane, n-Hexane, Nitrogen, CarbonDioxide, HydrogenSulfide)', 'corrected', 'All eleven components replaced by the source values. Largest changes: H2S Tc 373.4 → 373.1 K, Pc 89.63 → 90.0 bar, ω 0.0942 → 0.1005; n-hexane Pc 30.25 → 30.441 bar; i-butane Vc 262.7 → 257.75 cm³/mol; nitrogen ω 0.0377 → 0.0372; the others moved by less than 0.2 %.'),
+  PV('Ideal-gas heat-capacity polynomials', 'kernel COMPONENTS.cp: enthalpy, entropy, heat capacity, speed of sound', 'Poling, Prausnitz & O\'Connell, The Properties of Gases and Liquids, 5th ed., as tabulated in the open `chemicals` library (PolingDatabank.tsv)', GH + 'CalebBell/chemicals/master/chemicals/Heat%20Capacity/PolingDatabank.tsv', 'corrected', 'The cubic polynomials held before deviated from the source quartics by up to 3.7 % at 250 K and 9 % at 200 K (methane, ethane, n-pentane). Replaced by cubic least-squares fits of the source over 180–560 K (largest residual 0.10 %). Checked further against the NIST heat capacities (data set nist-heat-capacity).'),
+  PV('Peng–Robinson binary interaction parameters of the light components', 'kernel KIJ', 'ChemSep interaction-parameter table (DECHEMA-regressed) distributed with the open `thermo` library', GH + 'CalebBell/thermo/master/thermo/Interaction%20Parameters/ChemSep/pr.json', 'corrected', 'Replaced by the source: N2–C2 0.010 → 0.0533, N2–H2S 0.13 → 0.1652, CO2–C1 0.105 → 0.0978, CO2–C3 0.125 → 0.1315, N2–C1 0.025 → 0.0289, H2S–C2 0.085 → 0.0952, H2S–C3 0.08 → 0.0878; 21 hydrocarbon–hydrocarbon pairs that were zero now carry the source values (|kij| ≤ 0.04). H2S–methane (0.07) is not in the table and is unchanged.'),
+  PV('Default interaction parameters with C7+ (N2 0.10, CO2 0.115, H2S 0.06; methane–C7+ 0.14·SG − 0.0668)', 'kernel kijOf', '—', '', 'unverified', 'Customary characterisation defaults; no openly readable source was found. They are tuning parameters (binary-interaction scale and override table).'),
+  PV('Peng–Robinson volume-shift parameters of the light components, C7+ shift 1 − 2.258/M^0.1823, Péneloux SRK shift', 'kernel makeFluid: liquid density', '—', '', 'unverified', 'Jhaveri–Youngren-type values written from the literature; not found in an openly readable source. Their effect is validated instead: liquid densities of seven fluids against NIST within 1.6 % on average (data set nist-liquid-density). A volume-shift multiplier is now a calibration parameter.'),
+  PV('Parachors of the light components', 'kernel COMPONENTS.par: gas–oil interfacial tension', 'NeqSim component database', GH + 'equinor/neqsim/master/src/main/resources/data/COMP.csv', 'verified', 'Within 1.1 % of the source for all eleven components (largest: propane 150.3 here, 151.9 in the source; n-pentane 231.5 / 233.9). Pure-component surface tension against NIST: data set nist-surface-tension. The C7+ relation 59.3 + 2.34·M is unverified.'),
+  PV('Equation-of-state constants (Ωa, Ωb, m(ω) of Peng–Robinson 1976/1978, Soave)', 'kernel EOS', '—', '', 'unverified', 'Textbook constants, not compared with a file in this pass; their consequence (vapour pressures within 1.0 %, gas Z within 1.5 % of NIST) is covered by the reference data sets.'),
+  PV('Lohrenz–Bray–Clark viscosity polynomial and Stiel–Thodos dilute-gas viscosity', 'kernel viscosityLBC', 'open `chemicals` library (viscosity.py: Lorentz_Bray_Clarke, Stiel_Thodos) and NeqSim LBCViscosityMethod.java', GH + 'equinor/neqsim/master/src/main/java/neqsim/physicalproperties/methods/commonphasephysicalproperties/viscosity/LBCViscosityMethod.java', 'verified', 'All coefficients agree with NeqSim (0.1023, 0.023364, 0.058533, −0.040758, 0.0093324; 34e-5·Tr^0.94 and 17.78e-5·(4.58Tr − 1.67)^0.625). The `chemicals` file carries 0.0093724 for the last coefficient — a difference between the two sources, not changed here.'),
+  PV('Stiel–Thodos dense-fluid thermal conductivity', 'conductivityStielThodos()', 'open `chemicals` library (thermal_conductivity.py: Stiel_Thodos_dense)', GH + 'CalebBell/chemicals/master/chemicals/thermal_conductivity.py', 'verified', 'All constants identical (210, 1.22e-2/0.535, 1.14e-2/0.67/1.069, 2.60e-3/1.155/2.016).'),
+  PV('Lee–Kesler modified BWR constants of the simple and reference fluids', 'leeKesler(), leeKeslerZ()', 'thermopack (SINTEF/NTNU) leekesler.f90', GH + 'thermotools/thermopack/main/src/leekesler.f90', 'verified', 'All 24 constants and ω_ref = 0.3978 identical.'),
+  PV('Lee–Kesler / Kesler–Lee acentric-factor correlations', 'kernel pseudoProps, acentricLK()', 'open `chemicals` library (acentric.py: LK_omega) and NeqSim TBPfractionModel.java', GH + 'CalebBell/chemicals/master/chemicals/acentric.py', 'verified', 'Identical (5.92714, 6.09648, 1.28862, 0.169347; 15.2518, 15.6875, 13.4721, 0.43577; heavy branch −7.904, 0.1352, 0.007465, 8.359, 1.408, 0.01063). NeqSim writes 6.09649 for the second constant.'),
+  PV('Kesler–Lee critical temperature and pressure of petroleum fractions', 'kernel pseudoProps', 'NeqSim TBPfractionModel.java (class LeeKesler, kelvin / MPa form)', GH + 'equinor/neqsim/master/src/main/java/neqsim/thermo/characterization/TBPfractionModel.java', 'verified', 'After conversion from °R/psia to K/MPa every coefficient agrees within 0.01 % except one (9.9099 in the source against 9.9010 from the constant held here, 0.09 %).'),
+  PV('Twu (1984) critical-property correlations', 'critTwu()', 'NeqSim TBPfractionModel.java (class TwuModel)', GH + 'equinor/neqsim/master/src/main/java/neqsim/thermo/characterization/TBPfractionModel.java', 'verified', 'All coefficients of the n-alkane reference (Tc, Pc, Vc, SG) and of the three perturbation functions agree after unit conversion (largest difference 0.004 %).'),
+  PV('Riazi–Daubert (1980) critical-property correlations', 'critRiaziDaubert()', '—', '', 'unverified', 'The open implementations found use the 1987 molar-mass form, not the 1980 boiling-point form held here. Checked only against the critical temperature of n-decane (within 3 K).'),
+  PV('Søreide boiling-point correlation', 'kernel tbSoreide', 'NeqSim TBPfractionModel.java', GH + 'equinor/neqsim/master/src/main/java/neqsim/thermo/characterization/TBPfractionModel.java', 'verified', 'Identical. The Søreide specific-gravity relation 0.2855 + Cf(M − 66)^0.13 is unverified.'),
+  PV('Won (1986) melting temperature and enthalpy of fusion of paraffins', 'wonFusion()', 'NeqSim ComponentWonWax.java', GH + 'equinor/neqsim/master/src/main/java/neqsim/thermo/component/ComponentWonWax.java', 'verified', 'Identical (374.5 + 0.02617·M − 20172/M; 0.1426·M·Tf cal/mol). The Pedersen wax-forming fraction is unverified.'),
+  PV('Munck et al. (1988) Langmuir constants and reference properties of the empty hydrate lattice', 'LANGMUIR, HYDRATE_STRUCTURES: default hydrate model', 'PyTherm lecture notebook (methane, structure I) and Avaji et al. (2023), Table 2', GH + 'iurisegtovich/PyTherm-applied-thermodynamics/master/contents/main-lectures/HYD1-methane-hydrates.ipynb', 'verified', 'Verified against the notebook: methane in both structure-I cavities (0.7228e-3 / 3187 and 23.35e-3 / 2653), Δμ⁰ 1264, Δh⁰ −4858 J/mol, Δcp −39.16 J/mol/K, Δv 4.6 cm³/mol; structure-II reference properties against Avaji et al. Table 2 (882.8 / −5202 against 883 / −5201 here). The constants of the other guests and of methane in structure II could not be read from an open source: status unverified for those, and they are judged by the hydrate data sets (ethane, propane, i-butane and CO2 within 0.6 K; H2S −1.4 K; nitrogen −1.6 K at 130–960 bar).'),
+  PV('Kihara parameters, cavity radii and coordination numbers; Sloan & Koh reference properties', 'KIHARA, kiharaC(): Kihara hydrate option and structure H', 'Avaji et al. (2023) Fluid Phase Equilib. 567, 113716 (open manuscript, Tables 1, 2 and 8); NeqSim COMP.csv and ComponentHydrate.java', 'https://bradscholars.brad.ac.uk/server/api/core/bitstreams/d47ed2ca-b934-4bc8-ae3b-a8631c4e0d8d/content', 'verified', 'Transcribed from the sources in this pass (C1–iC4 from Avaji et al.; N2, CO2, n-C4 from NeqSim; radii 3.95/4.33 and 3.91/4.73 Å, coordination 20/24 and 20/28). Structure-H cavity data (3.91, 4.06, 5.71 Å; 20, 20, 36) from Herri et al., https://hal-emse.ccsd.cnrs.fr/emse-00724388v1/document, Table 1.'),
+  PV('Structure-H effective reference constants (Δμ⁰ 528.7 J/mol, Δh⁰ −5624 J/mol)', 'HYDRATE_STRUCTURES.sH', 'regressed in this work to NIST hydrate database set 275', 'https://gashydrates.nist.gov/hydrate-browser/dataset_jsons.json', 'unverified', 'No published structure-H parameter set could be read from an open source. Two lumped constants (large-cavity occupation by methylcyclohexane included) were fitted to 19 points of Nakamura et al. (2003) and reproduce three independent sets within 0.3 K on average. Valid for methane with a methylcyclohexane-type former only.'),
+  PV('NRTL / Wilson / UNIQUAC parameters, methanol–water and MEG–water', 'ACTIVITY_PARAMS: water activity of inhibited aqueous phases', 'ChemSep NRTL table in the open `thermo` library (methanol–water only)', GH + 'CalebBell/thermo/master/thermo/Interaction%20Parameters/ChemSep/nrtl.json', 'unverified', 'Methanol–water: the vapour–liquid set held here (−253.88 / 845.21 cal/mol, α 0.2994) is a different regression from the ChemSep set (−189.0 / 792.8 cal/mol, α 0.2999); the ChemSep set was tested and is 2 K worse on 20 wt % methanol hydrate data, so the set was kept. MEG–water is in none of the open tables found. The low-temperature sets were regressed in this work to ice-point depression and remain unverified; they are judged by the data sets methanol-freezing (within 0.7 K), hydrate-methanol (inhibitor response within about 0.5 K to 20 wt %) and hydrate-meg (good to 30 wt %; 3–6 K too much depression at 40–50 wt %).'),
+  PV('Pitzer parameters of NaCl (β0, β1, Cφ and their temperature functions)', 'PITZER_NACL: water activity of brines', 'USGS PHREEQC database pitzer.dat', GH + 'usgs-coupled/phreeqc3/master/database/pitzer.dat', 'corrected', 'β0 0.0765 → 0.07534, β1 0.2664 → 0.2769, Cφ 0.00127 → 0.00148, and the linear temperature slopes written from memory replaced by the six-term PHREEQC temperature function. Against Hamer & Wu (1972): osmotic coefficient within 0.06 % on average, activity coefficient 0.10 % (0.23 % before); methane-hydrate temperatures in NaCl brine (De Roo et al.) bias −0.33 K (−0.62 K before).'),
+  PV('Debye–Hückel constants from the density and permittivity of water', 'debyeHuckel()', '—', '', 'unverified', 'Computed from first principles with a permittivity polynomial that was not compared with a file (Aφ = 0.3920 at 25 °C against the customary 0.3915). Validated through the dilute end of the Hamer & Wu osmotic coefficients.'),
+  PV('Henry constants of gases in water at 25 °C and their temperature coefficients', 'HENRY: gas solubility, dissolved-gas correction of the hydrate model', 'Sander compilation as held in the open `thermo` library (Sander_henry_T_dep.json)', GH + 'CalebBell/thermo/master/thermo/Interaction%20Parameters/Sander_henry_T_dep.json', 'verified', 'Within 11 % of the source at 25 °C for CH4 (1.4e-3 here, 1.27e-3 mol/kg/bar in the file), C2H6, C3H8, n-C4H10, N2, CO2 and H2S; i-butane differs by a factor of two (8.4e-4 here, 1.6e-3 in the file) and is left unchanged pending a second source. Methane solubility against Böttger et al. (2016): 7 % (data set methane-solubility). Partial molar volumes and Setschenow constants are unverified.'),
+  PV('PC-SAFT universal constants and pure-component parameters', 'pcsaftModel()', 'NIST teqp (PCSAFT.cpp, constants of Gross & Sadowski 2001) and Clapeyron.jl database (PCSAFT_like.csv, PCSAFT_unlike.csv)', GH + 'ClapeyronThermo/Clapeyron.jl/master/database/SAFT/PCSAFT/PCSAFT_like.csv', 'verified', 'Transcribed from the sources in this pass; reproduces NIST densities of seven fluids within 1.1 % on average and vapour pressures within 0.7 % except CO2 (up to 8 %: no quadrupole term). C7+ pseudo-components: n-alkane sets interpolated in molar mass with the segment diameter matched to the specific gravity (this work).'),
+  PV('Cubic-plus-association parameters of water, methanol and MEG; water–gas interaction parameters', 'cpaModel(), cpaWater()', 'NeqSim component and interaction databases (published sets of Kontogeorgis and co-workers)', GH + 'equinor/neqsim/master/src/main/resources/data/INTER.csv', 'verified', 'Transcribed from the sources in this pass (water 4C: a0 0.12277 Pa·m⁶/mol², b 14.515 cm³/mol, c1 0.67359, ε 16655 J/mol, β 0.0692). Water content of methane against Frost et al. (2014): 17 % (data set water-content-cpa).'),
+  PV('GERG-2008 coefficients (eleven components, 55 binary pairs, 7 departure functions)', 'gergModel()', 'NIST teqp, GERG.hpp', SOURCES.gerg.url, 'verified', 'Extracted by script from the source file into data/ref/pvt.js; reproduces NIST densities within 0.03 % on average (0.3 % at most) and vapour pressures within 0.2 % (data set gerg-density).'),
+  PV('Pedersen corresponding-states viscosity: mixing rules and methane reference correlation (Hanley et al. 1975)', 'viscosityPedersen(), methaneViscosity()', 'NeqSim PFCTViscosityMethodMod86.java', GH + 'equinor/neqsim/master/src/main/java/neqsim/physicalproperties/methods/commonphasephysicalproperties/viscosity/PFCTViscosityMethodMod86.java', 'verified', 'All constants transcribed from the source; methane viscosity against NIST within 1.1 % on average. The tanh(T − 91 K) switch between the two dense-fluid branches is written from the published description and unverified.'),
+  PV('Flory–Huggins asphaltene model defaults (molar mass 750 g/mol, density 1100 kg/m³, solubility parameter 21 MPa^0.5)', 'asphalteneFH(), asphalteneCurve()', 'NeqSim FloryHugginsAsphalteneModel.java', GH + 'equinor/neqsim/master/src/main/java/neqsim/pvtsimulation/flowassurance/FloryHugginsAsphalteneModel.java', 'verified', 'Equation and default values as in the source. The temperature coefficient of the solubility parameter (1.07e-3 per K, Hirschberg et al. 1984) is unverified. All four are inputs.'),
+  PV('de Boer screening boundaries and colloidal-instability thresholds', 'asphalteneScreen()', '—', '', 'unverified', 'Approximate digitisation of the published plot; thresholds 0.7 / 0.9 written from the literature. Screening only.'),
+  PV('Black-oil correlations (Standing, Vasquez–Beggs, Glasø, Beggs–Robinson), Lee–Gonzalez–Eakin gas viscosity', 'blackOil(), rsStanding(), viscosityLGE()', '—', '', 'unverified', 'Not compared with an open source in this pass; they are cross-checks beside the equation of state, not part of the published properties.'),
+  PV('Bukacek water content, Motiee hydrate correlation, Nielsen–Bucklin and Hammerschmidt depressions', 'kernel waterContent, hydrateT0, hydrateDepression; hammerschmidt()', '—', '', 'unverified', 'Coefficients not compared with an open source. The Bukacek correlation is validated against measured water contents of methane (17 %, data set water-content-bukacek); the gas-gravity hydrate correlation is only the fallback of the van der Waals–Platteeuw model.'),
+  PV('Molar masses of the inhibitors', 'kernel INHIBITORS', 'NeqSim component database', GH + 'equinor/neqsim/master/src/main/resources/data/COMP.csv', 'verified', 'Methanol 32.042, MEG 62.068 (62.069), DEG 106.12 (106.122), TEG 150.17 (150.175), ethanol 46.069 g/mol. Densities are unverified.'),
+];
 
 // ---- interactive flash calculator (custom tab) ---------------------------------------------------------------------------------
 function flashView(el, api) {
@@ -1308,10 +2028,29 @@ const CAL_VALID = [
   { calT: 105, calP: 60, psat: 232.7, rho: 721.1, rs: 37.81, mu: 2.04 },
   { calT: 130, calP: 180, psat: 241.1, rho: 645, rs: 118, mu: 0.65 },
 ];
+const CAL_SAMPLE2 = [
+  {calT:40,calP:120,calSal:3.5,calInhWt:0,bo:1.309,rhoG:168.5,zG:0.6619,muG:0.0207,co:1.856,cp:2.232,sound:361.2,sigma:4.433,wc:681,rhoW:1029,aw:0.9814,hydT:16.95},
+  {calT:60,calP:150,calSal:3.5,calInhWt:0,bo:1.374,rhoG:178.1,zG:0.7291,muG:0.02247,co:2.22,cp:2.355,sound:397.8,sigma:3.161,wc:1425,rhoW:1019,aw:0.98,hydT:18.04},
+  {calT:60,calP:60,calSal:0,calInhWt:0,bo:1.173,rhoG:62.31,zG:0.8263,muG:0.01428,co:1.761,cp:2.276,sound:345.9,sigma:8.959,wc:2775,rhoW:990.3,aw:0.9996,hydT:14.63},
+  {calT:90,calP:200,calSal:3.5,calInhWt:0,bo:1.471,rhoG:192,zG:0.8262,muG:0.02433,co:3.008,cp:2.454,sound:448.1,sigma:1.844,wc:3722,rhoW:1004,aw:0.9792,mmp:386.1,hydT:18.73},
+  {calT:90,calP:120,calSal:10,calInhWt:0,bo:1.305,rhoG:116.6,zG:0.816,muG:0.01812,co:2.598,cp:2.429,sound:384.3,sigma:4.672,wc:5303,rhoW:1048,aw:0.9369,hydT:13.8},
+  {calT:90,calP:40,calSal:0,calInhWt:20,bo:1.139,rhoG:34.7,zG:0.9191,muG:0.01394,co:2.01,cp:2.409,sound:372.1,sigma:10.17,wc:12610,rhoW:988.4,aw:0.9286,hydT:6.84},
+  {calT:120,calP:160,calSal:3.5,calInhWt:30,bo:1.397,rhoG:134.6,zG:0.8676,muG:0.02025,co:3.356,cp:2.603,sound:421.3,sigma:2.812,wc:10250,rhoW:997.2,aw:0.8591,hydT:8.82},
+  {calT:120,calP:80,calSal:0,calInhWt:40,bo:1.234,rhoG:65.58,zG:0.8972,muG:0.01609,co:2.896,cp:2.546,sound:388.2,sigma:6.405,wc:17220,rhoW:983.2,aw:0.822,hydT:1.74},
+  {calT:20,calP:100,calSal:3.5,calInhWt:20,bo:1.275,rhoG:167.4,zG:0.5831,muG:0.02021,co:1.595,cp:2.18,sound:338,sigma:5.504,wc:249.3,rhoW:1050,aw:0.9074,hydT:10.87},
+  {calT:10,calP:60,calSal:8,calInhWt:0,bo:1.2,rhoG:90.63,zG:0.6675,muG:0.01368,co:1.273,cp:2.07,sound:295.7,sigma:9.2,wc:196.1,rhoW:1070,aw:0.9522,hydT:11.43},
+];
+const CAL_VALID2 = [
+  {calT:50,calP:80,calSal:3.5,calInhWt:0,bo:1.219,rhoG:93.84,zG:0.7575,muG:0.01541,co:1.769,cp:2.263,sound:335,sigma:7.491,wc:1400,rhoW:1022,aw:0.981,hydT:14.83},
+  {calT:75,calP:100,calSal:0,calInhWt:10,bo:1.264,rhoG:104.4,zG:0.7947,muG:0.0166,co:2.229,cp:2.376,sound:363.1,sigma:5.854,wc:3564,rhoW:992.4,aw:0.9688,hydT:14.95},
+  {calT:105,calP:60,calSal:5,calInhWt:0,bo:1.184,rhoG:51.26,zG:0.8945,muG:0.01468,co:2.42,cp:2.444,sound:375.7,sigma:8.431,wc:15590,rhoW:998.5,aw:0.9709,hydT:13.03},
+  {calT:30,calP:150,calSal:3.5,calInhWt:30,bo:1.378,rhoG:226.1,zG:0.6274,muG:0.02745,co:1.837,cp:2.23,sound:417.3,sigma:2.774,wc:306.6,rhoW:1055,aw:0.8564,hydT:8.51},
+  {calT:15,calP:80,calSal:0,calInhWt:0,bo:1.238,rhoG:132.9,zG:0.6014,muG:0.01657,co:1.38,cp:2.111,sound:309.5,sigma:7.163,wc:229.8,rhoW:1006,aw:1.001,hydT:16.14},
+];
 export default {
   id: 'pvt', num: 1, title: 'Fluid, PVT & Phase Behaviour', short: 'Fluid · PVT', icon: '🧪',
   tagline: 'Equation-of-state characterisation, phase envelope, laboratory experiments, properties, hydrate, wax and aqueous-phase thermodynamics of the case fluid.',
-  description: 'The case fluid is characterised with a cubic equation of state (C7+ split, alternative critical-property correlations, tuning multipliers and interaction parameters) and flashed at constant PT, PH, PS and TV. The phase envelope is traced by continuation through the critical point, the standard PVT-cell experiments are simulated for comparison with a laboratory report, and every property the flow solvers need is tabulated. Hydrate equilibrium follows van der Waals–Platteeuw with the water activity from activity-coefficient and electrolyte models; wax and asphaltenes are screened from the same characterisation.',
+  description: 'The case fluid is characterised with a cubic equation of state (C7+ split, alternative critical-property correlations, tuning multipliers and interaction parameters) and flashed at constant PT, PH, PS and TV. The phase envelope is traced by continuation through the critical point, the standard PVT-cell experiments are simulated for comparison with a laboratory report, and every property the flow solvers need is tabulated. Hydrate equilibrium follows van der Waals–Platteeuw (Munck constants or Kihara cell potential, structures I, II and H) with the water activity from activity-coefficient and electrolyte models; wax and asphaltene solid phases, the water-side Gibbs minimum and the miscibility pressure come from the same characterisation. GERG-2008, PC-SAFT, cubic-plus-association, Lee–Kesler and the Pedersen viscosity model run beside the cubic equation as cross-checks, and every constant set and reference data set carries its source.',
   guide: [
     'Define the fluid composition, rates, water cut, salinity and inhibitor on the case page; choose here whether to analyse that fluid or one of the built-in library fluids.',
     'Enter reservoir and reference conditions and, if a PVT report exists, its saturation pressures, CCE, differential-liberation, viscosity and hydrate points.',
@@ -1337,10 +2076,16 @@ export default {
     'heavy-end/pseudocomponent characterization', 'plus-fraction splitting/lumping', 'critical-property regression', 'acentric-factor adjustment', 'binary-interaction-parameter regression', 'eos parameter regression',
     'pure-component eos verification', 'binary-mixture verification', 'multicomponent flash verification', 'pt-flash', 'ph-flash', 'ps-flash', 'tv-flash', 'bubble-point solver', 'dew-point solver', 'critical-point calculation', 'phase-envelope tracing', 'material-balance closure', 'component mass-balance closure', 'energy-balance closure', 'thermodynamic consistency',
     'gibbs-energy minimum/stability', 'fugacity equality', 'gibbs–duhem consistency', 'maxwell-relation', 'eos derivative verification', 'analytic-vs-numerical derivative', 'unit/dimensional consistency', 'limiting/single-phase', 'regression reproducibility', 'cross-implementation benchmark', 'machine-precision conservation',
+    // added with the residual-Helmholtz models, association, corresponding states, solid phases and the extended calibration
+    'helmholtz free-energy formulation', 'benedict–webb–rubin family', 'cubic-plus-association eos', 'saft', 'pc-saft', 'gerg-type multiparameter eos', 'pedersen viscosity model', 'kihara potential', 'lennard–jones/devonshire-type intermolecular potentials',
+    'hydrate structure-i, structure-ii and structure-h occupancy models', 'hydrate phase-stability/gibbs-energy minimization', 'compositional flash + wax/asphaltene solid-phase equilibrium', 'where solids are permitted', 'initial hydrate', 'asphaltene or other solid phase fractions',
+    'slim-tube measurements', 'formation-volume-factor calibration', 'gas-density calibration', 'water-density calibration', 'gas-viscosity calibration', 'compressibility calibration', 'z-factor calibration', 'enthalpy/heat-capacity calibration', 'speed-of-sound calibration',
+    'interfacial-tension calibration', 'surface-tension calibration', 'water-content calibration', 'volume-shift regression', 'hydrate-equilibrium calibration', 'hydrate dissociation p–t calibration', 'hydrate inhibitor-response calibration', 'brine/salinity correction calibration', 'water-activity calibration',
+    'phase-envelope measurements', 'compressibility measurements', 'calorimetric data', 'interfacial-tension measurements', 'water-content measurements', 'high-pressure/high-temperature measurements', 'high-pressure/low-temperature deepwater-condition measurements', 'saline-water hydrate experiments',
     'pvt-cell experiments', 'bubble-point measurements', 'dew-point measurements', 'density measurements', 'viscosity measurements', 'hydrate equilibrium experiments', 'hydrate dissociation experiments', 'meg/methanol inhibitor', 'multicomponent reservoir-fluid',
   ],
-  referenceOnly: ['wax/asphaltene solid-phase equilibrium', 'gibbs-energy minimization', 'benedict', 'cubic-plus-association', 'saft', 'gerg', 'pedersen viscosity', 'kihara', 'lennard', 'structure-h', 'helmholtz', 'slim-tube', 'where solids are permitted', 'asphaltene or other solid phase fractions', 'volume-shift regression', 'speed-of-sound calibration', 'gas-density calibration', 'water-density calibration', 'gas-viscosity calibration', 'enthalpy/heat-capacity calibration', 'water-content calibration', 'compressibility calibration', 'z-factor calibration', 'tension calibration', 'formation-volume-factor calibration', 'hydrate-equilibrium calibration', 'hydrate dissociation p-t calibration', 'inhibitor-response calibration', 'salinity correction calibration', 'water-activity calibration', 'saline-water hydrate', 'calorimetric', 'interfacial-tension measurements', 'water-content measurements', 'high-pressure', 'phase-envelope measurements', 'compressibility measurements'],
-  equationsNote: 'Cubic equations of state (Peng–Robinson 1978, Soave–Redlich–Kwong, Redlich–Kwong, van der Waals) with van der Waals one-fluid mixing rules, Péneloux-type volume translation and two-phase vapour–liquid equilibrium; the hydrocarbon flash carries no water and no third (aqueous or solid) phase. Riazi–Daubert and Twu critical properties act as plus-fraction-average ratios to Kesler–Lee because the shared kernel accepts uniform multipliers only; volume shift is on/off, not a regressed parameter. The critical point is located on the traced saturation line, not by the Heidemann–Khalil criterion. Viscosity is Lohrenz–Bray–Clark (a corresponding-states residual-viscosity correlation) with Lee–Gonzalez–Eakin and Beggs–Robinson as cross-checks; the Pedersen corresponding-states model is not implemented. Lee–Kesler is used for the gas compressibility cross-check only. Hydrates: van der Waals–Platteeuw for structures I and II with the Langmuir constants and reference properties of Munck et al. (1988), guest fugacities from the EOS and water activity from NRTL / UNIQUAC / Wilson (methanol, MEG), Pitzer / Davies / Debye–Hückel (NaCl equivalent) and Henry\'s-law gas solubility; checked here against pure-gas dissociation data to within about 1.2 K up to 200 bara and 2 K at 450 bara; the stable structure is the one with the lower water chemical potential (no general multiphase Gibbs minimisation); structure H, Kihara cell-potential integration and hydrate formation from a liquid-water-free gas are not modelled. Water dissolved in the liquid hydrocarbon is neglected in the water distribution. Ethanol, DEG and TEG solutions are treated as ideal. Methanol and MEG low-temperature activity parameters were regressed to ice-point data in this work. Multi-ion brines are reduced to NaCl of equal ionic strength. Wax: ideal-solution solid–liquid equilibrium (Won melting properties, Pedersen wax-forming fraction) on a carbon-number distribution; asphaltenes: de Boer and colloidal-instability screening only. SAFT, CPA, GERG and BWR-type equations are listed for reference and not solved.',
+  referenceOnly: [],
+  equationsNote: "Cubic equations of state (Peng–Robinson 1978, Soave–Redlich–Kwong, Redlich–Kwong, van der Waals) with van der Waals one-fluid mixing rules and Péneloux-type volume translation give the two-phase vapour–liquid equilibrium and the published property table; the hydrocarbon flash carries no water. Residual-Helmholtz models are solved beside it on the phases of the cubic flash: GERG-2008 (the eleven kernel components only — phases with more than 1 mol % C7+ are not evaluated), PC-SAFT (non-associating, no polar terms; C7+ by interpolated n-alkane parameters with the segment diameter matched to the specific gravity), cubic-plus-association for water, methanol and MEG with the gas (water content, inhibitor loss, dissolved gas) and the Lee–Kesler modified Benedict–Webb–Rubin equation with Kay mixing for the gas; their derivatives are numerical. They are cross-checks and options, not the source of the table used by the other suites. Riazi–Daubert and Twu critical properties act as plus-fraction-average ratios to Kesler–Lee because the shared kernel accepts uniform multipliers only. The critical point is located on the traced saturation line, not by the Heidemann–Khalil criterion. Viscosity: Lohrenz–Bray–Clark in the table; Pedersen corresponding states (methane reference, GERG-2008 methane density) and Lee–Gonzalez–Eakin as alternatives. Hydrates: van der Waals–Platteeuw for structures I and II with either the Munck Langmuir constants (default) or constants integrated from the Kihara potential in the Lennard-Jones–Devonshire cell, guest fugacities from the cubic equation, water activity from NRTL / UNIQUAC / Wilson (methanol, MEG), Pitzer / Davies / Debye–Hückel (NaCl equivalent) and Henry's-law gas solubility. Against the NIST hydrate database the Munck set is within about 0.6 K for single guests near 273–290 K but 1–2.4 K too cold at 100–700 bar and for methane–propane; the Kihara set is within about 1 K and errs warm. Structure H is modelled for methane with a methylcyclohexane-type former only, with two constants regressed in this work. The water-side Gibbs minimum decides between aqueous liquid, ice and the hydrate structures and gives the equilibrium conversion; it is not a general multiphase flash of all components, and hydrate formation from a water-free gas is not modelled. MEG inhibition is reliable to about 30 wt %; at 40–50 wt % the model predicts 3–6 K more depression than the measurements used here. Ethanol, DEG and TEG solutions are treated as ideal. Methanol and MEG low-temperature activity parameters were regressed to ice-point data in this work. Multi-ion brines are reduced to NaCl of equal ionic strength. Wax: ideal-solution solid–liquid equilibrium (Won melting properties, Pedersen wax-forming fraction) on a carbon-number distribution. Asphaltenes: Flory–Huggins regular-solution solid–liquid equilibrium (Hirschberg) with the liquid solubility parameter from the cubic equation — strongly dependent on the asphaltene solubility parameter, which must be tuned to a measured onset — beside the de Boer and colloidal-instability screens. The miscibility pressure is a single-cell multiple-contact estimate of the slim-tube value. Validation ticks mean that the comparison is supported in the app: bundled sourced data sets where open data were found (NIST fluid properties, NIST hydrate database, Hamer & Wu, ThermoML), and table inputs with deviations for the rest (mixture phase envelopes, reservoir-fluid PVT reports, gas–oil interfacial tension, slim tube, asphaltene onset).",
 
   inputs: [
     { group: 'Fluid and conditions', tab: 'inputs', help: 'The composition, rates, water cut, salinity and inhibitor come from the case fluid; the results tables show them back.', fields: [
@@ -1361,6 +2106,9 @@ export default {
       { key: 'labDLE', label: 'Differential liberation at reservoir temperature', type: 'table', columns: [{ key: 'p', label: 'Pressure', unit: 'bara' }, { key: 'rs', label: 'Rs', unit: 'Sm³/Sm³' }, { key: 'bo', label: 'Bo', unit: 'm³/Sm³' }, { key: 'rho', label: 'Oil density', unit: 'kg/m³' }], value: LAB.dle, showIf: (v) => v.useLab !== false },
       { key: 'labVisc', label: 'Oil viscosity at reservoir temperature', type: 'table', columns: [{ key: 'p', label: 'Pressure', unit: 'bara' }, { key: 'mu', label: 'Viscosity', unit: 'mPa·s' }], value: LAB.visc, showIf: (v) => v.useLab !== false },
       { key: 'labHyd', label: 'Hydrate dissociation points (fresh water)', type: 'table', columns: [{ key: 'p', label: 'Pressure', unit: 'bara' }, { key: 't', label: 'Temperature', unit: '°C' }], value: [{ p: 20, t: 8.4 }, { p: 50, t: 13.6 }, { p: 100, t: 17.9 }], showIf: (v) => v.useLab !== false },
+      { key: 'labProps', label: 'Other measurements (quantity codes: rhoG, zG, muG, cpG, cpO, soundG, soundO, co, sigma, wc, rhoW, psat, hydT, jt)', type: 'table', columns: [{ key: 'q', label: 'Quantity code', type: 'text' }, { key: 'p', label: 'Pressure', unit: 'bara' }, { key: 't', label: 'Temperature', unit: '°C' }, { key: 'value', label: 'Measured value' }], value: [], showIf: (v) => v.useLab !== false, help: 'Comparison path for gas density (kg/m³), Z, gas viscosity (mPa·s), heat capacities (kJ/kg/K), speed of sound (m/s), oil compressibility (1/bar), gas–oil interfacial tension (mN/m), water content of gas (mg/Sm³), aqueous density (kg/m³), saturation pressure (bara; the pressure column is ignored), hydrate temperature (°C) and Joule–Thomson coefficient (K/bar).' },
+      { key: 'labMmp', label: 'Slim-tube minimum miscibility pressure (0 = not measured)', unit: 'bara', value: 0, min: 0, max: 1500, showIf: (v) => v.useLab !== false },
+      { key: 'labAop', label: 'Upper asphaltene onset pressure at reservoir temperature (0 = not measured)', unit: 'bara', value: 0, min: 0, max: 1500, showIf: (v) => v.useLab !== false },
       { key: 'labWat', label: 'Wax appearance temperature (0 = not measured)', unit: '°C', value: 0, min: -30, max: 90, showIf: (v) => v.useLab !== false },
     ] },
     { group: 'Separator train, swelling gas and SARA', tab: 'inputs', fields: [
@@ -1370,6 +2118,16 @@ export default {
       { key: 'saraAro', label: 'Aromatics', unit: 'wt %', value: 33, min: 0, max: 100 },
       { key: 'saraRes', label: 'Resins', unit: 'wt %', value: 20.5, min: 0, max: 100 },
       { key: 'saraAsp', label: 'Asphaltenes', unit: 'wt %', value: 2.5, min: 0, max: 100 },
+    ] },
+    { group: 'Initial state and permitted solid phases', tab: 'inputs', help: 'Which solid phases the equilibrium may form, and the solids already present at the start (for example after a shut-in). The equilibrium at the cold reference point tells whether they grow or dissolve.', fields: [
+      { key: 'solidsAllowed', label: 'Solid phases permitted', type: 'select', value: 'all', options: opt({ all: 'Hydrate, ice, wax and asphaltene', hydrate: 'Hydrate and ice only', waxAsph: 'Wax and asphaltene only', none: 'None (fluid phases only)' }) },
+      { key: 'hyd0', label: 'Initial hydrate (share of the water inventory)', unit: '%', value: 0, min: 0, max: 100 },
+      { key: 'solid0', label: 'Initial wax solids in the oil', unit: 'wt %', value: 0, min: 0, max: 60 },
+      { key: 'shFormer', label: 'Structure-H former present in the liquid (methylcyclohexane-type naphthene)', type: 'bool', value: false, help: 'Adds structure H (methane in the small and medium cavities, the heavy former in the large one) to the hydrate structures considered.' },
+      { key: 'aspMW', label: 'Asphaltene molar mass', unit: 'g/mol', value: 750, min: 300, max: 5000, typical: [500, 2500] },
+      { key: 'aspRho', label: 'Asphaltene density', unit: 'kg/m³', value: 1100, min: 900, max: 1300 },
+      { key: 'aspDelta', label: 'Asphaltene solubility parameter at 25 °C', unit: 'MPa^0.5', value: 21, min: 15, max: 30, typical: [19, 24], help: 'Tune to a measured onset pressure; the amount comes from the SARA asphaltene content.' },
+      { key: 'aspDeltaT', label: 'Relative decrease of that parameter per K', unit: '1/K', value: 1.07e-3, min: 0, max: 3e-3 },
     ] },
     { group: 'Equation of state and characterisation', tab: 'setup', fields: [
       { key: 'eosSel', label: 'Equation of state', type: 'select', value: 'case', options: [{ value: 'case', label: 'As set in the case' }, ...Object.entries(EOS).map(([value, e]) => ({ value, label: e.name }))] },
@@ -1382,11 +2140,13 @@ export default {
       { key: 'kijScale', label: 'Binary-interaction scale', unit: '–', value: 1, min: 0, max: 3, typical: [0.5, 1.5], help: 'Scales every default kij (including methane–C7+).' },
       { key: 'vcMult', label: 'C7+ critical-volume multiplier (viscosity)', unit: '–', value: 1, min: 0.5, max: 2, typical: [0.9, 1.2], help: 'Tunes the Lohrenz–Bray–Clark liquid viscosity.' },
       { key: 'kijTable', label: 'Binary interaction overrides (ids: N2, CO2, H2S, C1 … C6, C7+)', type: 'table', columns: [{ key: 'a', label: 'Component i', type: 'text' }, { key: 'b', label: 'Component j', type: 'text' }, { key: 'kij', label: 'kij', unit: '–' }], value: [] },
+      { key: 'altEos', label: 'Alternative equations of state and viscosity model', type: 'select', value: 'key', options: opt({ key: 'Cross-check at the key conditions: PC-SAFT, GERG-2008, Lee–Kesler, CPA, Pedersen', all: 'As above plus the Z-factor curves and the second hydrate constants set', none: 'Cubic model only (fastest)' }), help: 'The alternative models are evaluated on the phases of the cubic flash at the key conditions; the published property table stays the cubic model.' },
+      { key: 'mmpCalc', label: 'Estimate the miscibility pressure of the swelling gas (adds a few tenths of a second)', type: 'bool', value: false },
       { key: 'scnModel', label: 'Carbon-number distribution (wax, plot)', type: 'select', value: 'exp', options: opt({ exp: 'Exponential (Pedersen)', gamma: 'Gamma (Whitson)' }) },
       { key: 'gammaAlpha', label: 'Gamma shape α', unit: '–', value: 1, min: 0.5, max: 3, showIf: (v) => v.scnModel === 'gamma' },
     ] },
     { group: 'Aqueous phase, hydrate and wax models', tab: 'setup', fields: [
-      { key: 'hydModel', label: 'Hydrate model', type: 'select', value: 'vdwp', options: opt({ vdwp: 'van der Waals–Platteeuw (Munck parameters)', corr: 'Gas-gravity correlation + Nielsen–Bucklin' }) },
+      { key: 'hydModel', label: 'Hydrate model', type: 'select', value: 'vdwp', options: opt({ vdwp: 'van der Waals–Platteeuw, Munck Langmuir constants', kihara: 'van der Waals–Platteeuw, Kihara cell potential', corr: 'Gas-gravity correlation + Nielsen–Bucklin' }) },
       { key: 'actModel', label: 'Activity-coefficient model (inhibitor–water)', type: 'select', value: 'NRTL', options: opt({ NRTL: 'NRTL', UNIQUAC: 'UNIQUAC', Wilson: 'Wilson', ideal: "Ideal solution (Raoult's law)" }) },
       { key: 'elecModel', label: 'Electrolyte model', type: 'select', value: 'pitzer', options: opt({ pitzer: 'Pitzer', davies: 'Davies', edh: 'Extended Debye–Hückel', dh: 'Debye–Hückel limiting law' }) },
       { key: 'inhDesign', label: 'Inhibitor for the requirement (when the case has none)', type: 'select', value: 'MEG', options: Object.entries(INHIBITORS).filter(([k]) => k !== 'none').map(([value, i]) => ({ value, label: i.name })) },
@@ -1397,6 +2157,17 @@ export default {
       { key: 'inhWtIn', label: 'Custom inhibitor concentration', unit: 'wt %', value: 30, min: 0, max: 90, showIf: (v) => v.aqSource === 'custom' },
       { key: 'waxDetect', label: 'Wax detection limit for the appearance temperature', unit: 'wt %', value: 0.02, min: 0.001, max: 1 },
       { key: 'waxHfMult', label: 'Wax enthalpy-of-fusion multiplier', unit: '–', value: 1, min: 0.5, max: 1.5, help: 'Tune to a measured wax appearance temperature.' },
+    ] },
+    { group: 'Calibration multipliers (estimated on the calibration tab)', tab: 'setup', help: 'Each multiplier moves one measured quantity; leave at 1 for the untuned model. They act on the run, on the published property table (volume shift, parachor, heat capacity, gas viscosity) and on the hydrate curve.', fields: [
+      { key: 'shiftMult', label: 'Volume-shift multiplier (densities, Z, formation-volume factor)', unit: '–', value: 1, min: 0, max: 3, typical: [0.7, 1.3] },
+      { key: 'parMult', label: 'Parachor multiplier (interfacial and surface tension)', unit: '–', value: 1, min: 0.5, max: 1.5, typical: [0.9, 1.1] },
+      { key: 'cpMult', label: 'Ideal-gas heat-capacity multiplier (enthalpy, heat capacity, speed of sound)', unit: '–', value: 1, min: 0.7, max: 1.3, typical: [0.95, 1.05] },
+      { key: 'muGMult', label: 'Gas-viscosity multiplier', unit: '–', value: 1, min: 0.5, max: 2, typical: [0.9, 1.1] },
+      { key: 'rhoWMult', label: 'Aqueous-density multiplier', unit: '–', value: 1, min: 0.9, max: 1.1, typical: [0.99, 1.01] },
+      { key: 'wcMult', label: 'Water-content multiplier', unit: '–', value: 1, min: 0.3, max: 3, typical: [0.8, 1.2] },
+      { key: 'hydMult', label: 'Hydrate reference chemical-potential multiplier (shifts the dissociation curve)', unit: '–', value: 1, min: 0.8, max: 1.2, typical: [0.97, 1.03] },
+      { key: 'actMult', label: 'Inhibitor activity multiplier (ln γ of water: inhibitor response)', unit: '–', value: 1, min: 0, max: 3, typical: [0.7, 1.3] },
+      { key: 'saltMult', label: 'Salt activity multiplier (ln a_w of the brine: salinity correction)', unit: '–', value: 1, min: 0, max: 3, typical: [0.8, 1.2] },
     ] },
     { group: 'Property-table range and resolution', tab: 'mesh', help: 'The table is interpolated by the flow, solids and operations suites.', fields: [
       { key: 'nP', label: 'Pressure points (logarithmic)', value: 22, min: 6, max: 80 },
@@ -1415,9 +2186,10 @@ export default {
     { name: 'Black oil, low GOR', values: { fluidSource: 'blackOil', tRes: 80, pRes: 250, pRef: 80, useLab: false, swellGas: 'CO2' } },
     { name: 'Volatile oil, near-critical', values: { fluidSource: 'volatileOil', tRes: 120, pRes: 420, pRef: 150, useLab: false, swellGas: 'lean' } },
     { name: 'Gas condensate with constant-volume depletion', values: { fluidSource: 'gasCondensate', tRes: 110, pRes: 420, pRef: 180, tArr: 20, useLab: false, swellGas: 'none', sepStages: [{ p: 60, t: 25 }, { p: 10, t: 20 }] } },
-    { name: 'Lean gas tie-back with MEG injection', values: { fluidSource: 'leanGas', tRes: 95, pRes: 280, pRef: 150, pArr: 70, tArr: 8, useLab: false, swellGas: 'none', aqSource: 'custom', salinityIn: 0.5, inhIn: 'MEG', inhWtIn: 45, inhDesign: 'MEG' } },
+    { name: 'Lean gas tie-back with MEG injection', values: { fluidSource: 'leanGas', altEos: 'all', tRes: 95, pRes: 280, pRef: 150, pArr: 70, tArr: 8, useLab: false, swellGas: 'none', aqSource: 'custom', salinityIn: 0.5, inhIn: 'MEG', inhWtIn: 45, inhDesign: 'MEG' } },
     { name: 'Sour CO₂-rich gas, SRK and methanol', values: { fluidSource: 'sourGas', eosSel: 'SRK', tRes: 100, pRes: 300, pRef: 120, pArr: 60, tArr: 10, useLab: false, swellGas: 'none', inhDesign: 'MeOH', aqSource: 'custom', salinityIn: 2, inhIn: 'MeOH', inhWtIn: 25 } },
     { name: 'Reference oil tuned to the laboratory report', values: { fluidSource: 'case', tcMult: 1.025, pcMult: 0.97, kijScale: 1.15, vcMult: 1.06 } },
+    { name: 'Kihara hydrate constants, structure-H former, miscibility and solids inventory', values: { fluidSource: 'case', altEos: 'all', hydModel: 'kihara', shFormer: true, mmpCalc: true, swellGas: 'rich', hyd0: 20, solid0: 0.5, labProps: [{ q: 'sigma', p: 100, t: 60, value: 6.1 }, { q: 'wc', p: 25, t: 30, value: 1500 }] } },
     { name: 'Heavy-end sensitivity: SRK, Twu, two pseudo-components', values: { fluidSource: 'case', eosSel: 'SRK', critCorr: 'Twu', nPseudoSel: '2', useLab: false } },
   ],
   pull: ({ fluid, outputs } = {}) => [
@@ -1444,19 +2216,30 @@ export default {
   ],
 
   calibration: {
-    note: 'Regress the C7+ critical-property multipliers, the interaction scale and the viscosity critical-volume multiplier to saturation pressure, liquid density, solution gas–oil ratio and viscosity. The model uses the fluid of the most recent run (the reference fluid before any run). Fit Tc, Pc and kij to saturation pressure, density and GOR first; the critical-volume multiplier only moves viscosity.',
+    note: 'Regress the C7+ critical-property multipliers, the interaction scale and the viscosity critical-volume multiplier to saturation pressure, liquid density, solution gas–oil ratio and viscosity, and the single-purpose multipliers to their own measurement: volume shift → densities, Z and formation-volume factor; parachor → interfacial tension; ideal-gas heat capacity → heat capacity and speed of sound; gas viscosity; aqueous density; water content; hydrate reference chemical potential → fresh-water hydrate points; inhibitor activity → inhibited hydrate points and water activity; salt activity → brine hydrate points. A row only needs the columns that were measured; give the salinity and inhibitor of the aqueous phase with hydrate, water-activity, water-content and aqueous-density points. The model uses the fluid of the most recent run (the reference fluid before any run). Fit one group of parameters at a time (tick only those the data can identify).',
     params: [
       { key: 'tcMult', label: 'C7+ Tc multiplier', lo: 0.9, hi: 1.1 }, { key: 'pcMult', label: 'C7+ Pc multiplier', lo: 0.8, hi: 1.2 }, { key: 'wMult', label: 'C7+ acentric-factor multiplier', lo: 0.8, hi: 1.2 },
       { key: 'kijScale', label: 'Binary-interaction scale', lo: 0, hi: 2.5 }, { key: 'vcMult', label: 'C7+ Vc multiplier (viscosity)', lo: 0.8, hi: 1.4 },
+      { key: 'shiftMult', label: 'Volume-shift multiplier', lo: 0.3, hi: 2 }, { key: 'parMult', label: 'Parachor multiplier', lo: 0.7, hi: 1.3 }, { key: 'cpMult', label: 'Ideal-gas heat-capacity multiplier', lo: 0.85, hi: 1.15 },
+      { key: 'muGMult', label: 'Gas-viscosity multiplier', lo: 0.7, hi: 1.4 }, { key: 'rhoWMult', label: 'Aqueous-density multiplier', lo: 0.95, hi: 1.05 }, { key: 'wcMult', label: 'Water-content multiplier', lo: 0.5, hi: 2 },
+      { key: 'hydMult', label: 'Hydrate reference chemical-potential multiplier', lo: 0.9, hi: 1.1 }, { key: 'actMult', label: 'Inhibitor activity multiplier', lo: 0.3, hi: 2 }, { key: 'saltMult', label: 'Salt activity multiplier', lo: 0.5, hi: 1.6 },
     ],
-    columns: [{ key: 'calT', label: 'Temperature', unit: '°C' }, { key: 'calP', label: 'Pressure', unit: 'bara' }, { key: 'psat', label: 'Saturation pressure at T', unit: 'bara' }, { key: 'rho', label: 'Liquid density at P, T', unit: 'kg/m³' }, { key: 'rs', label: 'Solution GOR at P, T', unit: 'Sm³/Sm³' }, { key: 'mu', label: 'Liquid viscosity at P, T', unit: 'mPa·s' }],
-    targets: [{ key: 'psat', label: 'Saturation pressure', unit: 'bara' }, { key: 'rho', label: 'Liquid density', unit: 'kg/m³' }, { key: 'rs', label: 'Solution GOR', unit: 'Sm³/Sm³' }, { key: 'mu', label: 'Liquid viscosity', unit: 'mPa·s' }],
+    columns: [{ key: 'calT', label: 'Temperature', unit: '°C' }, { key: 'calP', label: 'Pressure', unit: 'bara' }, { key: 'calSal', label: 'Salinity of the aqueous phase', unit: 'wt %' }, { key: 'calInhWt', label: 'Inhibitor in the aqueous phase', unit: 'wt %' },
+      { key: 'psat', label: 'Saturation pressure at T', unit: 'bara' }, { key: 'rho', label: 'Liquid density at P, T', unit: 'kg/m³' }, { key: 'rs', label: 'Solution GOR at P, T', unit: 'Sm³/Sm³' }, { key: 'mu', label: 'Liquid viscosity at P, T', unit: 'mPa·s' },
+      { key: 'bo', label: 'Formation-volume factor', unit: 'm³/Sm³' }, { key: 'rhoG', label: 'Gas density', unit: 'kg/m³' }, { key: 'zG', label: 'Gas Z-factor', unit: '–' }, { key: 'muG', label: 'Gas viscosity', unit: 'mPa·s' }, { key: 'co', label: 'Liquid compressibility', unit: '10⁻⁴/bar' },
+      { key: 'cp', label: 'Liquid heat capacity', unit: 'kJ/kg/K' }, { key: 'sound', label: 'Speed of sound in the gas', unit: 'm/s' }, { key: 'sigma', label: 'Interfacial tension', unit: 'mN/m' }, { key: 'wc', label: 'Water content of gas', unit: 'mg/Sm³' }, { key: 'rhoW', label: 'Aqueous density', unit: 'kg/m³' },
+      { key: 'aw', label: 'Water activity', unit: '–' }, { key: 'hydT', label: 'Hydrate temperature', unit: '°C' }, { key: 'mmp', label: 'Minimum miscibility pressure', unit: 'bara' }],
+    targets: [{ key: 'psat', label: 'Saturation pressure', unit: 'bara' }, { key: 'rho', label: 'Liquid density', unit: 'kg/m³' }, { key: 'rs', label: 'Solution GOR', unit: 'Sm³/Sm³' }, { key: 'mu', label: 'Liquid viscosity', unit: 'mPa·s' },
+      { key: 'bo', label: 'Formation-volume factor', unit: 'm³/Sm³' }, { key: 'rhoG', label: 'Gas density (stock-tank flash gas at P, T)', unit: 'kg/m³' }, { key: 'zG', label: 'Gas Z-factor', unit: '–' }, { key: 'muG', label: 'Gas viscosity', unit: 'mPa·s' }, { key: 'co', label: 'Liquid isothermal compressibility', unit: '10⁻⁴/bar' },
+      { key: 'cp', label: 'Liquid heat capacity', unit: 'kJ/kg/K' }, { key: 'sound', label: 'Speed of sound in the gas', unit: 'm/s' }, { key: 'sigma', label: 'Gas–oil interfacial (surface) tension', unit: 'mN/m' }, { key: 'wc', label: 'Water content of gas', unit: 'mg/Sm³' }, { key: 'rhoW', label: 'Aqueous-phase density', unit: 'kg/m³' },
+      { key: 'aw', label: 'Water activity of the aqueous phase', unit: '–' }, { key: 'hydT', label: 'Hydrate dissociation temperature at P', unit: '°C' }, { key: 'mmp', label: 'Slim-tube minimum miscibility pressure at T', unit: 'bara' }],
     model: calibrationModel,
-    sample: CAL_SAMPLE,
-    validationSample: CAL_VALID,
+    sample: [...CAL_SAMPLE, ...CAL_SAMPLE2],
+    validationSample: [...CAL_VALID, ...CAL_VALID2],
   },
 
   verify: verifyChecks,
+  validationData: VALIDATION,
 
   views: [{ id: 'flash', label: 'Flash calculator', tip: 'Interactive PT / PH / PS flash with phase compositions and properties', render: flashView }],
 };

@@ -6,8 +6,9 @@
 // SI units inside; bara, °C, mm and µm at the interfaces.
 import { clamp, brent, interp1, tridiag, rng, mean, std, quantile, linspace, histogram, gci, isNum } from '../core/num.js';
 import { fluidModel } from '../core/thermo.js';
-import { G, frictionFactor, hInside, hOutside, uValue, seaTemperature, stratifiedLevel, flowPattern, slugVelocity, slugBodyHoldup, slugFrequency, slugLength, severeSlugging, gradient, discretise, marchSteady } from '../core/pipe.js';
+import { G, frictionFactor, hInside, hOutside, nuCrossFlow, nuFreeCylinder, uValue, seaTemperature, stratifiedLevel, flowPattern, slugVelocity, slugBodyHoldup, slugFrequency, slugLength, slugUnit, severeSlugging, gradient, discretise, marchSteady } from '../core/pipe.js';
 import { BASE } from '../data/basecase.js';
+import * as REF from '../data/ref/flow.js';
 
 const PI = Math.PI, DEG = PI / 180, FT = 0.3048, P_ATM = 101325, RGAS = 8.314462618;
 const fin = (x, d = 0) => (typeof x === 'number' && Number.isFinite(x) ? x : d);
@@ -150,10 +151,13 @@ export const HOLDUP_MODELS = [
   { value: 'hagedornBrown', label: 'Hagedorn & Brown (1965, Griffith bubble) — upward flow' },
   { value: 'orkiszewski', label: 'Orkiszewski (1967) — upward flow' },
   { value: 'gray', label: 'Gray (1974) — gas-condensate, upward flow' },
+  { value: 'dunsRos', label: 'Duns & Ros (1963) — upward flow' },
+  { value: 'ansari', label: 'Ansari et al. (1994) mechanistic — upward flow' },
+  { value: 'mechEnt', label: 'Mechanistic + three-field annular flow (entrainment / deposition)' },
   { value: 'homogeneous', label: 'Homogeneous (no slip)' },
 ];
-const OWN = { hagedornBrown, gray, orkiszewski, mukherjeeBrill };
-const UP_ONLY = new Set(['hagedornBrown', 'gray', 'orkiszewski']);
+const OWN = { hagedornBrown, gray, orkiszewski, mukherjeeBrill, dunsRos, ansari, mechEnt };
+const UP_ONLY = new Set(['hagedornBrown', 'gray', 'orkiszewski', 'dunsRos', 'ansari']);
 /**
  * Two-phase holdup and pressure gradient at one location with any of the suite's closures.
  * p: { vsl, vsg, rhoL, rhoG, muL, muG, sigma, D, theta (rad, + up), rough (m), P (Pa), fModel, waterCont }
@@ -166,10 +170,9 @@ export function holdupGradient(p, model = 'beggsBrill', mp = {}) {
   let r;
   if (vm <= 1e-9 || q.vsg <= 1e-9 * vm || q.vsl <= 1e-9 * vm) {
     r = gradient(q, 'homogeneous');
-    if (vm > 1e-9 && q.vsl <= 1e-9 * vm) withAcc(r, q.rhoG, vm, vm, q.P); // single-phase gas: expansion acceleration
   } else if (model === 'transient') r = transientClosure(q, mp.slip);
   else if (model === 'zuberFindlay') r = zuberFindlay(q, mp);
-  else if (OWN[model] && !(UP_ONLY.has(model) && q.theta < 0)) r = OWN[model](q);
+  else if (OWN[model] && !(UP_ONLY.has(model) && q.theta <= (model === 'ansari' ? 0.05 : -1e-12))) r = OWN[model](q, mp);
   else r = gradient(q, OWN[model] ? 'beggsBrill' : model);
   const hm = mp.holdupMult;
   if (hm && hm !== 1 && r.holdup > 0 && r.holdup < 1) { // calibration multiplier on the liquid holdup: the static head follows
@@ -263,9 +266,9 @@ export function steadyMarch(o) {
   const state = (P, T, i) => {
     const sMid = 0.5 * (grid.s[i] + grid.s[i + 1]), zMid = 0.5 * (grid.z[i] + grid.z[i + 1]), D = dOf ? Math.max(dOf(sMid), 0.01) : id, A = (PI * D * D) / 4, pr = fm.at(P, T, mScale), th = grid.theta[i];
     const vsg = pr.qG / A, vsl = pr.qL / A, vm = vsl + vsg;
-    const gr = holdupGradient({ vsl, vsg, rhoL: pr.rhoL, rhoG: pr.rhoG, muL: pr.muL, muG: pr.muG, sigma: pr.sigma, D, theta: th, rough: rOf ? rOf(sMid) : rough, P: P * 1e5, fModel, waterCont: pr.phaseInv }, model, mp);
+    const gr = holdupGradient({ vsl, vsg, rhoL: pr.rhoL, rhoG: pr.rhoG, muL: pr.muL, muG: pr.muG, sigma: pr.sigma, D, theta: th, rough: rOf ? rOf(sMid) : rough, P: P * 1e5, fModel, waterCont: pr.phaseInv, label: false }, model, mp);
     gr.loc = kCell[i] > 0 && vm > 0 ? (kCell[i] * (pr.rhoL * (vsl / vm) + pr.rhoG * (vsg / vm)) * vm * vm) / (2 * ds) : 0; gr.dpdx += gr.loc;
-    const H = gr.holdup, ta = tAmbOf(sMid, zMid), U = uOf ? uOf({ s: sMid, z: zMid, D, pr, vm, holdup: H, ta }) : U0, q = U * PI * D * (T - ta) - (heatOf ? heatOf(sMid) : 0);
+    const H = gr.holdup, ta = tAmbOf(sMid, zMid), U = uOf ? uOf({ s: sMid, z: zMid, D, pr, vm, holdup: H, ta, T }) : U0, q = U * PI * D * (T - ta) - (heatOf ? heatOf(sMid) : 0);
     const mCp = pr.mG * pr.cpG + pr.mO * pr.cpO + pr.mW * pr.cpW, jt = mCp > 0 ? (pr.mG * pr.cpG * pr.jtG + pr.mO * pr.cpO * pr.jtO - pr.mW / pr.rhoW) / mCp : 0, sinT = Math.sin(th);
     const dTds = mCp > 0 && energy !== 'isothermal' ? -q / mCp - jt * gr.dpdx - (mdot * G * sinT) / mCp : 0;
     const ke = H > 1e-6 && H < 1 - 1e-6 ? 0.5 * (pr.mG * (vsg / (1 - H)) ** 2 + (pr.mO + pr.mW) * (vsl / H) ** 2) : 0.5 * mdot * vm * vm;
@@ -390,15 +393,26 @@ export function flowConfig(v = {}, ctx = {}) {
   const od = id0 + 2 * (wt + insT), riserBaseX = clamp(num(v.riserBaseX, BASE.riserBaseX, 0, 1e7), 0, L), burialDepth = num(v.burialDepth, 0, 0, 20), kSoil = num(v.kSoil, 1.2, 0.1, 10);
   const current = num(v.currentSpeed, BASE.currentSpeed, 0, 5), wind = num(v.windSpeed, 5, 0, 60), uMult = num(v.uMult, 1, 0.05, 20), uIn = num(v.uValue, BASE.U, 0, 5000);
   const tAmbOf = (s, z) => ambientTemperature(z, thermal), buriedAt = (s) => burialDepth > 0 && xOfS(s) <= riserBaseX + 1e-6;
-  const network = (c) => uValue({ id: c.D, wt, kWall, layers: layers.slice(1), hIn: filmInside(c.pr, c.vm, c.holdup, c.D), hOut: c.z >= 0 ? hOutside(wind, od, 'air') : hOutside(current, od, 'seawater', c.ta), burial: buriedAt(c.s) ? { depth: burialDepth + od / 2, kSoil } : null });
+  const hOutMult = num(v.hOutMult, 1, 0.05, 20), natConv = v.natConv !== false;
+  // outside film: forced convection (Churchill–Bernstein) combined with free convection (Churchill–Chu) for the surface temperature excess, which is found by one fixed-point pass
+  const hOutOf = (c, dT = 0) => hOutMult * (c.z >= 0 ? hOutside(wind, od, 'air', c.ta, dT) : hOutside(current, od, 'seawater', c.ta, dT));
+  const network = (c) => {
+    const mk = (hOut) => uValue({ id: c.D, wt, kWall, layers: layers.slice(1), hIn: filmInside(c.pr, c.vm, c.holdup, c.D), hOut, burial: buriedAt(c.s) ? { depth: burialDepth + od / 2, kSoil } : null });
+    let r = mk(hOutOf(c));
+    if (natConv && Number.isFinite(c.T) && !buriedAt(c.s)) { const h0 = hOutOf(c), dTs = (r.U * c.D * (c.T - c.ta)) / (od * Math.max(h0, 1e-9)); r = mk(hOutOf(c, dTs)); r.dTsurface = dTs; r.hOut = hOutOf(c, dTs); }
+    return r;
+  };
   const uMode = v.uMode === 'layers' ? 'layers' : 'input', uOf = uMode === 'layers' ? (c) => network(c).U * uMult : null, heat = num(v.heatTrace, 0, 0, 5000);
   const model = HOLDUP_MODELS.some((m) => m.value === v.model) ? v.model : 'beggsBrill', fModel = ['colebrook', 'haaland', 'swamee', 'churchill'].includes(v.fModel) ? v.fModel : 'colebrook';
-  const mp = { c0: num(v.c0, 1.2, 0.8, 2), vDrift: num(v.vDrift, 0.35, -5, 10), wallisN: num(v.wallisN, 0, 0, 5), holdupMult: num(v.holdupMult, 1, 0.2, 3) };
+  const mp = { c0: num(v.c0, 1.2, 0.8, 2), vDrift: num(v.vDrift, 0.35, -5, 10), wallisN: num(v.wallisN, 0, 0, 5), holdupMult: num(v.holdupMult, 1, 0.2, 3), annular: annularParams(v) };
+  const equip = equipment({ pumpDp0: num(v.pumpDp0, 0, 0, 500), pumpQmax: num(v.pumpQmax, 0.5, 1e-4, 100), pumpSpeed: num(v.pumpSpeed, 1, 0.1, 2), sepKv: v.sepMode === 'valve' ? num(v.sepKv, 0.5, 0, 1e6) : 0, compHead: v.sepMode === 'valve' ? num(v.compHead, 60, 0, 500) * 1e3 : 0, compQmax: num(v.compQmax, 2, 1e-3, 1e3), compSpeed: num(v.compSpeed, 1, 0.3, 1.3) });
+  const branch = num(v.branchFrac, 0, 0, 0.95) > 0 ? { frac: num(v.branchFrac, 0, 0, 0.95), x: num(v.branchX, 9000, 0, 1e7), length: num(v.branchLength, 3000, 10, 1e6), dz: num(v.branchDz, 0, -3000, 3000), idMm: num(v.branchIdMm, 0, 0, 3000), tIn: num(v.branchTin, BASE.tIn, -40, 250) } : null;
   const energy = v.energy === 'cpjt' ? 'cpjt' : 'enthalpy', n = Math.round(num(v.nSteady, 150, 8, 4000)), zEnd = profile.z[profile.z.length - 1], zBase = interp1(profile.x, profile.z, riserBaseX);
   const riserHeight = zEnd - zBase, hasRiser = riserBaseX < L - 1e-6 && riserHeight > 20 * id0;
   const fittings = (Array.isArray(v.fittings) ? v.fittings : []).map((r) => ({ x: +r?.x, K: +r?.K * (isNum(+r?.open) && +r.open > 0 && +r.open < 100 ? (100 / +r.open) ** 2 : 1) })).filter((r) => Number.isFinite(r.x) && r.K > 0).map((r) => ({ s: sOfX(clamp(r.x, 0, L)), K: r.K })), kTotal = num(v.kLoss, 0, 0, 1e5);
   const chokeDp = num(v.chokeDp, 0, 0, 500), chokeOpening = num(v.chokeOpening, 100, 1, 100);
   const cfg = { fm, profile, length: L, fittings, kTotal, chokeDp, chokeOpening, chokeLoss: (m) => chokeDp * m * m * (100 / chokeOpening) ** 2, id, id0, idMin, wt, rough, idOf, od, layers, thermal, uMode, uOf, U: uIn * uMult, uMult, network, tAmbOf, heat, tIn: num(v.tIn, BASE.tIn, -40, 250), pSep: num(v.pOut, BASE.pOut, 1.05, 1300), pOut: num(v.pOut, BASE.pOut, 1.05, 1300) + chokeDp * num(v.rateFrac, 1, 1e-4, 20) ** 2 * (100 / chokeOpening) ** 2, model, fModel, mp, energy, n, riserBaseX, riserBaseS: sOfX(riserBaseX), hasRiser, riserHeight, sOfX, xOfS, burialDepth, kSoil, insT, insK, kWall, current, wind, cErosion: num(v.cErosion, 100, 30, 400), buriedAt };
+  cfg.equip = equip; cfg.branch = branch; cfg.compPd = num(v.compPd, 120, 2, 1000); cfg.sepMode = v.sepMode === 'valve' ? 'valve' : 'fixed'; cfg.hOutOf = hOutOf; cfg.natConv = natConv;
   cfg.base = { fm, profile, n, id, rough, idOf, kTotal, fittings, tolP: num(v.tolP, 1e-6, 1e-9, 0.1), tIn: cfg.tIn, model, fModel, mp, energy, uOf, U: cfg.U, tAmbOf, heatOf: heat > 0 ? () => heat : null, cErosion: cfg.cErosion };
   return cfg;
 }
@@ -414,7 +428,10 @@ export function steadyFlow(v = {}, ctx = {}, over = {}) {
   const cfg = over.cfg || flowConfig(v, ctx), bc = ['outletP', 'inletP', 'bothP', 'ipr'].includes(v.bc) ? v.bc : 'outletP', rate = num(over.mScale ?? v.rateFrac, 1, 1e-4, 20), base = { ...cfg.base, ...(over.base || {}) };
   const need = (r) => { if (!r.ok) throw new Error(r.reason || 'No steady flow solution exists for these inputs.'); return r; };
   let st, mScale = rate, nodal = null;
-  if (bc === 'outletP') st = need(steadySolve({ ...base, mScale, pOut: cfg.pOut, pGuess: over.pGuess }));
+  // separator / compressor characteristic: the outlet pressure floats with the gas rate through the gas outlet valve and the compressor curve
+  const pOutAt = (m) => { if (cfg.sepMode !== 'valve') return cfg.pOut; const o = cfg.fm.at(cfg.pSep, 20, m), std = cfg.fm.at(1.01325, 15, m), qStd = fin(std.qG, 0), cs = cfg.equip.compressor(fin(o.qG, 0), cfg.compPd, 293, fin(o.zG, 0.9), fin(o.mwG, 20) * 1e-3, fin(o.mG, 0)); cfg.compressor = { ...cs, qStd, qSuction: fin(o.qG, 0) }; return cfg.equip.sepPressure(qStd, cfg.pSep, cs.head > 0 ? Math.min(cs.pSuction, cfg.pSep) : cfg.pSep) + (cfg.pOut - cfg.pSep); };
+  const solveOut = (opts, m, guess) => (cfg.branch ? steadyBranch({ ...opts, mScale: m, pOut: pOutAt(m) }, cfg.branch) : steadySolve({ ...opts, mScale: m, pOut: pOutAt(m), pGuess: guess }));
+  if (bc === 'outletP') { st = need(solveOut(base, mScale, over.pGuess)); cfg.pOutEff = pOutAt(mScale); }
   else if (bc === 'inletP') st = need(steadySolve({ ...base, mScale, pIn: num(v.pInSet, 95, 1.1, 1400) }));
   else {
     const coarse = { ...base, n: Math.min(base.n, 30), hydrate: false }, pInSet = num(v.pInSet, 95, 1.1, 1400), pRes = num(v.pRes, BASE.pRes, 2, 2000), pi = num(v.piIpr, BASE.pi, 1e-3, 1e6), wellDp = num(v.wellDp, 60, 0, 1500), vogel = v.iprType === 'vogel', qMax = vogel ? (pi * pRes) / 1.8 : pi * pRes;
@@ -422,8 +439,8 @@ export function steadyFlow(v = {}, ctx = {}, over = {}) {
     let last = null;
     const g = (m, opts = coarse) => {
       if (bc === 'bothP') { const r = steadySolve({ ...opts, mScale: m, pIn: pInSet }); return r.ok ? r.pOut - cfg.pOut : -1e3; }
-      const r = steadySolve({ ...opts, mScale: m, pOut: cfg.pOut, pGuess: last }); if (!r.ok) return -1e3; last = r.pIn;
-      return pwfOf(stdLiquid(cfg.fm, m)) - wellDp * (0.8 + 0.2 * m * m) - r.pIn; // available minus required flowline inlet pressure
+      const r = solveOut(opts, m, last); if (!r.ok) return -1e3; last = r.pIn;
+      return pwfOf(stdLiquid(cfg.fm, m)) - wellDp * (0.8 + 0.2 * m * m) + cfg.equip.pumpDp(r.qG[0] + r.qL[0]) - r.pIn; // available (inflow − well losses + booster pump) minus required flowline inlet pressure
     };
     const mHi = bc === 'ipr' ? Math.min(3, (0.999 * qMax) / Math.max(stdLiquid(cfg.fm, 1), 1e-9)) : 3;
     if (g(mHi) > 0) { if (bc === 'ipr') mScale = mHi; else throw new Error(`The pressure difference between ${pInSet} and ${cfg.pOut} bara would drive more than three times the case rate; reduce it or increase the case rate.`); }
@@ -434,7 +451,7 @@ export function steadyFlow(v = {}, ctx = {}, over = {}) {
       mScale = brent(g, lo, hi, 1e-4);
       if (bc === 'bothP' && base.n > coarse.n) { const a = mScale * 0.9, b = mScale * 1.1, full = { ...base, hydrate: false }, ga = g(a, full), gb = g(b, full); if (ga > 0 && gb < 0) mScale = brent((m) => g(m, full), a, b, 1e-5); }
     }
-    st = need(steadySolve(bc === 'bothP' ? { ...base, mScale, pIn: pInSet } : { ...base, mScale, pOut: cfg.pOut }));
+    st = need(bc === 'bothP' ? steadySolve({ ...base, mScale, pIn: pInSet }) : solveOut(base, mScale, last)); if (bc !== 'bothP') cfg.pOutEff = pOutAt(mScale);
     if (bc === 'ipr') { const q = stdLiquid(cfg.fm, mScale), pwf = pwfOf(q); nodal = { pwf, drawdown: pRes - pwf, qLiqStd: q, pRes, wellDp: wellDp * (0.8 + 0.2 * mScale * mScale) }; }
   }
   return Object.assign(st, { cfg, mScale, bc, nodal });
@@ -455,7 +472,7 @@ const fanning = (Re) => (Re < 2100 ? 16 / Math.max(Re, 1e-9) : 0.046 * Re ** -0.
  */
 export function stratifiedBalance(hD, p, o = {}) {
   const { vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0 } = p, g = stratGeom(hD, D), vL = (vsl * g.A) / g.AL, vG = (vsg * g.A) / g.AG, DL = (4 * g.AL) / g.SL, DG = (4 * g.AG) / (g.SG + g.Si);
-  const fL = fanning((rhoL * vL * DL) / muL), fG = fanning((rhoG * vG * DG) / muG), fi = o.pure ? fG : Math.max(fG, 0.0142);
+  const fL = fanning((rhoL * vL * DL) / muL) * (o.fwlMult || 1), fG0 = fanning((rhoG * vG * DG) / muG), fG = fG0 * (o.fwgMult || 1), fi = (o.pure ? fG0 : Math.max(fG0, 0.0142)) * (o.fiMult || 1);
   const tL = (fL * rhoL * vL * vL) / 2, tG = (fG * rhoG * vG * vG) / 2, ti = o.pure ? (fi * rhoG * vG * vG) / 2 : (fi * rhoG * (vG - vL) * Math.abs(vG - vL)) / 2;
   return { F: (tG * g.SG) / g.AG - (tL * g.SL) / g.AL + ti * g.Si * (1 / g.AL + 1 / g.AG) - (rhoL - rhoG) * G * Math.sin(theta), g, vL, vG, tL, tG, ti, fL, DL };
 }
@@ -508,7 +525,7 @@ export function flowPatternMap(p, o = {}) {
   return { vsg, vsl, index: idx, boundaries };
 }
 // Mandhane, Gregory & Aziz (1974) horizontal map: transition lines digitised in superficial velocities (ft/s), log–log interpolation
-const MANDHANE = { annular: [[0.01, 70], [0.1, 60], [0.3, 38], [0.56, 40], [1, 50], [2.5, 100], [14, 230], [30, 269]], wave: [[0.01, 14], [0.1, 10.5], [0.3, 2.5], [0.5, 2.5], [1.7, 3.25], [14, 3.25]] };
+const MANDHANE = { annular: [[0.01, 70], [0.1, 60], [0.3, 38], [0.56, 40], [1, 50], [2.5, 100], [14, 230], [30, 269]], wave: [[0.01, 32.7], [0.1, 14], [0.2, 10.5], [1.15, 2.5], [4.8, 2.5], [14, 3.26]] };
 const logInterp = (pts, x) => 10 ** interp1(pts.map((q) => log10(q[0])), pts.map((q) => log10(q[1])), log10(x));
 /** Mandhane-type horizontal flow-pattern classification from the superficial velocities (m/s); air–water coordinates, no property correction. */
 export function mandhaneRegime(vsl, vsg) {
@@ -534,21 +551,24 @@ export function slugUnitCell(p, o = {}) {
   const { vsl, vsg, rhoL, rhoG, muL, D, theta = 0 } = p, sigma = Math.max(p.sigma ?? 0.02, 1e-4), vm = vsl + vsg, A = (PI * D * D) / 4, dRho = Math.max(rhoL - rhoG, 1), sinP = Math.sin(Math.max(theta, 0));
   let { C0, vd } = slugVelocity(vm, D, theta);
   if (o.vtModel === 'nicklin') { C0 = 1.2; vd = 0.35 * Math.sqrt(G * D) * sinP; }
-  const vt = Math.max(C0 * vm + vd, 1e-6);
+  const vt = Math.max((C0 * vm + vd) * (o.vtMult || 1), 1e-6);
   let HLS = slugBodyHoldup(vm);
   if (o.bodyModel === 'barnea') { const fs = fanning((rhoL * vm * D) / muL), x = 2 * Math.sqrt((0.4 * sigma) / (dRho * G)) * ((2 * fs * vm ** 3) / D) ** 0.4 * (rhoL / sigma) ** 0.6 - 0.725; HLS = clamp(1 - (x > 0 ? 0.058 * x * x : 0), 0.48, 1); }
+  HLS = clamp(HLS * (o.bodyMult || 1), 0.3, 1);
   const vGb = 1.2 * vm + 1.53 * ((G * sigma * dRho) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * sinP;
   const holdup = clamp((vt * HLS + vGb * (1 - HLS) - vsg) / vt, vsl / Math.max(vm, 1e-9), 1);
   let HLF = clamp(stratifiedLevel({ ...p, vsl: Math.max(vsl * 0.3, 1e-4), theta: Math.min(theta, 0.15) }).holdup, 0.01, 0.9 * HLS);
   HLF = clamp(Math.min(HLF, holdup * 0.98) * (o.filmMult || 1), 0.005, Math.min(0.95 * HLS, 0.98 * holdup));
   const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), dIn = D / 0.0254;
   const length = (o.lenMult || 1) * (o.lengthModel === 'norris' ? Math.exp(-2.099 + 4.859 * Math.sqrt(Math.log(Math.max(dIn, 1.01)))) * FT : slugLength(D, vm, o.lengthModel === 'brill' ? 'brill' : 'scott'));
-  const unitLength = length / beta, lam = vsl / Math.max(vm, 1e-9);
+  const unitLength0 = length / beta, unitLength = unitLength0, lam = vsl / Math.max(vm, 1e-9);
   let f = o.freqModel === 'unitCell' ? vt / unitLength : o.freqModel === 'heywood' ? 0.0434 * (lam * (2.02 / D + (vm * vm) / (G * D))) ** 1.02 : slugFrequency(vsl, vm, D, theta, o.freqModel === 'gregory' ? 'gregory' : 'zabaras');
   if (!(f > 0)) f = vt / unitLength;
   const freq = f * (o.freqMult || 1), vBody = (vm - vGb * (1 - HLS)) / HLS, filmVelocity = vt - ((vt - vBody) * HLS) / HLF;
-  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, slugFraction: beta, freq, period: 1 / freq, length, lengthFromFreq: (beta * vt) / freq, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength,
-    volume: length * A * HLS, filmThickness: levelOfHoldup(HLF) * D, filmVelocity, vBody, pickup: A * (vt - vBody) * HLS };
+  // unit-cell identity: the body length that goes with the frequency actually used (equal to the correlation when the frequency is derived from it)
+  const lengthUnit = (beta * vt) / freq;
+  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, slugFraction: beta, freq, period: 1 / freq, length, lengthFromFreq: lengthUnit, lengthMax: lengthUnit * Math.exp(3.09 * 0.5 - 0.125), unitLength: lengthUnit / beta, lengthCorrelation: length,
+    volume: lengthUnit * A * HLS, filmThickness: levelOfHoldup(HLF) * D, filmVelocity, vBody, pickup: A * (vt - vBody) * HLS };
 }
 
 /**
@@ -568,19 +588,19 @@ export function slugTracking(f, o = {}) {
   const at = (a, s) => { const u = clamp(s / ds, 0, n - 1 - 1e-9), i = Math.floor(u); return a[i] + (a[i + 1] - a[i]) * (u - i); };
   const empty = { n: 0, arrivals: [], meanLength: 0, stdLength: 0, p50: 0, p90: 0, p99: 0, maxLength: 0, lognormal: null, length1000: 0, freqArrival: 0, period: null, merges: 0, dissipated: 0, generated: 0, surge: 0, surgeSingle: 0, hist: { centers: [], counts: [] }, from: Ltot, tSim: 0 };
   // a site cannot launch slugs closer than two body lengths apart (above that the flow is a continuous liquid column with bubbles)
-  let sites = (o.sites || []).filter((q) => q.freq > 0 && q.length > 0 && q.s < Ltot).map((q) => ({ ...q, freq: Math.min(q.freq, at(f.vt, q.s) / (2 * q.length)) })).sort((a, b) => a.s - b.s);
+  let sites = (o.sites || []).filter((q) => q.freq > 0 && q.length > 0 && q.s < Ltot).map((q) => ({ ...q, freq: Math.min(q.freq * (o.initMult || 1), at(f.vt, q.s) / (2 * q.length)) })).sort((a, b) => a.s - b.s);
   if (!sites.length || nSlugs < 1) return empty;
   // keep the number of slugs in the line affordable: track the downstream window that holds about 220 slug units
   const unit0 = at(f.vt, sites[0].s) / sites[0].freq, from = Math.max(sites[0].s, Ltot - 220 * unit0);
   if (from > sites[0].s) { const keep = sites.filter((q) => q.s > from); sites = [{ ...sites[0], s: from }, ...keep]; }
-  const relax = o.relax || 300 * D, minL = 2 * D, lnL = (m) => R.lognormal(Math.log(Math.max(m, minL)) - 0.5 * sigmaL * sigmaL, sigmaL), lnT = (fq) => R.lognormal(Math.log(1 / fq) - 0.5 * sigmaT * sigmaT, sigmaT);
+  const relax = (o.relax || 300 * D) * (o.relaxMult || 1), wkM = o.wakeMult ?? 1, minL = 2 * D, lnL = (m) => R.lognormal(Math.log(Math.max(m, minL)) - 0.5 * sigmaL * sigmaL, sigmaL), lnT = (fq) => R.lognormal(Math.log(1 / fq) - 0.5 * sigmaT * sigmaT, sigmaT);
   const slugs = []; // ordered from the outlet (index 0) to the inlet
   if (prefill) { let x = Ltot - R.uniform(0, 1) * unit0; while (x > sites[0].s + unit0) { const sp = at(f.vt, x) * lnT(sites[0].freq), L = Math.min(lnL(sites[0].length), 0.9 * sp); slugs.push({ xt: x - L, L, rec: null }); x -= sp; } }
   sites.forEach((q) => { q.next = lnT(q.freq) * R.uniform(0, 1); });
   const fMax = Math.max(...sites.map((q) => q.freq)), tMax = (prefill ? 0 : (Ltot - from) / Math.max(at(f.vt, from), 0.1)) + (2.5 * nSlugs) / sites[0].freq;
   const lCap = 12 * Math.max(...sites.map((q) => q.length)); // liquid available to one slug
   let steps = 0, dt = clamp(Math.min(0.2 / fMax, (0.5 * sites[0].length) / Math.max(at(f.vt, Ltot), 0.1)), 0.05, 30), t = 0, ops = 0, merges = 0, dissipated = 0, generated = slugs.length;
-  const arrivals = [], wake = (L, th) => (Math.abs(th) > 0.8 ? 1 + 8 * Math.exp((-1.06 * L) / D) : 1 + 0.56 * Math.exp((-0.46 * L) / D)); // Moissis–Griffith (steep) / Cook–Behnia (near horizontal)
+  const arrivals = [], wake = (L, th) => (wkM > 0 ? 1 + wkM * (Math.abs(th) > 0.8 ? 8 * Math.exp((-1.06 * L) / (D * wkM)) : 0.56 * Math.exp((-0.46 * L) / (D * wkM))) : 1); // the multiplier scales the strength and the length of the wake // Moissis–Griffith (steep) / Cook–Behnia (near horizontal)
   while (arrivals.length < nSlugs && t < tMax && ops < maxOps && steps++ < 60000) {
     t += dt;
     for (const q of sites) if (t >= q.next) { // initiation
@@ -798,6 +818,8 @@ export function makeTransient(o) {
     const pr = fm.at(o.init.P[i], o.init.T[i]), H = clamp(o.init.holdup[i], 0, 1), rs = rsOf(pr);
     P[i] = o.init.P[i] * 1e5; T[i] = o.init.T[i]; md[i] = (H * pr.rhoL) / (1 + rs); Gc[i] = (1 - H) * pr.rhoG + rs * md[i];
   }
+  // side inflows (branches joining the line): [{ s (m), mdotOf(t) (kg/s of the same stream), T (°C) }] → one source per cell
+  const srcs = (o.sources || []).map((q) => ({ ...q, w: 0 })), srcAt = new Array(N).fill(null); for (const q of srcs) { let c = 0; while (c < N - 1 && grid.s[c + 1] < q.s) c++; srcAt[c] = q; }
   let last0 = { qL: 0, qG: 0, mOut: 0 };
   { const W = (o.mdot0 ?? mdotOf(0)) / A; for (let f = 0; f <= N; f++) { const i = Math.min(f, N - 1), pr = fm.at(P[i] / 1e5, T[i]), xg = xgOf(pr); jf[f] = W * (xg / pr.rhoG + (1 - xg) / pr.rhoL); vgF[f] = vlF[f] = jf[f]; if (f === N) last0 = { qL: (W * (1 - xg) * A) / pr.rhoL, qG: (W * xg * A) / pr.rhoG, mOut: W * A }; } }
   const total = () => { let m = 0, e = 0; for (let i = 0; i < N; i++) { m += (Gc[i] + md[i]) * grid.ds[i] * A; e += (cG * Gc[i] + cD * md[i] + wallC) * T[i] * grid.ds[i] * A; } return { m, e }; };
@@ -848,7 +870,7 @@ export function makeTransient(o) {
     for (let i = 0; i < N; i++) { // pressure (volume-conservation) equation
       const r = dt / grid.ds[i], cm = gG[i] * AGf[i] + gD[i] * ADf[i], cp = gG[i] * AGf[i + 1] + gD[i] * ADf[i + 1];
       sub[i] = i > 0 ? r * cm * bco[i] : 0; sup[i] = i < N - 1 ? r * cp * bco[i + 1] : 0; dia[i] = kap[i] - r * (cp * bco[i + 1] + (i > 0 ? cm * bco[i] : 0));
-      rhs[i] = kap[i] * P[i] - clamp(Vv[i], -0.1, 0.1) + r * (gG[i] * (BGf[i + 1] - BGf[i]) + gD[i] * (BDf[i + 1] - BDf[i])) + r * (cp * jst[i + 1] - (i > 0 ? cm * jst[i] : 0)) - (i === N - 1 ? r * cp * bco[N] * pOut : 0);
+      rhs[i] = kap[i] * P[i] - clamp(Vv[i], -0.1, 0.1) - (srcAt[i] ? r * (srcAt[i].mdotOf(t + dt) / A) * (gG[i] * xgMax + gD[i] * (1 - xgMax)) : 0) + r * (gG[i] * (BGf[i + 1] - BGf[i]) + gD[i] * (BDf[i + 1] - BDf[i])) + r * (cp * jst[i + 1] - (i > 0 ? cm * jst[i] : 0)) - (i === N - 1 ? r * cp * bco[N] * pOut : 0);
     }
     const Pn = tridiag(sub, dia, sup, rhs);
     for (let i = 0; i < N; i++) Pn[i] = Number.isFinite(Pn[i]) ? clamp(Pn[i], 5e4, pCap) : P[i];
@@ -868,10 +890,12 @@ export function makeTransient(o) {
       if (sg < 1 || slq < 1) { const dis = FG[f] - Fgas[f]; Fgas[f] *= sg; Fliq[f] *= slq; FD[f] *= slq; FG[f] = Fgas[f] + dis * slq; }
     }
     FG[0] = W * xgMax; FD[0] = W * (1 - xgMax); vgF[0] = vlF[0] = jf[0] = W * (xgMax / rhoG[0] + (1 - xgMax) / rhoL[0]);
+    for (const q of srcs) { q.w = q.mdotOf(t + dt) / A; }
     for (let f = 0; f <= N; f++) { const fe = cG * FG[f] + cD * FD[f]; FE[f] = fe * (f === 0 ? tIn : fe >= 0 || f === N ? T[f - 1] : T[f]); }
     for (let i = 0; i < N; i++) {
-      const r = dt / grid.ds[i], E = (cG * Gc[i] + cD * md[i] + wallC) * T[i] - r * (FE[i + 1] - FE[i]), hl = (4 * (o.U ? o.U[i] : 0)) / D, ta = o.tAmb ? o.tAmb[i] : 4;
-      Gc[i] = Math.max(Gc[i] - r * (FG[i + 1] - FG[i]), 0); md[i] = Math.max(md[i] - r * (FD[i + 1] - FD[i]), 0);
+      const r = dt / grid.ds[i], sq = srcAt[i], sw = sq ? sq.w : 0, E = (cG * Gc[i] + cD * md[i] + wallC) * T[i] - r * (FE[i + 1] - FE[i]) + r * sw * (cG * xgMax + cD * (1 - xgMax)) * (sq ? sq.T : 0), hl = (4 * (o.U ? o.U[i] : 0)) / D, ta = o.tAmb ? o.tAmb[i] : 4;
+      Gc[i] = Math.max(Gc[i] - r * (FG[i + 1] - FG[i]) + r * sw * xgMax, 0); md[i] = Math.max(md[i] - r * (FD[i + 1] - FD[i]) + r * sw * (1 - xgMax), 0);
+      if (sw) { bal.mIn += sw * A * dt; bal.eIn += sw * (cG * xgMax + cD * (1 - xgMax)) * sq.T * A * dt; }
       const C = cG * Gc[i] + cD * md[i] + wallC, Tn = (E + dt * hl * ta) / (C + dt * hl);
       bal.eLoss += hl * (Tn - ta) * dt * grid.ds[i] * A; T[i] = Tn; P[i] = Pn[i];
     }
@@ -931,6 +955,7 @@ export function transientDriftFlux(o) { const sim = makeTransient(o); while (!si
  * o: { reTau (R u_τ / ν), model, n, maxIter, tol }. Returns { Re, f (Darcy), reTau, y[] (y⁺), u[] (u⁺), r[] (r/R), uRel[] (u / U_bulk), nut[], k[], iterations, residual, converged }.
  */
 export function ransPipe(o = {}) {
+  if (['sst', 'sa', 'kestd', 'rng', 'realizable', 'rsm'].includes(o.model)) return ransPipeExtra(o);
   const Rp = Math.max(o.reTau || 1000, 5), model = o.model || 'komega', n = o.n || 120, maxIter = o.maxIter || 6000, tol = o.tol || 1e-9;
   // geometric grid from the wall, first node at y⁺ ≈ 0.1
   const y1 = Math.min(0.1, Rp / (4 * n)), g = (q) => (y1 * (q ** n - 1)) / (q - 1) - Rp, q = g(1 + 1e-9) >= 0 ? 1 + 1e-9 : brent(g, 1 + 1e-9, 3, 1e-13), y = [0];
@@ -1046,11 +1071,1292 @@ export function damBreak(o = {}) {
   return { x, h, u: h.map((v, i) => (v > dry ? q[i] / v : 0)), exact, l1: mean(h.map((v, i) => Math.abs(v - exact[i]))) / hL, massError: Math.abs(mass - m0) / m0, tEnd };
 }
 
+/*NEW-SECTIONS-BEGIN*/
+// =====================================================================================================
+// 7a. More steady closures: Duns & Ros, Ansari mechanistic model, annular flow with entrainment and deposition,
+//     homogeneous-relaxation flashing, Baker map
+// =====================================================================================================
+const tabLog = (xs, ys, x) => interp1(xs.map(log10), ys, log10(clamp(x, xs[0], xs[xs.length - 1])));
+// Duns & Ros (1963) chart functions, read from open digitisations of the published charts (see PROVENANCE): slip factors F1–F7 against the
+// liquid-viscosity number N_L, regime-boundary factors L1, L2 against the diameter number N_D and the friction correction f2.
+const DR = { NL: [0.002, 0.004, 0.006, 0.01, 0.02, 0.04, 0.05, 0.07, 0.1, 0.2, 0.4, 1, 2],
+  F1: [1.25, 1.25, 1.254, 1.26, 1.29, 1.523, 1.675, 1.915, 2.096, 2.151, 1.872, 1.178, 0.9], F2: [0.24, 0.24, 0.24, 0.24, 0.27, 0.499, 0.594, 0.751, 0.916, 1.02, 0.969, 0.812, 0.7],
+  F3: [0.83, 0.84, 0.926, 1.296, 1.987, 2.654, 2.824, 3.122, 3.339, 3.698, 3.943, 4.121, 4.15], F4: [-19.76, -0.41, 9.97, 21.62, 35.6, 47.6, 50.6, 53.6, 55.1, 56.2, 55.95, 55.8, 55.62],
+  F5: [0.22, 0.21, 0.207, 0.19, 0.17, 0.14, 0.13, 0.1, 0.06, 0.05, 0.06, 0.09, 0.111], F6: [0.852, 0.301, 0.093, -0.092, -0.059, 0.779, 1.047, 1.536, 2.076, 1.971, 1.78, 1.728, 1.75],
+  F7: [0.13, 0.119, 0.1, 0.09, 0.07, 0.06, 0.05, 0.049, 0.04, 0.03, 0.03, 0.0235, 0.02],
+  ND: [10, 16, 20, 30, 40, 50, 60, 70, 100, 275], L1: [2.066, 2.058, 2.056, 2.005, 1.635, 1.3, 1.097, 1.043, 1.032, 1.02], L2: [0.476, 0.499, 0.584, 0.771, 0.922, 1.042, 1.108, 1.129, 1.138, 1.128],
+  fx: [0.001, 0.4, 0.7, 1, 2, 3, 6, 10, 20, 40, 100], f2: [1.002, 0.939, 0.76, 0.649, 0.504, 0.431, 0.342, 0.289, 0.24, 0.215, 0.201] };
+// Mist-flow wall friction of Duns & Ros (also used by Orkiszewski): the liquid film acts as a roughness that depends on the gas Weber number.
+function mistFriction(p) {
+  const { vsg, rhoL, rhoG, muL, muG, D, rough, fModel } = p, s = Math.max(p.sigma, 1e-4), N = (rhoG * vsg * vsg * muL * muL) / (rhoL * s * s), e0 = s / (rhoG * vsg * vsg * D), ed = clamp(N <= 0.005 ? 0.0749 * e0 : 0.3713 * e0 * N ** 0.302, rough / D, 0.5);
+  return ed > 0.05 ? 4 * (1 / (4 * log10(0.27 * ed)) ** 2 + 0.067 * ed ** 1.73) : frictionFactor((rhoG * vsg * D) / muG, ed, fModel);
+}
+/** Duns & Ros (1963) for upward flow: bubble (I), slug (II), transition and mist (III) regions with the slip-velocity charts. */
+function dunsRos(p) {
+  const { vsl, vsg, rhoL, rhoG, muL, D, theta, rough, P, fModel } = p, vm = vsl + vsg, lam = vsl / vm, { NLv, NGv, ND, NL } = velocityNumbers(p), sinT = Math.sin(theta), F = (k) => tabLog(DR.NL, DR[k], NL);
+  const L1 = tabLog(DR.ND, DR.L1, ND), L2 = tabLog(DR.ND, DR.L2, ND), bubSlug = L1 + L2 * NLv, Ls = 50 + 36 * NLv, Lm = 75 + 84 * NLv ** 0.75, k4 = (rhoL / (G * Math.max(p.sigma, 1e-4))) ** 0.25;
+  const slip = () => {
+    const S = NGv <= bubSlug ? F('F1') + F('F2') * NLv + (F('F3') - F('F4') / ND) * (NGv / (1 + NLv)) ** 2 : ((1 + F('F5')) * (NGv ** 0.982 + 0.029 * ND + F('F6'))) / (1 + F('F7') * NLv) ** 2, vs = Math.max(S, 1e-6) / k4;
+    const H = clamp((vs - vm + Math.sqrt((vm - vs) ** 2 + 4 * vs * vsl)) / (2 * vs), lam, 1), f1 = frictionFactor((rhoL * vsl * D) / muL, rough / D, fModel), f2 = tabLog(DR.fx, DR.f2, Math.max(((f1 / 4) * (vsg / vsl)) * ND ** (2 / 3), 0.001)), f3 = 1 + (f1 / 4) * Math.sqrt(vsg / (50 * vsl));
+    return { holdup: H, fric: (((f1 * f2) / f3) * rhoL * vsl * vm) / (2 * D), rho: rhoL * H + rhoG * (1 - H), regime: NGv <= bubSlug ? 'bubble' : 'slug' };
+  };
+  const mist = (rg) => ({ holdup: lam, fric: (mistFriction(p) * rg * vsg * vsg) / (2 * D), rho: rhoL * lam + rg * (1 - lam), regime: 'annular' });
+  let r;
+  if (NGv <= Ls) r = slip();
+  else if (NGv >= Lm) r = mist(rhoG);
+  else { const a = slip(), b = mist((rhoG * NGv) / Lm), w = (Lm - NGv) / (Lm - Ls); r = { holdup: w * a.holdup + (1 - w) * b.holdup, fric: w * a.fric + (1 - w) * b.fric, rho: w * a.rho + (1 - w) * b.rho, regime: 'churn' }; }
+  const rho = r.rho; delete r.rho; r.grav = rho * G * sinT;
+  return NGv > Ls ? withAcc(r, rho, vm, vsg, P) : Object.assign(r, { acc: 0 });
+}
+
+/** Flow pattern of the Ansari et al. (1994) model for upward flow: 'bubble' | 'dispersed bubble' | 'slug' | 'annular' (before the film checks). */
+export function ansariPattern(p) {
+  const { vsl, vsg, rhoL, rhoG, muL, muG, D, theta, rough, fModel } = p, s = Math.max(p.sigma, 1e-4), dRho = Math.max(rhoL - rhoG, 1), vm = vsl + vsg, sinT = Math.max(Math.sin(theta), 0.05), v0 = (G * dRho * s / (rhoL * rhoL)) ** 0.25;
+  if (vsg >= (3.1 * (s * G * sinT * dRho) ** 0.25) / Math.sqrt(rhoG)) return 'annular';
+  const Hg = vsg / vm, rhoM = rhoL * (1 - Hg) + rhoG * Hg, muM = muL * (1 - Hg) + muG * Hg, f = frictionFactor((D * rhoM * vm) / muM, rough / D, fModel), c = 2 * Math.sqrt((0.4 * s) / (dRho * G)) * (rhoL / s) ** 0.6 * (2 / D) ** 0.4;
+  if (Hg <= 0.76 && vm >= ((0.725 + 4.15 * Math.sqrt(Hg)) / c / (f / 4) ** 0.4) ** (1 / 1.2)) return 'dispersed bubble';
+  const bubbly = theta > 70 * DEG && D > 0.95 * 19 * Math.sqrt((dRho * s) / (rhoL * rhoL * G));
+  return bubbly && vsg <= (vsl + 1.15 * v0 * Math.sin(theta)) / 3 ? 'bubble' : 'slug';
+}
+/**
+ * Ansari, Sylvester, Sarica, Shoham & Brill (1994) mechanistic model for upward two-phase flow: bubble / dispersed-bubble flow with
+ * the Harmathy slip, slug flow with the Taylor-bubble film (developed or developing), annular flow with the Wallis entrainment and the
+ * film–core momentum balance; annular flow that fails the film-stability or blockage checks is treated as slug flow.
+ */
+function ansari(p) {
+  const { vsl, vsg, rhoL, rhoG, muL, muG, D, theta, rough, P, fModel } = p, s = Math.max(p.sigma, 1e-4), dRho = Math.max(rhoL - rhoG, 1), vm = vsl + vsg, lam = vsl / vm, sinT = Math.sin(theta), v0 = 1.53 * (G * s * dRho / (rhoL * rhoL)) ** 0.25, ed = rough / D;
+  let pat = ansariPattern(p);
+  if (pat === 'annular') {
+    const x = Math.sqrt(rhoG / rhoL) * 1e4 * vsg * muG / s, fe = clamp(1 - Math.exp(-0.125 * (x - 1.5)), 0, 1), c = fe > 0.9 ? 300 : 24 * (rhoL / rhoG) ** (1 / 3), alfc = 1 / (1 + (fe * vsl) / vsg), vsc = vsg + fe * vsl, rhoC = rhoG * alfc + rhoL * (1 - alfc), muC = muG * alfc + muL * (1 - alfc);
+    const fcs = frictionFactor((rhoC * vsc * D) / muC, ed, fModel), fls = frictionFactor((rhoL * vsl * D) / muL, ed, fModel), a = fe < 0.9999 ? ((1 - fe) ** 2 * frictionFactor((rhoL * vsl * (1 - fe) * D) / muL, ed, fModel)) / fls : 1;
+    const gcs = (fcs * rhoC * vsc * vsc) / (2 * D), gls = (fls * rhoL * vsl * vsl) / (2 * D), xmo2 = (gls / gcs) * a, ym = (G * sinT * (rhoL - rhoC)) / gcs;
+    let deld = 0, H = 1 - alfc, ok = true;
+    if (fe < 0.9999) {
+      const fn = (d) => { const t = 4 * d * (1 - d); return ym - (1 + c * d) / t / (1 - t) ** 2.5 + xmo2 / t ** 3; }, lo = 1e-6, hi = 0.499;
+      if (fn(lo) * fn(hi) < 0) deld = brent(fn, lo, hi, 1e-10); else ok = false;
+      H = 4 * deld * (1 - deld) + (1 - alfc) * (1 - 2 * deld) ** 2;
+      if (ok && H > 0.12) ok = false; // the film and the entrained liquid bridge the core
+      if (ok) { const st = (d) => { const t = 1 - (1 - 2 * d) ** 2; return ym - ((2 - 1.5 * t) * xmo2) / t ** 3 / (1 - 1.5 * t); }; let ds = 0.499, fa = st(1e-5); for (let i = 1; i <= 60; i++) { const b = 1e-5 + (0.3 * i) / 60, fb = st(b); if (Number.isFinite(fb) && fa * fb < 0) { ds = brent(st, b - 0.005, b, 1e-9); break; } fa = fb; } if (ds < deld) ok = false; } // film thicker than the stable (minimum-shear) film
+    } else if (H > 0.12) ok = false;
+    if (ok) { const phi = fe < 0.9999 ? (1 + c * deld) / (1 - 2 * deld) ** 5 : 1; return withAcc({ holdup: clamp(H, lam * 0.2, 1), fric: gcs * phi + (rhoC - (rhoL * H + rhoG * (1 - H))) * G * sinT, grav: (rhoL * H + rhoG * (1 - H)) * G * sinT, regime: 'annular', entrainment: fe, filmThickness: deld * D }, rhoC, vm, vsg, P); }
+    pat = 'slug';
+  }
+  if (pat === 'bubble' || pat === 'dispersed bubble') {
+    const H = pat === 'dispersed bubble' ? lam : clamp(brent((e) => v0 * Math.sqrt(e) + 1.2 * vm - vsg / (1 - e), lam, 0.9999, 1e-10), lam, 1), rho = rhoL * H + rhoG * (1 - H), f = frictionFactor((rho * vm * D) / (muL * lam + muG * (1 - lam)), ed, fModel);
+    return withAcc({ holdup: H, fric: (f * rho * vm * vm) / (2 * D), grav: rho * G * sinT, regime: pat }, rho, vm, vsg, P);
+  }
+  // slug flow
+  const lls = 30 * D, vtb = 1.2 * vm + 0.35 * Math.sqrt((G * D * dRho) / rhoL), als = Math.min(vsg / (0.425 + 2.65 * vm), 0.6), vgls = (a) => 1.2 * vm + v0 * Math.sqrt(1 - als);
+  const bal = (atb) => { const vltb = 9.916 * Math.sqrt(G * D * (1 - Math.sqrt(atb))), vlls = vtb - ((vtb + vltb) * (1 - atb)) / (1 - als), vg = als > 0.25 ? vlls : vgls(), vgtb = vtb * (1 - als / atb) + (vg * als) / atb, b1 = (vlls * (1 - als) - vsl) / (vltb * (1 - atb) + vlls * (1 - als)), b2 = (vsg - als * vg) / (atb * vgtb - als * vg); return { d: b1 - b2, b1, b2, vltb, vlls, vg, vgtb }; };
+  let atb = null; { let a0 = Math.max(als + 0.01, 0.3), f0 = bal(a0).d; for (let i = 1; i <= 80 && atb === null; i++) { const a1 = a0 + ((0.9999 - Math.max(als + 0.01, 0.3)) * 1) / 80, f1 = bal(a1).d; if (Number.isFinite(f0) && Number.isFinite(f1) && f0 * f1 <= 0) atb = brent((v) => bal(v).d, a0, a1, 1e-10); a0 = a1; f0 = f1; } }
+  if (atb === null) { const r = gradient(p, 'driftFlux'); r.regime = 'slug'; return r; } // no Taylor-bubble solution (very low rates): Bendiksen drift flux
+  const q = bal(atb), beta = clamp(0.5 * (q.b1 + q.b2), 0.01, 0.99), ltb = (lls * beta) / (1 - beta);
+  let atbE = atb; { const lc = (q.vltb + vtb) ** 2 / (2 * G); if (lc > 0.75 * ltb) { const c = (vsg - q.vg * als) / vtb, d = 1 - vsg / vtb, e = vtb - q.vlls, ff = (-2 * d * c * lls - (2 * (e * (1 - als)) ** 2) / G) / (d * d), gg = ((c * lls) / d) ** 2, h = ff * ff - 4 * gg; if (h > 0) { const l2 = Math.max((-ff + Math.sqrt(h)) / 2, (-ff - Math.sqrt(h)) / 2); if (l2 > 0) atbE = clamp(1 - (2 * (vtb - q.vlls) * (1 - als)) / Math.sqrt(2 * G * l2), als, 0.9999); } } } // developing Taylor bubble: mean void of the falling film region
+  const asu = atbE * beta + als * (1 - beta), H = clamp(1 - asu, lam, 1), rhoS = rhoL * (1 - als) + rhoG * als, vmls = q.vlls * (1 - als) + q.vg * als, ans = (q.vg * als) / Math.max(vmls, 1e-9), f = frictionFactor((rhoS * Math.abs(vmls) * D) / (muL * (1 - ans) + muG * ans), ed, fModel);
+  const grav = G * sinT * (rhoS * (1 - beta) + (rhoG * atbE + rhoL * (1 - atbE)) * beta);
+  return withAcc({ holdup: H, fric: ((rhoS * vmls * vmls * f) / (2 * D)) * (1 - beta), grav, regime: 'slug', slugFraction: 1 - beta, taylorVoid: atb }, rhoL * H + rhoG * (1 - H), vm, vsg, P);
+}
+
+// ---- annular-mist flow as three fields: gas core, entrained droplets, wall film ---------------------------------------------
+const dragSphere = (Re) => (Re < 1e-9 ? 0 : Re < 1000 ? (24 / Re) * (1 + 0.15 * Re ** 0.687) : 0.44); // Schiller & Naumann
+/** Equilibrium entrained liquid fraction of annular flow (Wallis, as used by Ansari et al.): FE = 1 − exp[−0.125 (v_crit − 1.5)], v_crit = 10⁴ vsg μg / σ · (ρg/ρl)^½. */
+export const entrainmentFraction = (p) => clamp(1 - Math.exp(-0.125 * ((1e4 * p.vsg * p.muG) / Math.max(p.sigma, 1e-4) * Math.sqrt(p.rhoG / p.rhoL) - 1.5)), 0, 0.9999);
+/**
+ * Annular-mist flow with three fields (gas, droplets carried in the gas core, liquid film on the wall).
+ * Film thickness from the combined momentum balance of film and core with the Wallis interfacial friction f_i = f_c (1 + 300 δ/D) and
+ * a wall friction on the film; droplets slip behind the gas by their terminal velocity (Schiller–Naumann drag, size from a critical
+ * Weber number); the entrained flow follows  dW_E/dz = π D (R_E − R_D),  R_D = k_D C  (deposition, C = droplet concentration in the core),
+ * R_E = k_E k_D C_eq  (entrainment written so that the developed state is the Wallis equilibrium fraction when k_E = 1).
+ * p: closure point { vsl, vsg, rhoL, rhoG, muL, muG, sigma, D, theta, rough, P, fModel }; mp: { entFrac (entrained fraction to use; default equilibrium),
+ * kDep (deposition velocity m/s), entMult (k_E), weCrit (droplet critical Weber number), dropMult, fiMult }.
+ * Returns { holdup, holdupFilm, holdupDrops, fric, grav, acc, regime, filmThickness, filmVelocity, coreVelocity, tauI, tauW, entrainment, entEq, dropSize, dropSlip, rateDep, rateEnt (kg/m²/s), relaxLength (m) }.
+ */
+export function annularMist(p, mp = {}) {
+  const { vsl, vsg, rhoL, rhoG, muL, muG, D, theta, rough, P, fModel } = p, s = Math.max(p.sigma, 1e-4), A = (PI * D * D) / 4, sinT = Math.sin(theta), kD = mp.kDep ?? 0.15, kE = mp.entMult ?? 1, WeC = mp.weCrit ?? 12, vm = vsl + vsg;
+  const Eeq = clamp(entrainmentFraction(p) * kE, 0, 0.9999), E = clamp(mp.entFrac ?? Eeq, 0, 0.9999), dMax = ((WeC * s) / (rhoG * Math.max(vsg, 0.1) ** 2)) * (mp.dropMult ?? 1), dDrop = clamp(dMax, 5e-6, 0.3 * D);
+  let vt = Math.sqrt((4 * G * dDrop * Math.max(rhoL - rhoG, 1)) / (3 * 0.44 * rhoG)); for (let k = 0; k < 12; k++) { const cd = Math.max(dragSphere((rhoG * vt * dDrop) / muG), 0.1); vt = Math.sqrt((4 * G * dDrop * Math.max(rhoL - rhoG, 1)) / (3 * cd * rhoG)); }
+  const state = (dl) => {
+    const core = (1 - 2 * dl) ** 2, Ac = A * core, Af = A - Ac, vf = (vsl * (1 - E) * A) / Af, vg = (vsg * A) / Ac, vd = Math.max(vg - vt * sinT, 0.2 * vg), Hd = Math.min((vsl * E * A) / (vd * Ac), 0.5), rhoC = rhoG * (1 - Hd) + rhoL * Hd, vc = (vsg + vsl * E) * A / Ac;
+    const fc = frictionFactor((rhoC * vc * D * (1 - 2 * dl)) / muG, 0, fModel) / 4, fi = fc * (1 + 300 * dl) * (mp.fiMult ?? 1), Dhf = 4 * dl * D * (1 - dl), ff = frictionFactor((rhoL * Math.abs(vf) * Dhf) / muL, rough / D, fModel) / 4;
+    const ti = (fi * rhoC * (vc - vf) * Math.abs(vc - vf)) / 2, tw = (ff * rhoL * vf * Math.abs(vf)) / 2, Si = PI * D * (1 - 2 * dl), dpC = (ti * Si) / Ac + rhoC * G * sinT, dpF = (tw * PI * D - ti * Si) / Af + rhoL * G * sinT;
+    return { dpC, dpF, vf, vc, vd, Hd, rhoC, ti, tw, core, Ac };
+  };
+  let dl; { const f = (x) => { const q = state(x); return q.dpC - q.dpF; }, lo = 1e-6, hi = 0.45; const flo = f(lo), fhi = f(hi); dl = flo * fhi < 0 ? brent(f, lo, hi, 1e-12) : Math.abs(flo) < Math.abs(fhi) ? lo : hi; }
+  const q = state(dl), Hf = 1 - q.core, Hdr = q.Hd * q.core, H = clamp(Hf + Hdr, 1e-6, 1), rho = rhoL * H + rhoG * (1 - H), grav = rho * G * sinT, C = (rhoL * vsl * E) / Math.max(vsg + vsl * E, 1e-9), Ceq = (rhoL * vsl * Eeq) / Math.max(vsg + vsl * Eeq, 1e-9);
+  const r = { holdup: H, holdupFilm: Hf, holdupDrops: Hdr, fric: q.dpC - grav, grav, regime: 'annular', filmThickness: dl * D, filmVelocity: q.vf, coreVelocity: q.vc, tauI: q.ti, tauW: q.tw, entrainment: E, entEq: Eeq, dropSize: dDrop, dropSlip: vt, rateDep: kD * C, rateEnt: kD * Ceq, relaxLength: (vsg * A) / (PI * D * kD) };
+  return withAcc(r, rho, vm, vsg, P);
+}
+/**
+ * Development of the entrained fraction along a pipe of constant conditions (three-field mass balance marched with RK4).
+ * o: { p (closure point), mp, length, n, e0 (entrained fraction at the inlet) }. Returns { z[], entrained[], film[] (kg/s), holdup[], dpdz[], filmThickness[], eq, balance: { liquidIn, liquidOut } }.
+ */
+export function annularDevelopment(o) {
+  const p = o.p, mp = o.mp || {}, n = o.n || 60, L = o.length, dz = L / n, A = (PI * p.D * p.D) / 4, WL = p.rhoL * p.vsl * A, kD = mp.kDep ?? 0.15, eq = clamp(entrainmentFraction(p) * (mp.entMult ?? 1), 0, 0.9999);
+  const conc = (E) => (p.rhoL * p.vsl * E) / Math.max(p.vsg + p.vsl * E, 1e-9), dE = (E) => (PI * p.D * kD * (conc(eq) - conc(E))) / WL, z = [0], ent = [o.e0 ?? 0], st = [annularMist(p, { ...mp, entFrac: ent[0] })];
+  for (let i = 1; i <= n; i++) { const E = ent[i - 1], k1 = dE(E), k2 = dE(E + 0.5 * dz * k1), k3 = dE(E + 0.5 * dz * k2), k4 = dE(E + dz * k3), En = clamp(E + (dz / 6) * (k1 + 2 * k2 + 2 * k3 + k4), 0, 0.9999); z.push(i * dz); ent.push(En); st.push(annularMist(p, { ...mp, entFrac: En })); }
+  return { z, entrained: ent, film: ent.map((E) => WL * (1 - E)), drops: ent.map((E) => WL * E), holdup: st.map((q) => q.holdup), dpdz: st.map((q) => q.fric + q.grav + q.acc), filmThickness: st.map((q) => q.filmThickness), eq, relaxLength: st[0].relaxLength, balance: { liquidIn: WL, liquidOut: WL * (1 - ent[n]) + WL * ent[n] } };
+}
+
+// ---- homogeneous-relaxation model of flashing flow ------------------------------------------------------------------------------
+/** Relaxation time of Downar-Zapolski et al. (1996), low-pressure form: Θ = Θ₀ α^−0.257 ψ^−2.24, Θ₀ = 6.51·10⁻⁴ s, ψ = (p_sat − p)/p_sat. */
+export const relaxationTime = (alpha, psi, theta0 = 6.51e-4) => theta0 * clamp(alpha, 1e-4, 1) ** -0.257 * clamp(psi, 1e-4, 1) ** -2.24;
+/**
+ * Steady flashing flow in a pipe with the homogeneous-relaxation model (equal velocities, the vapour mass fraction x relaxes to its
+ * equilibrium value):  G dx/dz = ρ (x_eq − x)/Θ,   dp/dz = −[f G² v/(2D) + g sinθ / v + G² dv/dz],   v = x v_g(p) + (1 − x) v_l.
+ * model 'hem' is the homogeneous-equilibrium limit x = x_eq(p). The specific volume derivative is taken along the solution (explicit in x,
+ * implicit in p through the gas compressibility), marched with a midpoint rule.
+ * o: { G (kg/m²/s), D, length, n, p0 (Pa), x0, pSat (Pa), xEq(p), vG(p), vL, f (Darcy), theta, model: 'hrm' | 'hem', theta0, tau (fixed relaxation time, s) }.
+ * Returns { z[], p[], x[], xEq[], alpha[], u[], lag (max x_eq − x), choked (bool: the march reached the sonic limit), massFluxCheck }.
+ */
+export function flashingFlow(o) {
+  const n = o.n || 200, dz = o.length / n, Gm = o.G, D = o.D, f = o.f ?? 0.02, sinT = Math.sin(o.theta || 0), hem = o.model === 'hem', vL = o.vL, vG = o.vG, xEq = o.xEq, vol = (p, x) => x * vG(p) + (1 - x) * vL;
+  const z = [0], P = [o.p0], X = [hem ? xEq(o.p0) : o.x0 ?? 0], XE = [xEq(o.p0)]; let choked = false;
+  const rhs = (p, x) => {
+    const v = vol(p, x), al = clamp((x * vG(p)) / v, 0, 1), th = o.tau ?? relaxationTime(Math.max(al, 1e-3), (o.pSat - p) / o.pSat, o.theta0), dx = hem ? 0 : (xEq(p) - x) / (th * Gm * v), dp = 1e-4 * p, dvdp = hem ? (vol(p + dp, xEq(p + dp)) - vol(p - dp, xEq(p - dp))) / (2 * dp) : (x * (vG(p + dp) - vG(p - dp))) / (2 * dp);
+    const den = 1 + Gm * Gm * dvdp, num = (f * Gm * Gm * v) / (2 * D) + (G * sinT) / v + (hem ? 0 : Gm * Gm * (vG(p) - vL) * dx);
+    return { dp: -num / den, dx, den };
+  };
+  for (let i = 1; i <= n; i++) {
+    const a = rhs(P[i - 1], X[i - 1]); if (!(a.den > 0.02)) { choked = true; break; }
+    const pm = P[i - 1] + 0.5 * dz * a.dp, xm = hem ? xEq(pm) : clamp(X[i - 1] + 0.5 * dz * a.dx, 0, 1); if (!(pm > 0)) { choked = true; break; }
+    const b = rhs(pm, xm); if (!(b.den > 0.02)) { choked = true; break; }
+    const pn = P[i - 1] + dz * b.dp; if (!(pn > 0)) { choked = true; break; }
+    z.push(i * dz); P.push(pn); X.push(hem ? xEq(pn) : clamp(X[i - 1] + dz * b.dx, 0, 1)); XE.push(xEq(pn));
+  }
+  const alpha = X.map((x, i) => (x * vG(P[i])) / vol(P[i], x)), u = X.map((x, i) => Gm * vol(P[i], x));
+  return { z, p: P, x: X, xEq: XE, alpha, u, lag: Math.max(...X.map((x, i) => XE[i] - x)), choked };
+}
+/** Mechanistic closure of the kernel with the three-field annular-mist model in annular flow (entrainment and deposition feed the pressure gradient). */
+function mechEnt(p, mp = {}) {
+  const fp = flowPattern(p);
+  if (fp.pattern === 'annular') return annularMist(p, mp.annular || {});
+  const r = gradient({ ...p, label: false }, 'mechanistic'); return r;
+}
+
+// =====================================================================================================
+// 7b. Transient two-fluid model (separate mass, momentum and energy equations of gas and liquid)
+// =====================================================================================================
+// Cross-section relations of a partly filled circular pipe tabulated against the liquid holdup (all lengths per diameter).
+const SECT = (() => { const M = 600, hD = new Float64Array(M + 1), SL = new Float64Array(M + 1), Si = new Float64Array(M + 1); for (let j = 0; j <= M; j++) { const H = j / M, x = H <= 0 ? 0 : H >= 1 ? 1 : brent((v) => holdupOfLevel(v) - H, 0, 1, 1e-12), c = clamp(2 * x - 1, -1, 1); hD[j] = x; SL[j] = PI - Math.acos(c); Si[j] = Math.sqrt(1 - c * c); } return { M, hD, SL, Si }; })();
+const sect = (tab, H) => { const u = clamp(H, 0, 1) * SECT.M, j = Math.min(Math.floor(u), SECT.M - 1); return tab[j] + (tab[j + 1] - tab[j]) * (u - j); };
+// Thomas algorithm on typed arrays (a: sub-, b: main, c: super-diagonal, d: right-hand side; the solution overwrites d); cyclic variant by Sherman–Morrison.
+function thomas(a, b, c, d, n, w) { w[0] = c[0] / b[0]; d[0] /= b[0]; for (let i = 1; i < n; i++) { const m = b[i] - a[i] * w[i - 1]; w[i] = c[i] / m; d[i] = (d[i] - a[i] * d[i - 1]) / m; } for (let i = n - 2; i >= 0; i--) d[i] -= w[i] * d[i + 1]; }
+function thomasCyclic(a, b, c, d, n, w, u, bb) { const gam = -b[0], a0 = a[0], cn = c[n - 1]; for (let i = 0; i < n; i++) { bb[i] = b[i]; u[i] = 0; } bb[0] = b[0] - gam; bb[n - 1] = b[n - 1] - (a0 * cn) / gam; u[0] = gam; u[n - 1] = cn; thomas(a, bb, c, d, n, w); thomas(a, bb, c, u, n, w); const f = (d[0] + (a0 * d[n - 1]) / gam) / (1 + u[0] + (a0 * u[n - 1]) / gam); for (let i = 0; i < n; i++) d[i] -= f * u[i]; }
+
+/**
+ * Transient one-dimensional two-fluid model of stratified / slug flow in a pipe or a plane channel.
+ * Per phase k (liquid l: incompressible, gas g: ideal gas ρg = p / (Rs Tg)):
+ *   ∂(αk ρk)/∂t + ∂(αk ρk uk)/∂x = 0
+ *   ρk (∂uk/∂t + uk ∂uk/∂x) = −∂p/∂x − ρk g cosθ ∂h/∂x − ρk g sinθ − τwk Sk / (αk A) ± τi Si / (αk A) − B
+ *   ∂(αk ρk ek)/∂t + ∂(αk ρk ek uk)/∂x = −p [∂αk/∂t + ∂(αk uk)/∂x] + hi ai (Tj − Tk) + qwk        (ek = cvk Tk; six-equation form, o.energy)
+ * with αl + αg = 1, one pressure p (at the interface), the liquid level h(αl) from the pipe geometry (the level-gradient term makes the
+ * model hyperbolic below the inviscid Kelvin–Helmholtz limit) and B a uniform background pressure gradient (periodic domains).
+ * Discretisation: staggered finite volumes, first-order upwind, wall and interfacial friction and the pressure gradient implicit
+ * (the two phase momentum equations are solved together on every face and substituted in the volume-conservation equation, which gives
+ * one tridiagonal pressure equation per step), so the step is limited by the material and gravity-wave CFL number. Liquid bridging
+ * (αl → 1) is not treated specially: the pressure equation becomes the incompressible one there, which is what captures slugs.
+ * o: { n, length, D (pipe) | channelH (plane channel of that height, unit width), theta (rad, + up) | thetaOf(x), rhoL, muL, muG, Rs (J/kg/K of the gas, Z R / M),
+ *      T (K, isothermal value), pOut (Pa), periodic, closed, bodyForce (Pa/m), friction (false = inviscid), fiMult, fwlMult, fwgMult, fiMin (0.0142),
+ *      interfacialPressure (δ of the Bestion interfacial-pressure term, 0 = off),
+ *      virtualMass (coefficient C_vm of the added-mass force on the relative acceleration, bubbly limit), init(x) → { al, ul, ug, p, Tl, Tg },
+ *      inlet(t) → { al, ul, ug, Tl, Tg }, tEnd, cfl, dtMax, gasMin (gas fraction below which a face is a liquid bridge and the gas moves with the liquid, 0.05), residualGas (gas fraction that sets the compliance of liquid-full cells, 0.01) | liquidSound (m/s, sound speed of the liquid used instead), probes: [x], bridge (holdup counted as a slug, 1 − gasMin), nField, nSeries,
+ *      energy: { cvL, cvG, hi (W/m²K between the phases), UwL, UwG (W/m²K to the wall on the wetted perimeters), Tw } }
+ * Returns { x[], al[], ul[], ug[], p[], Tl[], Tg[] (final, cell centres), t, steps, dtMean, mass: { liquid0, liquid, liquidIn, liquidOut, gas0, gas, gasIn, gasOut, errorL, errorG },
+ *           energy: { e0, e, in, out, wall, work, error }, volErrMax, series: { t, probes: [[αl]], pIn, inv }, field: { t, x, al: [[..]] }, slugs: [{ probe, t, duration }], momentum: { residual } }.
+ */
+export function twoFluid(o) {
+  const N = o.n || 200, L = o.length || 10, dx = L / N, per = !!o.periodic, closed = !!o.closed, chan = o.channelH > 0, D = chan ? o.channelH : o.D || 0.1, A = chan ? D : (PI * D * D) / 4;
+  const rhoL = o.rhoL ?? 1000, muL = o.muL ?? 1e-3, muG = o.muG ?? 1.8e-5, Rs = o.Rs ?? 287, T0 = o.T ?? 293.15, pOut = o.pOut ?? 1e5, B = o.bodyForce || 0, fric = o.friction !== false, fiM = o.fiMult ?? 1, fwlM = o.fwlMult ?? 1, fwgM = o.fwgMult ?? 1, fiMin = o.fiMin ?? 0.0142, cvm = o.virtualMass || 0, piC = o.interfacialPressure || 0;
+  const tEnd = o.tEnd ?? 1, cfl = o.cfl ?? 0.5, dtMax = o.dtMax ?? tEnd / 20, en = o.energy || null, cvL = en?.cvL ?? 4180, cvG = en?.cvG ?? 718, eps = 1e-7, agMin = o.gasMin ?? 0.05, bridge = o.bridge ?? 1 - agMin, kapL = o.liquidSound ? 1 / (rhoL * o.liquidSound ** 2) : (o.residualGas ?? 0.01) / pOut, cG = Math.sqrt(1.4 * Rs * T0); // compliance of a liquid-full cell: as if it kept 1 % of gas at the outlet pressure (regularises the closing of a liquid bridge)
+  const F = (n) => new Float64Array(n), NF = per ? N : N + 1, al = F(N), mg = F(N), p = F(N), Tl = F(N), Tg = F(N), ul = F(NF + 1), ug = F(NF + 1), hh = F(N), sinT = F(NF + 1), cosT = F(NF + 1), xc = F(N);
+  for (let f = 0; f <= NF; f++) { const th = typeof o.thetaOf === 'function' ? o.thetaOf(Math.min(f * dx, L)) : o.theta || 0; sinT[f] = Math.sin(th); cosT[f] = Math.cos(th); }
+  const init = o.init || (() => ({ al: 0.5, ul: 0, ug: 0 }));
+  for (let i = 0; i < N; i++) { xc[i] = (i + 0.5) * dx; const s = init(xc[i]); al[i] = clamp(s.al, 0, 1); p[i] = s.p ?? pOut; Tl[i] = s.Tl ?? T0; Tg[i] = s.Tg ?? T0; mg[i] = ((1 - al[i]) * p[i]) / (Rs * Tg[i]); }
+  for (let f = 0; f < (per ? N : N + 1); f++) { const s = init(Math.min(f * dx, L)); ul[f] = s.ul || 0; ug[f] = s.ug || 0; }
+  const level = (H) => (chan ? clamp(H, 0, 1) * D : sect(SECT.hD, H) * D);
+  const us = F(NF + 1), gs = F(NF + 1), dl = F(NF + 1), dg = F(NF + 1), alU = F(NF + 1), mgU = F(NF + 1), FL = F(NF + 1), FG = F(NF + 1), sa = F(N), sb = F(N), sc = F(N), sd = F(N), w1 = F(N), w2 = F(N), w3 = F(N), ulO = F(NF + 1), ugO = F(NF + 1);
+  const total = () => { let l = 0, g = 0, e = 0; for (let i = 0; i < N; i++) { l += al[i] * rhoL * dx * A; g += mg[i] * dx * A; e += (al[i] * rhoL * cvL * Tl[i] + mg[i] * cvG * Tg[i]) * dx * A; } return { l, g, e }; };
+  const start = total(), bal = { lIn: 0, lOut: 0, gIn: 0, gOut: 0, eIn: 0, eOut: 0, eWall: 0, eWork: 0, vol: 0, momRes: 0 };
+  const probes = (o.probes || []).map((x) => clamp(Math.floor(x / dx), 0, N - 1)), ser = { t: [], probes: probes.map(() => []), pIn: [], inv: [] }, fld = { t: [], al: [] }, slugs = [], inSlug = probes.map(() => -1);
+  const nField = o.nField || 0, nSeries = o.nSeries || 400; let nextF = 0, nextS = 0, t = 0, steps = 0;
+  const record = () => {
+    for (let k = 0; k < probes.length; k++) { const b = al[probes[k]] >= bridge; if (b && inSlug[k] < 0) inSlug[k] = t; else if (!b && inSlug[k] >= 0) { slugs.push({ probe: k, t: inSlug[k], duration: t - inSlug[k] }); inSlug[k] = -1; } }
+    if (t >= nextS - 1e-12) { let inv = 0; for (let i = 0; i < N; i++) inv += al[i] * dx * A; ser.t.push(t); ser.pIn.push(p[0]); ser.inv.push(inv); probes.forEach((c, k) => ser.probes[k].push(al[c])); nextS += tEnd / nSeries; }
+    if (nField && t >= nextF - 1e-12) { fld.t.push(t); fld.al.push(Array.from(al)); nextF += tEnd / (nField - 1); }
+  };
+  record();
+  const wrap = (i) => (per ? (i + N) % N : i);
+  while (t < tEnd - 1e-12 && steps < (o.maxSteps || 4e6)) {
+    // ---- time step: material and gravity-wave CFL condition
+    let vmax = 1e-6; for (let f = 0; f < NF + (per ? 0 : 0); f++) { const i = wrap(Math.min(f, N - 1)), c = Math.sqrt(G * Math.abs(cosT[f]) * D * 0.8); vmax = Math.max(vmax, Math.abs(ul[f]) + c, Math.abs(ug[f])); }
+    const dt = Math.min((cfl * dx) / vmax, dtMax, tEnd - t), rdt = 1 / dt, bc = !per && !closed && o.inlet ? o.inlet(t + dt) : null;
+    for (let i = 0; i < N; i++) hh[i] = level(al[i]);
+    ulO.set(ul); ugO.set(ug);
+    // ---- phase momentum equations on the faces, linear in the new pressure difference: u = u* − d (pR − pL)
+    const f0 = per ? 0 : 1, f1 = per ? N - 1 : N;
+    for (let f = f0; f <= f1; f++) {
+      const Lc = wrap(f - 1), out = !per && f === N, Rc = out ? Lc : wrap(f), dxf = out ? 0.5 * dx : dx;
+      if (!per && closed && f === N) { us[f] = 0; gs[f] = 0; dl[f] = 0; dg[f] = 0; continue; }
+      const a = clamp(0.5 * (al[Lc] + al[Rc]), eps, 1 - eps), ag = 1 - a, rg = Math.max((0.5 * (mg[Lc] + mg[Rc])) / ag, 0.5 * (p[Lc] + p[Rc]) / (Rs * 0.5 * (Tg[Lc] + Tg[Rc])) * 0.2, 1e-3), u1 = ulO[f], u2 = ugO[f];
+      let Fwl = 0, Fwg = 0, Fil = 0, Fig = 0;
+      if (fric) {
+        let SLp, SGp, Sip, AL, AG;
+        if (chan) { SLp = 1; SGp = 1; Sip = 1; AL = a * D; AG = ag * D; } else { SLp = sect(SECT.SL, a) * D; Sip = sect(SECT.Si, a) * D; SGp = PI * D - SLp; AL = a * A; AG = ag * A; }
+        const DL = (4 * AL) / Math.max(SLp, 1e-12), DG = (4 * AG) / Math.max(SGp + Sip, 1e-12), fL = fanning((rhoL * Math.abs(u1) * DL) / muL) * fwlM, fG = fanning((rg * Math.abs(u2) * DG) / muG), fi = Math.max(fG, fiMin) * fiM, ur = Math.abs(u2 - u1);
+        Fwl = (fL * Math.abs(u1) * SLp) / (2 * AL); Fwg = (fG * fwgM * Math.abs(u2) * SGp) / (2 * AG); Fil = (fi * rg * ur * Sip) / (2 * AL * rhoL); Fig = (fi * ur * Sip) / (2 * AG);
+      }
+      // upwind convective acceleration and explicit gravity terms
+      const fm = per ? wrap(f - 1) : f - 1, fp = per ? wrap(f + 1) : Math.min(f + 1, N), cl = u1 >= 0 ? (u1 * (u1 - ulO[fm])) / dx : (u1 * (ulO[fp] - u1)) / dx, cg = u2 >= 0 ? (u2 * (u2 - ugO[fm])) / dx : (u2 * (ugO[fp] - u2)) / dx;
+      // interfacial-pressure term Δp_i = δ αg αl ρg ρl (ug − ul)² / (αg ρl + αl ρg) (Bestion): optional regularisation that keeps the model hyperbolic beyond the inviscid Kelvin–Helmholtz limit
+      const dpi = piC > 0 ? (piC * ag * a * rg * rhoL * (u2 - u1) ** 2) / (ag * rhoL + a * rg) : 0, dal = (al[Rc] - al[Lc]) / dxf;
+      const gh = (G * cosT[f] * (hh[Rc] - hh[Lc])) / dxf, b1 = u1 * rdt - cl - G * sinT[f] - gh - B / rhoL - (dpi * dal) / (a * rhoL), b2 = u2 * rdt - cg - G * sinT[f] - gh - B / rg + (dpi * dal) / (ag * rg);
+      // added-mass coupling of the relative acceleration (C_vm ρl αg per unit volume on each phase, opposite signs)
+      const vl = cvm ? (cvm * ag) / a : 0, vg = cvm ? (cvm * rhoL) / rg : 0, vmE = cvm ? (u2 - u1) * rdt : 0;
+      const a11 = rdt + Fwl + Fil + vl * rdt, a12 = Fil + vl * rdt, a21 = Fig + vg * rdt, a22 = rdt + Fwg + Fig + vg * rdt, r1 = b1 - vl * vmE, r2 = b2 + vg * vmE, det = a11 * a22 - a12 * a21;
+      if (1 - Math.max(al[Lc], al[Rc]) < agMin) { // liquid bridge: the trapped gas moves with the liquid (single-fluid momentum of the slug body)
+        const rm = a * rhoL + ag * rg; us[f] = (u1 * rdt - cl - G * sinT[f] - B / rm) / (rdt + Fwl); gs[f] = us[f]; dl[f] = 1 / rm / (rdt + Fwl) / dxf; dg[f] = dl[f];
+      } else { us[f] = (a22 * r1 + a12 * r2) / det; gs[f] = (a11 * r2 + a21 * r1) / det; dl[f] = (a22 / rhoL + a12 / rg) / det / dxf; dg[f] = (a11 / rg + a21 / rhoL) / det / dxf; }
+      alU[f] = u1 > 0 || (u1 === 0 && us[f] >= 0) || out ? al[Lc] : al[Rc]; mgU[f] = u2 > 0 || (u2 === 0 && gs[f] >= 0) ? mg[Lc] : out ? ((1 - al[Lc]) * pOut) / (Rs * Tg[Lc]) : mg[Rc]; // donor cells from the old velocity sign, frozen over the step
+    }
+    if (!per) { // inlet face
+      if (bc) { us[0] = bc.ul; gs[0] = bc.ug; alU[0] = bc.al; mgU[0] = ((1 - bc.al) * p[0]) / (Rs * (bc.Tg ?? T0)); } else { us[0] = 0; gs[0] = 0; alU[0] = al[0]; mgU[0] = mg[0]; }
+      dl[0] = 0; dg[0] = 0;
+    }
+    // ---- pressure equation: volume conservation with the linearised face velocities
+    for (let i = 0; i < N; i++) {
+      const fa = i, fb = per ? wrap(i + 1) : i + 1, rg = Math.max(p[i] / (Rs * Tg[i]), 1e-9), r = dt / dx, kap = mg[i] / (rg * p[i]) + al[i] * kapL, vol = al[i] + mg[i] / rg - 1;
+      const cA = r * (alU[fa] * dl[fa] + (mgU[fa] * dg[fa]) / rg), cB = r * (alU[fb] * dl[fb] + (mgU[fb] * dg[fb]) / rg), last = !per && i === N - 1;
+      sa[i] = -cA; sc[i] = last ? 0 : -cB; sb[i] = kap + cA + cB;
+      sd[i] = kap * p[i] + clamp(vol, -0.05, 0.05) - r * (alU[fb] * us[fb] - alU[fa] * us[fa] + (mgU[fb] * gs[fb] - mgU[fa] * gs[fa]) / rg) + (last ? cB * pOut : 0);
+      if (!per && i === 0) sa[i] = 0;
+    }
+    if (per) thomasCyclic(sa, sb, sc, sd, N, w1, w2, w3); else thomas(sa, sb, sc, sd, N, w1);
+    // ---- new velocities and upwind fluxes
+    for (let f = per ? 0 : 0; f <= f1; f++) {
+      const Lc = wrap(f - 1), out = !per && f === N, Rc = out ? Lc : wrap(f);
+      if (!per && f === 0) { ul[0] = us[0]; ug[0] = gs[0]; FL[0] = alU[0] * us[0]; FG[0] = mgU[0] * gs[0]; continue; }
+      const dp = (out ? pOut : sd[Rc]) - sd[Lc]; ul[f] = us[f] - dl[f] * dp; ug[f] = clamp(gs[f] - dg[f] * dp, -cG, cG);
+      FL[f] = alU[f] * ul[f]; FG[f] = mgU[f] * ug[f];
+    }
+    if (per) { ul[N] = ul[0]; ug[N] = ug[0]; FL[N] = FL[0]; FG[N] = FG[0]; }
+    // positivity: a cell cannot give more than it holds
+    for (let i = 0; i < N; i++) {
+      const fa = i, fb = i + 1, oL = Math.max(FL[fb], 0) + Math.max(-FL[fa], 0), oG = Math.max(FG[fb], 0) + Math.max(-FG[fa], 0);
+      if (oL * dt > al[i] * dx && oL > 0) { const s = (al[i] * dx) / (oL * dt); if (FL[fb] > 0) FL[fb] *= s; if (FL[fa] < 0) FL[fa] *= s; if (per && i === N - 1 && FL[fb] > 0) FL[0] = FL[N]; if (per && i === 0 && FL[fa] < 0) FL[N] = FL[0]; }
+      if (oG * dt > mg[i] * dx && oG > 0) { const s = (mg[i] * dx) / (oG * dt); if (FG[fb] > 0) FG[fb] *= s; if (FG[fa] < 0) FG[fa] *= s; if (per && i === N - 1 && FG[fb] > 0) FG[0] = FG[N]; if (per && i === 0 && FG[fa] < 0) FG[N] = FG[0]; }
+    }
+    // ---- phase energies (internal energy, pressure work, interfacial and wall heat transfer), then masses
+    let mres = 0;
+    for (let i = 0; i < N; i++) {
+      const fa = i, fb = i + 1, r = dt / dx, alN = al[i] - r * (FL[fb] - FL[fa]), mgN = Math.max(mg[i] - r * (FG[fb] - FG[fa]), 0);
+      if (en) {
+        const tlA = FL[fa] >= 0 ? (i > 0 || per ? Tl[wrap(i - 1)] : bc?.Tl ?? Tl[0]) : Tl[i], tlB = FL[fb] >= 0 ? Tl[i] : Tl[per ? wrap(i + 1) : Math.min(i + 1, N - 1)], tgA = FG[fa] >= 0 ? (i > 0 || per ? Tg[wrap(i - 1)] : bc?.Tg ?? Tg[0]) : Tg[i], tgB = FG[fb] >= 0 ? Tg[i] : Tg[per ? wrap(i + 1) : Math.min(i + 1, N - 1)];
+        const pn = sd[i], agO = 1 - al[i], agN = 1 - alN, work = -pn * (agN - agO + r * ((1 - (ug[fb] >= 0 ? al[i] : al[per ? wrap(i + 1) : Math.min(i + 1, N - 1)])) * ug[fb] - (1 - (ug[fa] >= 0 ? (i > 0 || per ? al[wrap(i - 1)] : bc?.al ?? al[0]) : al[i])) * ug[fa]));
+        const Si = chan ? 1 / D : (sect(SECT.Si, al[i]) * D) / A, SLw = chan ? 1 / D : (sect(SECT.SL, al[i]) * D) / A, SGw = chan ? 1 / D : (PI * D) / A - SLw, hi = (en.hi || 0) * Si, hwl = (en.UwL || 0) * SLw, hwg = (en.UwG || 0) * SGw, Tw = en.Tw ?? T0;
+        const Cl = Math.max(alN, 1e-9) * rhoL * cvL, Cg = Math.max(mgN, 1e-12) * cvG, El = al[i] * rhoL * cvL * Tl[i] - r * rhoL * cvL * (FL[fb] * tlB - FL[fa] * tlA), Eg = mg[i] * cvG * Tg[i] - r * cvG * (FG[fb] * tgB - FG[fa] * tgA) + work;
+        // implicit 2 × 2 exchange: Cl Tl' = El + dt [hi (Tg' − Tl') + hwl (Tw − Tl')],  Cg Tg' = Eg + dt [hi (Tl' − Tg') + hwg (Tw − Tg')]
+        const m11 = Cl + dt * (hi + hwl), m22 = Cg + dt * (hi + hwg), m12 = dt * hi, dd = m11 * m22 - m12 * m12, q1 = El + dt * hwl * Tw, q2 = Eg + dt * hwg * Tw, tl = (m22 * q1 + m12 * q2) / dd, tg = (m11 * q2 + m12 * q1) / dd;
+        bal.eWall += (hwl * (tl - Tw) + hwg * (tg - Tw)) * dt * dx * A; bal.eWork += work * dx * A; Tl[i] = tl; Tg[i] = tg;
+      }
+      al[i] = alN; mg[i] = mgN; p[i] = Math.max(sd[i], 100);
+      const v = Math.abs(al[i] + (mg[i] * Rs * Tg[i]) / p[i] - 1); if (v > mres) mres = v;
+    }
+    if (!per) {
+      bal.lIn += FL[0] * rhoL * A * dt; bal.lOut += FL[N] * rhoL * A * dt; bal.gIn += FG[0] * A * dt; bal.gOut += FG[N] * A * dt;
+      if (en) { bal.eIn += (FL[0] * rhoL * cvL * (FL[0] >= 0 ? bc?.Tl ?? Tl[0] : Tl[0]) + FG[0] * cvG * (FG[0] >= 0 ? bc?.Tg ?? Tg[0] : Tg[0])) * A * dt; bal.eOut += (FL[N] * rhoL * cvL * Tl[N - 1] + FG[N] * cvG * Tg[N - 1]) * A * dt; }
+    }
+    bal.vol = Math.max(bal.vol, mres); t += dt; steps++;
+    record();
+    if (!(mres < 0.5)) break; // diverged (ill-posed regime on this grid): stop and report
+  }
+  const end = total();
+  return { x: Array.from(xc), al: Array.from(al), ul: Array.from(ul.subarray(0, N)), ug: Array.from(ug.subarray(0, N)), p: Array.from(p), Tl: Array.from(Tl), Tg: Array.from(Tg), t, steps, dtMean: steps ? t / steps : 0, completed: t >= tEnd - 1e-9,
+    mass: { liquid0: start.l, liquid: end.l, liquidIn: bal.lIn, liquidOut: bal.lOut, gas0: start.g, gas: end.g, gasIn: bal.gIn, gasOut: bal.gOut, errorL: (end.l - start.l - bal.lIn + bal.lOut) / Math.max(start.l + bal.lIn, 1e-12), errorG: (end.g - start.g - bal.gIn + bal.gOut) / Math.max(start.g + bal.gIn, 1e-12) },
+    energy: { e0: start.e, e: end.e, in: bal.eIn, out: bal.eOut, wall: bal.eWall, work: bal.eWork, error: en ? (end.e - start.e - bal.eIn + bal.eOut + bal.eWall - bal.eWork) / Math.max(Math.abs(start.e) + Math.abs(bal.eIn), 1e-12) : 0 },
+    volErrMax: bal.vol, series: ser, field: { t: fld.t, x: Array.from(xc), al: fld.al }, slugs };
+}
+
+// =====================================================================================================
+// 7d. Compressible two-phase benchmark models: exact Riemann solution, seven-equation (Baer–Nunziato) model, species transport
+// =====================================================================================================
+/**
+ * Exact solution of the Riemann problem of the Euler equations for an ideal gas (two-shock / two-rarefaction / mixed, after Toro).
+ * L, R: { rho, u, p }; returns { pStar, uStar, sample(xi) → { rho, u, p } } with xi = x / t.
+ */
+export function riemannExact(L, R, gamma = 1.4) {
+  const g = gamma, aL = Math.sqrt((g * L.p) / L.rho), aR = Math.sqrt((g * R.p) / R.rho);
+  const fK = (p, K, aK) => (p > K.p ? (p - K.p) * Math.sqrt(2 / ((g + 1) * K.rho) / (p + ((g - 1) / (g + 1)) * K.p)) : ((2 * aK) / (g - 1)) * ((p / K.p) ** ((g - 1) / (2 * g)) - 1));
+  const F = (p) => fK(p, L, aL) + fK(p, R, aR) + R.u - L.u, pStar = brent(F, 1e-12 * Math.min(L.p, R.p), 50 * Math.max(L.p, R.p) + L.rho * (L.u - R.u) ** 2 + 1, 1e-14), uStar = 0.5 * (L.u + R.u) + 0.5 * (fK(pStar, R, aR) - fK(pStar, L, aL));
+  const sample = (xi) => {
+    const left = xi <= uStar, K = left ? L : R, aK = left ? aL : aR, s = left ? 1 : -1, pr = pStar / K.p; // mirror the right side
+    if (pStar > K.p) { const sK = K.u - s * aK * Math.sqrt(((g + 1) / (2 * g)) * pr + (g - 1) / (2 * g)); if (s * (xi - sK) < 0) return { ...K }; return { rho: (K.rho * (pr + (g - 1) / (g + 1))) / (((g - 1) / (g + 1)) * pr + 1), u: uStar, p: pStar }; }
+    const head = K.u - s * aK, aS = aK * pr ** ((g - 1) / (2 * g)), tail = uStar - s * aS;
+    if (s * (xi - head) < 0) return { ...K }; if (s * (xi - tail) > 0) return { rho: K.rho * pr ** (1 / g), u: uStar, p: pStar };
+    const c = (2 / (g + 1)) * (aK + s * ((g - 1) / 2) * (K.u - xi)); return { rho: K.rho * (c / aK) ** (2 / (g - 1)), u: (2 / (g + 1)) * (s * aK + ((g - 1) / 2) * K.u + xi), p: K.p * (c / aK) ** ((2 * g) / (g - 1)) };
+  };
+  return { pStar, uStar, sample };
+}
+
+/**
+ * Seven-equation two-phase model of Baer–Nunziato type in one dimension (two velocities, two pressures, volume-fraction transport),
+ * stiffened-gas equations of state p = (γ − 1) ρ e − γ p∞, interface velocity u_I = u₂ and interface pressure p_I = p₁, without relaxation:
+ *   ∂α₁/∂t + u_I ∂α₁/∂x = 0;   ∂(αρ)_k/∂t + ∂(αρu)_k/∂x = 0;   ∂(αρu)_k/∂t + ∂(αρu² + αp)_k/∂x = p_I ∂α_k/∂x;
+ *   ∂(αρE)_k/∂t + ∂(αu(ρE + p))_k/∂x = p_I u_I ∂α_k/∂x.
+ * Rusanov fluxes with the non-conservative terms discretised after Saurel & Abgrall so that a contact with uniform velocity and
+ * pressure stays uniform. o: { n, length, x0, tEnd, cfl, eos: [{ gamma, pinf }, { gamma, pinf }], left / right: { a1, rho1, u1, p1, rho2, u2, p2 } }.
+ * Returns { x[], a1[], rho1[], u1[], p1[], rho2[], u2[], p2[], steps, conservation: { mass1, mass2, momentum (after the end-pressure impulse), energy (relative drift; mass and energy for states at rest at the ends) }, entropy: { s0, s1, production (≥ 0) } }.
+ */
+export function baerNunziato(o = {}) {
+  const N = o.n || 200, L = o.length || 1, dx = L / N, x0 = o.x0 ?? 0.5 * L, tEnd = o.tEnd ?? 0.2, cfl = o.cfl || 0.45, eos = o.eos || [{ gamma: 1.4, pinf: 0 }, { gamma: 1.4, pinf: 0 }];
+  const U = Array.from({ length: 7 }, () => new Float64Array(N)), x = Array.from({ length: N }, (_, i) => (i + 0.5) * dx), g1 = eos[0].gamma, g2 = eos[1].gamma, q1 = eos[0].pinf || 0, q2 = eos[1].pinf || 0;
+  const set = (i, s) => { const a2 = 1 - s.a1; U[0][i] = s.a1; U[1][i] = s.a1 * s.rho1; U[2][i] = s.a1 * s.rho1 * s.u1; U[3][i] = s.a1 * ((s.p1 + g1 * q1) / (g1 - 1) + 0.5 * s.rho1 * s.u1 * s.u1); U[4][i] = a2 * s.rho2; U[5][i] = a2 * s.rho2 * s.u2; U[6][i] = a2 * ((s.p2 + g2 * q2) / (g2 - 1) + 0.5 * s.rho2 * s.u2 * s.u2); };
+  const init = o.init || ((xx) => (xx < x0 ? o.left : o.right)); for (let i = 0; i < N; i++) set(i, init(x[i]));
+  const prim = (i) => { const a1 = U[0][i], a2 = 1 - a1, r1 = U[1][i] / a1, u1 = U[2][i] / U[1][i], p1 = (g1 - 1) * (U[3][i] / a1 - 0.5 * r1 * u1 * u1) - g1 * q1, r2 = U[4][i] / a2, u2 = U[5][i] / U[4][i], p2 = (g2 - 1) * (U[6][i] / a2 - 0.5 * r2 * u2 * u2) - g2 * q2; return { a1, a2, r1, u1, p1, r2, u2, p2, c1: Math.sqrt(Math.max((g1 * (p1 + q1)) / r1, 1e-12)), c2: Math.sqrt(Math.max((g2 * (p2 + q2)) / r2, 1e-12)) }; };
+  const tot = () => { let m1 = 0, m2 = 0, mo = 0, e = 0, s = 0; for (let i = 0; i < N; i++) { const w = prim(i); m1 += U[1][i]; m2 += U[4][i]; mo += U[2][i] + U[5][i]; e += U[3][i] + U[6][i]; s += (U[1][i] * Math.log((w.p1 + q1) / w.r1 ** g1)) / (g1 - 1) + (U[4][i] * Math.log((w.p2 + q2) / w.r2 ** g2)) / (g2 - 1); } return { m1: m1 * dx, m2: m2 * dx, mo: mo * dx, e: e * dx, s: s * dx }; };
+  const pe = (i) => { const w = prim(i); return w.a1 * w.p1 + w.a2 * w.p2 + w.a1 * w.r1 * w.u1 * w.u1 + w.a2 * w.r2 * w.u2 * w.u2; }, pEnds = [pe(0), pe(N - 1)]; // momentum flux through the open ends (constant until a wave arrives)
+  const t0 = tot(), W = new Array(N), Fx = Array.from({ length: 7 }, () => new Float64Array(N + 1)), Sf = new Float64Array(N + 1), Un = Array.from({ length: 7 }, () => new Float64Array(N));
+  let t = 0, steps = 0;
+  const flux = (w, k) => (k === 1 ? w.a1 * w.r1 * w.u1 : k === 2 ? w.a1 * (w.r1 * w.u1 * w.u1 + w.p1) : k === 3 ? w.a1 * w.u1 * ((w.p1 + g1 * q1) / (g1 - 1) + 0.5 * w.r1 * w.u1 * w.u1 + w.p1) : k === 4 ? w.a2 * w.r2 * w.u2 : k === 5 ? w.a2 * (w.r2 * w.u2 * w.u2 + w.p2) : w.a2 * w.u2 * ((w.p2 + g2 * q2) / (g2 - 1) + 0.5 * w.r2 * w.u2 * w.u2 + w.p2));
+  while (t < tEnd - 1e-14) {
+    let smax = 1e-12; for (let i = 0; i < N; i++) { W[i] = prim(i); smax = Math.max(smax, Math.abs(W[i].u1) + W[i].c1, Math.abs(W[i].u2) + W[i].c2); }
+    const dt = Math.min((cfl * dx) / smax, tEnd - t), lam = dt / dx;
+    for (let f = 0; f <= N; f++) { // transmissive ends
+      const a = W[Math.max(f - 1, 0)], b = W[Math.min(f, N - 1)], iL = Math.max(f - 1, 0), iR = Math.min(f, N - 1), S = Math.max(Math.abs(a.u1) + a.c1, Math.abs(a.u2) + a.c2, Math.abs(b.u1) + b.c1, Math.abs(b.u2) + b.c2); Sf[f] = S;
+      for (let k = 1; k < 7; k++) Fx[k][f] = 0.5 * (flux(a, k) + flux(b, k)) - 0.5 * S * (U[k][iR] - U[k][iL]);
+    }
+    for (let i = 0; i < N; i++) {
+      const w = W[i], aP = U[0][Math.min(i + 1, N - 1)], aM = U[0][Math.max(i - 1, 0)], a0 = U[0][i], dA = 0.5 * (aP - aM), uI = w.u2, pI = w.p1;
+      Un[0][i] = a0 - lam * (uI * dA - 0.5 * Sf[i + 1] * (aP - a0) + 0.5 * Sf[i] * (a0 - aM));
+      for (let k = 1; k < 7; k++) Un[k][i] = U[k][i] - lam * (Fx[k][i + 1] - Fx[k][i]);
+      Un[2][i] += lam * pI * dA; Un[3][i] += lam * pI * uI * dA; Un[5][i] -= lam * pI * dA; Un[6][i] -= lam * pI * uI * dA;
+    }
+    for (let k = 0; k < 7; k++) U[k].set(Un[k]);
+    t += dt; steps++;
+  }
+  const t1 = tot(), out = { x, a1: [], rho1: [], u1: [], p1: [], rho2: [], u2: [], p2: [] };
+  for (let i = 0; i < N; i++) { const w = prim(i); out.a1.push(w.a1); out.rho1.push(w.r1); out.u1.push(w.u1); out.p1.push(w.p1); out.rho2.push(w.r2); out.u2.push(w.u2); out.p2.push(w.p2); }
+  const rel = (a, b) => (b - a) / Math.max(Math.abs(a), 1e-300);
+  return { ...out, steps, tEnd: t, conservation: { mass1: rel(t0.m1, t1.m1), mass2: rel(t0.m2, t1.m2), momentum: (t1.mo - t0.mo - (pEnds[0] - pEnds[1]) * t) / Math.max(Math.abs(t0.mo), Math.abs(pEnds[0] - pEnds[1]) * t, 1e-300), energy: rel(t0.e, t1.e) }, entropy: { s0: t0.s, s1: t1.s, production: t1.s - t0.s } };
+}
+
+/**
+ * Species (tracer, inhibitor, water-cut marker) transport with the liquid along a steady solution:
+ *   ∂(A H c)/∂t + ∂(q_L c)/∂s = ∂/∂s (A H D ∂c/∂s),   first-order upwind advection, central dispersion, explicit in time.
+ * o: { s[] (uniform nodes), qL[] (m³/s), holdup[], area[] | A, D (m²/s dispersion), cIn(t), c0, tEnd, cfl, nSeries }.
+ * Returns { s[], c[] (cell values at the end), t[], cOut[], breakthrough (time at which the outlet reaches 50 % of a unit step, s | null), balance: { in, out, stored, error } }.
+ */
+export function speciesTransport(o) {
+  const n = o.s.length - 1, ds = o.s[1] - o.s[0], mid = (a) => Array.from({ length: n }, (_, i) => 0.5 * (a[i] + a[i + 1])), q = o.qL, H = mid(o.holdup), A = o.area ? mid(o.area) : new Array(n).fill(o.A), V = H.map((h, i) => Math.max(h * A[i], 1e-12) * ds);
+  const Dd = o.D || 0, cIn = typeof o.cIn === 'function' ? o.cIn : () => o.cIn ?? 1, c = new Array(n).fill(o.c0 ?? 0), tEnd = o.tEnd, nS = o.nSeries || 300;
+  let dt = Infinity; for (let i = 0; i < n; i++) dt = Math.min(dt, V[i] / (Math.abs(q[i]) + Math.abs(q[i + 1]) + (4 * Dd * V[i]) / (ds * ds) + 1e-30)); dt *= o.cfl || 0.9;
+  const steps = Math.max(1, Math.ceil(tEnd / dt)); dt = tEnd / steps;
+  // the upwind scheme adds a numerical dispersion ½ |u| Δs (1 − |u| Δt / Δs); it is taken off the physical dispersion where that is larger
+  const Dn = Array.from({ length: n + 1 }, (_, f) => { if (f === 0 || f === n) return 0; const uf = Math.abs(q[f]) * ds / (0.5 * (V[f - 1] + V[f])); return Math.max(Dd - 0.5 * uf * ds * (1 - (uf * dt) / ds), 0); });
+  const ts = [0], co = [c[n - 1]], F = new Array(n + 1); let mIn = 0, mOut = 0, bt = null; const m0 = c.reduce((s, v, i) => s + v * V[i], 0), every = Math.max(1, Math.floor(steps / nS));
+  for (let k = 1; k <= steps; k++) {
+    const t = k * dt, ci = cIn(t - 0.5 * dt);
+    for (let f = 0; f <= n; f++) { const adv = q[f] * (f === 0 ? ci : c[f - 1]), dif = f > 0 && f < n ? (-Dn[f] * 0.5 * (V[f - 1] + V[f])) / (ds * ds) * (c[f] - c[f - 1]) : 0; F[f] = adv + dif; }
+    const prev = c[n - 1]; for (let i = 0; i < n; i++) c[i] += (dt / V[i]) * (F[i] - F[i + 1]);
+    mIn += F[0] * dt; mOut += F[n] * dt;
+    if (bt === null && prev < 0.5 && c[n - 1] >= 0.5) bt = t - dt + (dt * (0.5 - prev)) / (c[n - 1] - prev);
+    if (k % every === 0 || k === steps) { ts.push(t); co.push(c[n - 1]); }
+  }
+  const m1 = c.reduce((s, v, i) => s + v * V[i], 0);
+  return { s: mid(o.s), c, t: ts, cOut: co, breakthrough: bt, steps, balance: { in: mIn, out: mOut, stored: m1 - m0, error: (m1 - m0 - mIn + mOut) / Math.max(Math.abs(mIn), Math.abs(m0), 1e-300) } };
+}
+
+// =====================================================================================================
+// 7c. More turbulence closures for developed pipe flow (1-D radial, wall units: ν = 1, u_τ = 1, R⁺ = Re_τ)
+// =====================================================================================================
+// One under-relaxed finite-volume sweep of (1/r) d/dr (r Γ dφ/dr) + src − sink φ = 0 on nodes y[0..n] (y from the wall, r = R⁺ − y).
+// wall: { value } (Dirichlet) | null (zero gradient); the centre line is symmetric; fixed[j] pins a node.
+function radialSweep(y, r, phi, gam, src, sink, wall, ur = 0.5, fixed = null) {
+  const n = y.length - 1, a = new Array(n + 1), b = new Array(n + 1), c = new Array(n + 1), d = new Array(n + 1);
+  for (let j = 0; j <= n; j++) {
+    if (j === 0) { if (wall) { a[j] = 0; c[j] = 0; b[j] = 1; d[j] = wall.value; } else { a[j] = 0; b[j] = 1; c[j] = -1; d[j] = 0; } continue; }
+    if (fixed && fixed[j] !== undefined) { a[j] = 0; c[j] = 0; b[j] = 1; d[j] = fixed[j]; continue; }
+    if (j === n) { a[j] = -1; b[j] = 1; c[j] = 0; d[j] = 0; continue; }
+    const we = (0.5 * (r[j] + r[j + 1]) * 0.5 * (gam[j] + gam[j + 1])) / (y[j + 1] - y[j]), ww = (0.5 * (r[j] + r[j - 1]) * 0.5 * (gam[j] + gam[j - 1])) / (y[j] - y[j - 1]), vol = (r[j] * (y[j + 1] - y[j - 1])) / 2, bb = (ww + we + Math.max(sink[j], 0) * vol) / ur;
+    a[j] = -ww; c[j] = -we; b[j] = bb; d[j] = Math.max(src[j], 0) * vol + (1 - ur) * bb * phi[j];
+  }
+  const x = tridiag(a, b, c, d); for (let j = 0; j <= n; j++) phi[j] = Math.max(x[j], 1e-14);
+}
+export const RANS_MODELS = [
+  { value: 'mixing', label: 'Mixing length (van Driest)' }, { value: 'komega', label: 'k–ω (Wilcox 1988)' }, { value: 'sst', label: 'SST k–ω (Menter 2003)' }, { value: 'sa', label: 'Spalart–Allmaras' },
+  { value: 'kepsilon', label: 'Low-Reynolds k–ε (Chien)' }, { value: 'kestd', label: 'Standard k–ε, wall functions' }, { value: 'rng', label: 'RNG k–ε, wall functions' }, { value: 'realizable', label: 'Realizable k–ε, wall functions' }, { value: 'rsm', label: 'Reynolds-stress model (LRR), wall functions' },
+];
+/**
+ * Fully developed turbulent pipe flow with the closures that ransPipe does not cover. Momentum: (1 + ν_t) dU⁺/dy⁺ = 1 − y⁺/R⁺.
+ *  'sst'        Menter SST k–ω (2003 constants, production limiter, cross-diffusion, F1/F2 blending), integrated to the wall;
+ *  'sa'         Spalart–Allmaras one-equation model (standard form without the trip term), integrated to the wall;
+ *  'kestd' | 'rng' | 'realizable'  high-Reynolds k–ε family with the log-law wall function at the first node (κ = 0.41, E = 9.8);
+ *  'rsm'        Launder–Reece–Rodi Reynolds-stress model (isotropisation of production, wall-reflection term, gradient diffusion with the
+ *               wall-normal stress) for ⟨uu⟩, ⟨vv⟩, ⟨ww⟩, ⟨uv⟩ and ε, wall functions.
+ * o: { reTau, model, n, maxIter, tol, yWall (y⁺ of the wall-function node, default 40) }.
+ * Returns { Re, f (Darcy), reTau, y[], u[], r[], uRel[], nut[], k[], stress: { uu, vv, ww, uv } | null, iterations, residual, converged, wallFunction }.
+ */
+export function ransPipeExtra(o = {}) {
+  const Rp = Math.max(o.reTau || 1000, 50), model = o.model || 'sst', n = o.n || 100, maxIter = o.maxIter || 8000, tol = o.tol || 1e-8, kap = 0.41, E = 9.8, wf = !(model === 'sst' || model === 'sa');
+  const yp = wf ? Math.min(o.yWall || 40, 0.2 * Rp) : 0, y1 = wf ? (Rp - yp) / (3 * n) : Math.min(0.1, Rp / (4 * n)), gq = (q) => (y1 * (q ** n - 1)) / (q - 1) - (Rp - yp), q = gq(1 + 1e-9) >= 0 ? 1 + 1e-9 : brent(gq, 1 + 1e-9, 3, 1e-13), y = [yp];
+  for (let j = 1; j <= n; j++) y.push(j === n ? Rp : yp + (y1 * (q ** j - 1)) / (q - 1));
+  const r = y.map((v) => Rp - v), z = () => new Array(n + 1).fill(0), nut = z(), u = z(), S = z(), gam = z(), src = z(), sink = z(), tau = y.map((v) => 1 - v / Rp);
+  const law = (yy) => (yy < 11.06 ? yy : Math.log(E * yy) / kap), uWall = wf ? law(yp) : 0;
+  let ubWall = 0; if (wf) { const m = 60; for (let i = 0; i < m; i++) { const ya = (yp * (i + 0.5)) / m; ubWall += law(ya) * (Rp - ya) * (yp / m); } }
+  const velocity = () => { for (let j = 0; j <= n; j++) S[j] = Math.max(tau[j], 0) / (1 + nut[j]); u[0] = uWall; for (let j = 1; j <= n; j++) u[j] = u[j - 1] + 0.5 * (S[j] + S[j - 1]) * (y[j] - y[j - 1]); let ub = ubWall; for (let j = 1; j <= n; j++) ub += 0.5 * (u[j] * r[j] + u[j - 1] * r[j - 1]) * (y[j] - y[j - 1]); return (2 * ub) / (Rp * Rp); };
+  const grad = (a, j) => (j === 0 ? (a[1] - a[0]) / (y[1] - y[0]) : j === n ? 0 : (a[j + 1] - a[j - 1]) / (y[j + 1] - y[j - 1]));
+  // start from the mixing-length solution
+  for (let j = 0; j <= n; j++) { const e = 1 - y[j] / Rp, l = Rp * (0.14 - 0.08 * e * e - 0.06 * e ** 4) * (1 - Math.exp(-y[j] / 26)); nut[j] = (l * l * 2 * e) / (1 + Math.sqrt(1 + 4 * l * l * e)); }
+  let ub = velocity(), it = 0, res = 1, kk = null, stress = null;
+  if (model === 'sa') {
+    const cb1 = 0.1355, cb2 = 0.622, sg = 2 / 3, cv1 = 7.1, cw2 = 0.3, cw3 = 2, cw1 = cb1 / (kap * kap) + (1 + cb2) / sg, nt = nut.map((v) => Math.max(v, 1e-10));
+    for (it = 1; it <= maxIter; it++) {
+      for (let j = 0; j <= n; j++) {
+        const d = Math.max(y[j], 1e-9), chi = nt[j], fv1 = chi ** 3 / (chi ** 3 + cv1 ** 3), fv2 = 1 - chi / (1 + chi * fv1), St = Math.max(S[j] + (nt[j] * fv2) / (kap * kap * d * d), 0.3 * S[j] + 1e-12), rr = Math.min(nt[j] / (St * kap * kap * d * d), 10), g = rr + cw2 * (rr ** 6 - rr), fw = g * ((1 + cw3 ** 6) / (g ** 6 + cw3 ** 6)) ** (1 / 6), dn = grad(nt, j);
+        gam[j] = (1 + nt[j]) / sg; src[j] = cb1 * St * nt[j] + (cb2 / sg) * dn * dn; sink[j] = (cw1 * fw * nt[j]) / (d * d);
+      }
+      radialSweep(y, r, nt, gam, src, sink, { value: 0 }, 0.6);
+      for (let j = 0; j <= n; j++) { const chi = nt[j]; nut[j] = (nt[j] * chi ** 3) / (chi ** 3 + cv1 ** 3); }
+      const un = velocity(); res = Math.abs(un - ub) / un; ub = un; if (res < tol && it > 30) break;
+    }
+  } else if (model === 'sst') {
+    const bS = 0.09, a1 = 0.31, sk1 = 0.85, sk2 = 1, sw1 = 0.5, sw2 = 0.856, b1 = 0.075, b2 = 0.0828, g1 = 5 / 9, g2 = 0.44;
+    kk = y.map((_, j) => Math.max((nut[j] * S[j]) / 0.3, 1e-10)); const ww = y.map((yy, j) => (j === 0 ? 0 : Math.max(kk[j] / Math.max(nut[j], 1e-6), yy < 2.5 ? 6 / (b1 * yy * yy) : 0)));
+    const wFix = y.map((yy, j) => (j === 0 ? 60 / (b1 * y[1] * y[1]) : yy < 2.5 ? 6 / (b1 * yy * yy) : undefined)), F1 = z(), CD = z();
+    for (it = 1; it <= maxIter; it++) {
+      for (let j = 1; j <= n; j++) {
+        const d = y[j], w = Math.max(ww[j], 1e-12), cd = 2 * sw2 * grad(kk, j) * grad(ww, j) / w, cdp = Math.max(cd, 1e-10), arg1 = Math.min(Math.max(Math.sqrt(kk[j]) / (bS * w * d), 500 / (d * d * w)), (4 * sw2 * kk[j]) / (cdp * d * d));
+        F1[j] = Math.tanh(arg1 ** 4); CD[j] = cd;
+      }
+      F1[0] = 1;
+      for (let j = 0; j <= n; j++) { const P = Math.min(nut[j] * S[j] * S[j], 10 * bS * kk[j] * ww[j]); gam[j] = 1 + (F1[j] * sk1 + (1 - F1[j]) * sk2) * nut[j]; src[j] = P; sink[j] = bS * ww[j]; }
+      radialSweep(y, r, kk, gam, src, sink, { value: 0 }, 0.5);
+      for (let j = 0; j <= n; j++) {
+        const f = F1[j], gm = f * g1 + (1 - f) * g2, be = f * b1 + (1 - f) * b2, P = Math.min(nut[j] * S[j] * S[j], 10 * bS * kk[j] * ww[j]), x = (1 - f) * CD[j];
+        gam[j] = 1 + (f * sw1 + (1 - f) * sw2) * nut[j]; src[j] = (gm * P) / Math.max(nut[j], 1e-10) + Math.max(x, 0); sink[j] = be * ww[j] + Math.max(-x, 0) / Math.max(ww[j], 1e-12);
+      }
+      radialSweep(y, r, ww, gam, src, sink, { value: wFix[0] }, 0.5, wFix);
+      for (let j = 1; j <= n; j++) { const d = y[j], arg2 = Math.max((2 * Math.sqrt(kk[j])) / (bS * ww[j] * d), 500 / (d * d * ww[j])), F2 = Math.tanh(arg2 * arg2); nut[j] = (a1 * kk[j]) / Math.max(a1 * ww[j], S[j] * F2); }
+      nut[0] = 0; const un = velocity(); res = Math.abs(un - ub) / un; ub = un; if (res < tol && it > 30) break;
+    }
+  } else if (model === 'rsm') {
+    const Cmu = 0.09, C1 = 1.8, C2 = 0.6, Cs = 0.25, Ce = 0.15, Ce1 = 1.44, Ce2 = 1.92, Cr1 = 0.5, Cr2 = 0.3, k0 = 1 / Math.sqrt(Cmu);
+    kk = y.map(() => k0); const ee = y.map((yy, j) => Math.max((Cmu * k0 * k0) / Math.max(nut[j], 1e-3), 1e-8)), uu = kk.map((k) => 1.1 * k), vv = kk.map((k) => 0.5 * k), wz = kk.map((k) => 0.4 * k), qv = y.map((_, j) => Math.max(nut[j] * S[j], 1e-8));
+    for (it = 1; it <= maxIter; it++) {
+      const T = kk.map((k, j) => k / Math.max(ee[j], 1e-12)), f = y.map((yy, j) => ((3 * Cmu ** 0.75) / kap) * Math.sqrt(kk[j]) / Math.max(yy, 1e-9)), P = qv.map((v, j) => v * S[j]);
+      const Dg = (c) => y.map((_, j) => 1 + c * T[j] * vv[j]);
+      // ⟨vv⟩ (wall-normal), then ⟨uu⟩, ⟨ww⟩, −⟨uv⟩, ε
+      for (let j = 0; j <= n; j++) { src[j] = (2 / 3) * (C1 - 1) * ee[j] + (2 / 3) * C2 * P[j]; sink[j] = C1 / T[j] + f[j] * (2 / 3) * Cr1 + (f[j] * (4 / 9) * Cr2 * C2 * T[j] * P[j]) / Math.max(vv[j], 1e-12); }
+      radialSweep(y, r, vv, Dg(Cs), src, sink, null, 0.4);
+      const refl = y.map((_, j) => Cr1 * vv[j] + Cr2 * C2 * T[j] * (2 / 3) * P[j]);
+      for (let j = 0; j <= n; j++) { src[j] = P[j] * (2 - (4 / 3) * C2) + (2 / 3) * (C1 - 1) * ee[j] + (f[j] * refl[j]) / 3; sink[j] = C1 / T[j]; }
+      radialSweep(y, r, uu, Dg(Cs), src, sink, null, 0.4);
+      for (let j = 0; j <= n; j++) { src[j] = (2 / 3) * (C1 - 1) * ee[j] + (2 / 3) * C2 * P[j] + (f[j] * refl[j]) / 3; sink[j] = C1 / T[j]; }
+      radialSweep(y, r, wz, Dg(Cs), src, sink, null, 0.4);
+      for (let j = 0; j <= n; j++) { src[j] = vv[j] * S[j] * (1 - C2 + 0.5 * f[j] * Cr2 * C2 * T[j]); sink[j] = C1 / T[j] + 0.5 * f[j] * Cr1; }
+      radialSweep(y, r, qv, Dg(Cs), src, sink, { value: tau[0] }, 0.4);
+      for (let j = 0; j <= n; j++) kk[j] = 0.5 * (uu[j] + vv[j] + wz[j]);
+      for (let j = 0; j <= n; j++) { src[j] = (Ce1 * P[j]) / T[j]; sink[j] = Ce2 / T[j]; }
+      radialSweep(y, r, ee, Dg(Ce), src, sink, { value: (Cmu ** 0.75 * kk[0] ** 1.5) / (kap * yp) }, 0.4);
+      for (let j = 0; j <= n; j++) nut[j] = S[j] > 1e-9 ? clamp(qv[j] / S[j], 0, 1e5) : nut[j]; // effective eddy viscosity −⟨uv⟩ / (dU/dy) used in the momentum balance
+      nut[n] = nut[n - 1];
+      const un = velocity(); res = Math.abs(un - ub) / un; ub = un; if (res < tol && it > 50) break;
+    }
+    stress = { uu: uu.slice(), vv: vv.slice(), ww: wz.slice(), uv: qv.map((v) => -v) };
+  } else {
+    const rng = model === 'rng', rea = model === 'realizable', Cmu0 = rng ? 0.0845 : 0.09, C1 = rng ? 1.42 : 1.44, C2 = rng ? 1.68 : rea ? 1.9 : 1.92, sk = rng ? 0.71942 : 1, se = rng ? 0.71942 : rea ? 1.2 : 1.3, kW = 1 / Math.sqrt(Cmu0), eW = 1 / (kap * yp);
+    kk = y.map(() => kW); const ee = y.map((yy, j) => Math.max((Cmu0 * kW * kW) / Math.max(nut[j], 1e-3), 1e-8));
+    for (it = 1; it <= maxIter; it++) {
+      for (let j = 0; j <= n; j++) { gam[j] = 1 + nut[j] / sk; src[j] = nut[j] * S[j] * S[j]; sink[j] = ee[j] / Math.max(kk[j], 1e-12); }
+      radialSweep(y, r, kk, gam, src, sink, { value: kW }, 0.5);
+      for (let j = 0; j <= n; j++) {
+        const T = kk[j] / Math.max(ee[j], 1e-12), eta = S[j] * T, P = nut[j] * S[j] * S[j]; gam[j] = 1 + nut[j] / se;
+        if (rea) { src[j] = Math.max(0.43, eta / (eta + 5)) * S[j] * ee[j]; sink[j] = (C2 * ee[j]) / (kk[j] + Math.sqrt(ee[j])); }
+        else { const R = rng ? (eta * (1 - eta / 4.38)) / (1 + 0.012 * eta ** 3) : 0, c = C1 - R; src[j] = (Math.max(c, 0) * P) / T; sink[j] = C2 / T + (Math.max(-c, 0) * P) / T / Math.max(ee[j], 1e-12); }
+      }
+      radialSweep(y, r, ee, gam, src, sink, { value: eW }, 0.5);
+      for (let j = 0; j <= n; j++) { const T = kk[j] / Math.max(ee[j], 1e-12), cm = rea ? 1 / (4.0 + Math.sqrt(6) * Math.cos(PI / 6) * S[j] * T) : Cmu0; nut[j] = cm * kk[j] * T; } // realizable: As = √6 cos φ with φ = π/6 in simple shear, U* = S
+      const un = velocity(); res = Math.abs(un - ub) / un; ub = un; if (res < tol && it > 30) break;
+    }
+  }
+  const Re = 2 * Rp * ub;
+  return { Re, f: 8 / (ub * ub), reTau: Rp, y, u: u.slice(), r: r.map((v) => v / Rp), uRel: u.map((v) => v / ub), nut: nut.slice(), k: kk ? kk.slice() : null, stress, iterations: Math.min(it, maxIter), residual: res, converged: res < 1e-6, wallFunction: wf };
+}
+
+// =====================================================================================================
+// 7e. Bubbly flow: interfacial force closures in a radial void-distribution model, bubble dynamics, interfacial-area transport
+// =====================================================================================================
+/** Drag coefficient of a bubble: Ishii & Zuber (viscous and distorted regimes, swarm correction), as coded in OpenFOAM. */
+export function dragIshiiZuber(Re, Eo, alpha = 0, muRatio = 0.02) {
+  const muStar = (muRatio + 0.4) / (muRatio + 1), mixF = Math.max(1 - alpha, 1e-3) ** (-2.5 * muStar), ReM = Re / mixF, cdRe = ReM <= 1000 ? 24 * (1 + 0.1 * ReM ** 0.75) : 0.44 * ReM;
+  const F = Math.max((1 / mixF) * Math.sqrt(1 - alpha), 1e-3), Ea = (1 + 17.67 * F ** 0.8571428) / (18.67 * F), cdEl = Ea * 0.6666 * Math.sqrt(Eo) * Re;
+  return (cdEl >= cdRe ? Math.min(cdEl, Re * (1 - alpha) ** 2 * 2.66667) : cdRe) / Math.max(Re, 1e-12);
+}
+/** Lift coefficient of Tomiyama et al. (2002) with the horizontal Eötvös number (Wellek aspect ratio): positive for small bubbles (towards the wall in upflow), negative above d ≈ 5.8 mm in air–water. */
+export function liftTomiyama(Re, Eo) {
+  const EoH = Eo * (1 + 0.163 * Eo ** 0.757) ** (2 / 3), f = 0.0010422 * EoH ** 3 - 0.0159 * EoH * EoH - 0.0204 * EoH + 0.474;
+  return EoH < 4 ? Math.min(0.288 * Math.tanh(0.121 * Re), f) : EoH < 10.7 ? f : -0.288;
+}
+/** Terminal rise velocity of a bubble in a swarm (buoyancy = drag, Ishii–Zuber). */
+export function bubbleTerminal({ d, rhoL = 998, rhoG = 1.2, muL = 1e-3, sigma = 0.072, alpha = 0 }) {
+  const Eo = (G * (rhoL - rhoG) * d * d) / sigma; let v = 0.2;
+  for (let k = 0; k < 60; k++) { const cd = dragIshiiZuber((rhoL * v * d) / muL, Eo, alpha), vn = Math.sqrt((4 * G * d * (rhoL - rhoG) * (1 - alpha)) / (3 * cd * rhoL)); if (Math.abs(vn - v) < 1e-12) { v = vn; break; } v = 0.5 * (v + vn); }
+  return v;
+}
+/**
+ * Rise of a single bubble released from rest with the added (virtual) mass of the displaced liquid:
+ *   (ρg + C_vm ρl) dv/dt = (ρl − ρg) g − ¾ C_D ρl v² / d.   Returns { t[], v[], a0 (initial acceleration), terminal }.
+ */
+export function bubbleRise({ d = 3e-3, rhoL = 998, rhoG = 1.2, muL = 1e-3, sigma = 0.072, cvm = 0.5, tEnd = 0.5, n = 400 } = {}) {
+  const Eo = (G * (rhoL - rhoG) * d * d) / sigma, f = (v) => ((rhoL - rhoG) * G - (0.75 * dragIshiiZuber(Math.max((rhoL * Math.abs(v) * d) / muL, 1e-9), Eo) * rhoL * v * Math.abs(v)) / d) / (rhoG + cvm * rhoL), dt = tEnd / n, t = [0], vv = [0];
+  let v = 0; for (let i = 1; i <= n; i++) { const k1 = f(v), k2 = f(v + 0.5 * dt * k1), k3 = f(v + 0.5 * dt * k2), k4 = f(v + dt * k3); v += (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4); t.push(i * dt); vv.push(v); }
+  return { t, v: vv, a0: f(0), terminal: bubbleTerminal({ d, rhoL, rhoG, muL, sigma }) };
+}
+/**
+ * Radial void-fraction distribution of developed upward bubbly flow in a pipe from the balance of the lateral forces on the bubbles:
+ *   turbulent dispersion (Burns et al. Favre-averaged drag, or Lopez de Bertodano C_TD ρl k ∇α) = lift (Tomiyama, damped at the wall) + wall lubrication (Antal),
+ * with the liquid velocity from the radial momentum balance (mixing length with van Driest damping plus the Sato bubble-induced
+ * viscosity 0.6 α d u_r) and the bubble-induced (pseudo-turbulent) kinetic energy ½ C_vm α u_r² added to the shear-induced k.
+ * o: { R (pipe radius), jl (mean liquid velocity (1 − α) u_l averaged over the section), alphaMean, d (bubble diameter), rhoL, rhoG, muL, sigma, n,
+ *      cl (number, or 'tomiyama'), cw1, cw2, sigmaTD, ctd, tdModel: 'burns' | 'bertodano', cvm, cmub, iterations }.
+ * Returns { r[] (r/R), alpha[], ul[] (m/s), k[], uRel, cl, cd, peak: { r, alpha }, wallPeaked, alphaCentre, dpdz, mean (area-average void, check), iterations, residual }.
+ */
+export function bubblyPipe(o = {}) {
+  const R = o.R || 0.019, n = o.n || 120, d = o.d || 3.4e-3, rhoL = o.rhoL ?? 998, rhoG = o.rhoG ?? 1.2, muL = o.muL ?? 1e-3, sigma = o.sigma ?? 0.072, aM = o.alphaMean ?? 0.05, jl = o.jl ?? 0.9, nu = muL / rhoL;
+  const cw1 = o.cw1 ?? -0.01, cw2 = o.cw2 ?? 0.05, sTD = o.sigmaTD ?? 0.7, ctd = o.ctd ?? 1, cvm = o.cvm ?? 0.5, cmub = o.cmub ?? 0.6, burns = o.tdModel !== 'bertodano', Eo = (G * (rhoL - rhoG) * d * d) / sigma;
+  // nodes clustered at the wall: y = R (1 − cos) spacing
+  const r = Array.from({ length: n + 1 }, (_, j) => R * Math.sin((0.5 * PI * j) / n)), y = r.map((v) => Math.max(R - v, 0)), al = r.map(() => aM), ul = new Array(n + 1).fill(0), kk = new Array(n + 1).fill(0), nut = new Array(n + 1).fill(0), S = new Array(n + 1).fill(0);
+  const avg = (f) => { let s = 0; for (let j = 1; j <= n; j++) s += 0.5 * (f(j) * r[j] + f(j - 1) * r[j - 1]) * (r[j] - r[j - 1]); return (2 * s) / (R * R); };
+  let ur = bubbleTerminal({ d, rhoL, rhoG, muL, sigma, alpha: aM }), cd = 0, cl = 0, dpdz = 0, res = 1, it = 0;
+  const flow = (gp) => { // liquid velocity for a pressure gradient gp = −dp/dz − ρl g (the part that drives the flow)
+    let I = 0; const tau = new Array(n + 1).fill(0); // r τ(r) = ∫ [gp + (ρl − ρm) g] r dr  (τ = shear stress towards the wall)
+    for (let j = 1; j <= n; j++) { const fa = gp + al[j - 1] * (rhoL - rhoG) * G, fb = gp + al[j] * (rhoL - rhoG) * G; I += 0.5 * (fa * r[j - 1] + fb * r[j]) * (r[j] - r[j - 1]); tau[j] = I / r[j]; }
+    const tw = Math.max(tau[n], 1e-9), ut = Math.sqrt(tw / rhoL);
+    for (let j = 0; j <= n; j++) { const e = r[j] / R, l = R * (0.14 - 0.08 * e * e - 0.06 * e ** 4) * (1 - Math.exp((-y[j] * ut) / nu / 26)), nb = cmub * al[j] * d * ur, a = Math.abs(tau[j]) / (rhoL * Math.max(1 - al[j], 0.05)); S[j] = l > 1e-12 ? (-(nu + nb) + Math.sqrt((nu + nb) ** 2 + 4 * l * l * a)) / (2 * l * l) : a / (nu + nb); nut[j] = l * l * S[j] + nb; S[j] *= Math.sign(tau[j]); }
+    ul[n] = 0; for (let j = n - 1; j >= 0; j--) ul[j] = ul[j + 1] + 0.5 * (S[j] + S[j + 1]) * (r[j + 1] - r[j]);
+    return avg((j) => (1 - al[j]) * ul[j]);
+  };
+  for (it = 1; it <= (o.iterations || 60); it++) {
+    { const a = -(rhoL - rhoG) * G; let b = 2000, fb = flow(b) - jl, g = 0; while (fb < 0 && g++ < 20) { b *= 3; fb = flow(b) - jl; } dpdz = brent((x) => flow(x) - jl, a, b, 1e-8); flow(dpdz); }
+    const Reb = (rhoL * ur * d) / muL; cd = dragIshiiZuber(Reb, Eo, aM); cl = typeof o.cl === 'number' ? o.cl : liftTomiyama(Reb, Eo);
+    for (let j = 0; j <= n; j++) kk[j] = (Math.max(nut[j] - cmub * al[j] * d * ur, 0) * Math.abs(S[j])) / 0.3 + 0.5 * cvm * al[j] * ur * ur;
+    // lateral force balance integrated from the centre: d ln α / dr = (1 − α) Φ(r)
+    const phi = (j, a) => { const damp = 0.5 * (1 - Math.cos(PI * Math.min(y[j] / d, 1))), W = Math.max(0, cw1 / d + cw2 / Math.max(y[j], 1e-6)), dudr = -S[j], force = -cl * ur * dudr * damp - ur * ur * W; return burns ? ((1 - a) * sTD * d * force) / (0.75 * cd * ur * Math.max(nut[j], 1e-9)) : force / (ctd * Math.max(kk[j], 1e-9)); };
+    const profile = (ac) => { const a = [ac]; for (let j = 1; j <= n; j++) { const dr = r[j] - r[j - 1], p0 = phi(j - 1, a[j - 1]), a1 = clamp(a[j - 1] * Math.exp(clamp(p0 * dr, -30, 30)), 1e-12, 0.95), p1 = phi(j, a1); a.push(clamp(a[j - 1] * Math.exp(clamp(0.5 * (p0 + p1) * dr, -30, 30)), 1e-12, 0.95)); } return a; };
+    const mean = (a) => { let s = 0; for (let j = 1; j <= n; j++) s += 0.5 * (a[j] * r[j] + a[j - 1] * r[j - 1]) * (r[j] - r[j - 1]); return (2 * s) / (R * R); };
+    let lo = 1e-10, hi = 0.95; for (let k = 0; k < 70; k++) { const m = Math.sqrt(lo * hi); if (mean(profile(m)) > aM) hi = m; else lo = m; }
+    const an = profile(Math.sqrt(lo * hi)); res = 0; for (let j = 0; j <= n; j++) { res = Math.max(res, Math.abs(an[j] - al[j])); al[j] += 0.5 * (an[j] - al[j]); }
+    ur = bubbleTerminal({ d, rhoL, rhoG, muL, sigma, alpha: aM });
+    if (res < 1e-7 && it > 3) break;
+  }
+  { const a = -(rhoL - rhoG) * G; let b = 2000, fb = flow(b) - jl, g = 0; while (fb < 0 && g++ < 20) { b *= 3; fb = flow(b) - jl; } dpdz = brent((x) => flow(x) - jl, a, b, 1e-10); flow(dpdz); } // momentum balance of the final void profile
+  let jp = 0; for (let j = 1; j <= n; j++) if (al[j] > al[jp]) jp = j;
+  return { r: r.map((v) => v / R), alpha: al.slice(), ul: ul.slice(), k: kk.slice(), uRel: ur, cl, cd, eotvos: Eo, peak: { r: r[jp] / R, alpha: al[jp] }, wallPeaked: r[jp] / R > 0.5, alphaCentre: al[0], dpdz: dpdz + rhoL * G, mean: avg((j) => al[j]), liquidFlux: avg((j) => (1 - al[j]) * ul[j]), iterations: it, residual: res };
+}
+/**
+ * One-group interfacial-area transport along a vertical bubbly column (curvature κ = a_i/α = 6/d_sm, the form of Ishii and co-workers as coded in OpenFOAM):
+ *   v_g dκ/dz = −R_RC κ − 12 φ C_WE C_D^⅓ α u_r κ² + (C_TI/18) u_t κ² √(1 − We_cr/We) exp(−We_cr/We),   φ = 1/(36π),
+ * random-collision coalescence R_RC = 12 φ κ α C_RC u_t [1 − exp(−C α^⅓ α_max^⅓ / (α_max^⅓ − α^⅓))] / [α_max^⅓ (α_max^⅓ − α^⅓)], wake entrainment and turbulent-impact breakup.
+ * o: { d0, alpha, vg, k (liquid turbulent kinetic energy), length, n, rhoL, rhoG, muL, sigma, crc, cwe, cti, weCr, c, alphaMax, cdFixed }.
+ * Returns { z[], d[] (Sauter diameter), dEnd, dEquilibrium (| null), rates: { coalescenceRC, coalescenceWE, breakup } at the outlet (1/m/s) }.
+ */
+export function interfacialAreaTransport(o = {}) {
+  const { d0 = 3e-3, alpha = 0.1, vg = 1, k = 0.01, length = 10, n = 400, rhoL = 998, rhoG = 1.2, muL = 1e-3, sigma = 0.072, crc = 0.04, cwe = 0.002, cti = 0.085, weCr = 6, c = 3, alphaMax = 0.75 } = o, phi = 1 / (36 * PI), ut = Math.sqrt(2 * k), ur = Math.SQRT2 * ((sigma * G * (rhoL - rhoG)) / (rhoL * rhoL)) ** 0.25 * (1 - alpha) ** 1.75, cm = Math.cbrt(alphaMax), ca = Math.cbrt(alpha);
+  const parts = (kap) => { const d = 6 / kap, Re = Math.max((ur * d * rhoL) / muL, 1e-3), Eo = (G * d * d * (rhoL - rhoG)) / sigma, cd = o.cdFixed ?? Math.max(Math.min((16 / Re) * (1 + 0.15 * Re ** 0.687), 48 / Re), (8 * Eo) / (3 * (Eo + 4))), We = (rhoL * ut * ut * d) / sigma;
+    return { rc: alpha < alphaMax ? (12 * phi * kap * alpha * crc * ut * (1 - Math.exp((-c * Math.cbrt(alpha * alphaMax)) / (cm - ca)))) / (cm * (cm - ca)) * kap : 0, we: 12 * phi * cwe * Math.cbrt(cd) * alpha * kap * ur * kap, ti: We > weCr ? (cti / 18) * ut * kap * kap * Math.sqrt(1 - weCr / We) * Math.exp(-weCr / We) : 0 }; };
+  const f = (kap) => { const q = parts(kap); return (q.ti - q.rc - q.we) / vg; }, dz = length / n, z = [0], dd = [d0]; let kap = 6 / d0;
+  for (let i = 1; i <= n; i++) { const k1 = f(kap), k2 = f(kap + 0.5 * dz * k1), k3 = f(kap + 0.5 * dz * k2), k4 = f(kap + dz * k3); kap = clamp(kap + (dz / 6) * (k1 + 2 * k2 + 2 * k3 + k4), 6 / 0.2, 6 / 1e-5); z.push(i * dz); dd.push(6 / kap); }
+  let dEq = null; { let a = 6 / 0.1, fa = f(a); for (let i = 1; i <= 200 && dEq === null; i++) { const b = (6 / 0.1) * (6 / 2e-5 / (6 / 0.1)) ** (i / 200), fb = f(b); if (fa * fb < 0) dEq = 6 / brent(f, a, b, 1e-9); a = b; fa = fb; } }
+  const q = parts(kap);
+  return { z, d: dd, dEnd: 6 / kap, dEquilibrium: dEq, rates: { coalescenceRC: q.rc, coalescenceWE: q.we, breakup: q.ti }, uRel: ur, uTurb: ut };
+}
+
+// =====================================================================================================
+// 7f. Two-dimensional CFD: interface advection schemes and an incompressible Navier–Stokes solver (projection, SST k–ω, volume of fluid)
+// =====================================================================================================
+// THINC flux through the downstream face of a donor cell (fraction of the cell volume) for a Courant number c ≥ 0; pm, p, pp: upstream, donor, downstream values.
+function thincFlux(pm, p, pp, c, beta = 2.3) {
+  let fl = c * p;
+  if (p > 1e-8 && p < 1 - 1e-8 && (pp - p) * (p - pm) > 0) { const gm = pp > pm ? 1 : -1, qq = (beta * (2 * p - 1)) / gm, w = (Math.exp(beta) - Math.exp(qq)) / (Math.exp(qq) - Math.exp(-beta)); if (w > 0 && Number.isFinite(w)) { const xt = Math.log(w) / (2 * beta); fl = 0.5 * (c + (gm / beta) * (Math.log(Math.cosh(beta * (1 - xt))) - Math.log(Math.cosh(beta * (1 - c - xt))))); } }
+  return clamp(fl, Math.max(0, c - (1 - p)), Math.min(c, p));
+}
+/**
+ * One direction-split volume-of-fluid step on a staggered grid (cells with one ghost layer, stride nx + 2): THINC reconstruction weighted
+ * with the interface normal (THINC/WLIC), with the dilatation term of Weymouth & Yue so that the split advection conserves volume to round-off.
+ * C: cell fractions (ghosts filled by the caller), U, V: face velocities (U: (nx+1) × (ny+2) with ghost rows, V: (nx+2) × (ny+1) with ghost columns),
+ * normal: optional { nx[], ny[] } per cell (e.g. from a level set); otherwise from the gradient of C. odd swaps the sweep order.
+ */
+function vofStep(C, U, V, nx, ny, dx, dy, dt, odd, normal, fill, perX = false, perY = false) {
+  const sx = nx + 2, cc = new Float64Array(C.length); for (let k = 0; k < C.length; k++) cc[k] = C[k] > 0.5 ? 1 : 0;
+  const wOf = (k, dir) => { let gx, gy; if (normal) { gx = normal.nx[k]; gy = normal.ny[k]; } else { gx = (C[k + 1] ?? C[k]) - (C[k - 1] ?? C[k]); gy = (C[k + sx] ?? C[k]) - (C[k - sx] ?? C[k]); } const a = Math.abs(gx), b = Math.abs(gy); return a + b < 1e-12 ? 0.5 : dir === 0 ? a / (a + b) : b / (a + b); };
+  const sweepX = () => { const F = new Float64Array(C.length); for (let j = 1; j <= ny; j++) for (let i = 0; i <= nx; i++) { const u = U[i + (nx + 1) * j], c = (Math.abs(u) * dt) / dx, d = u >= 0 ? i + sx * j : i + 1 + sx * j, s = u >= 0 ? 1 : -1; if (c === 0) continue; const w = wOf(d, 0), f = w * thincFlux(C[d - s] ?? C[d], C[d], C[d + s] ?? C[d], c) + (1 - w) * c * C[d]; F[i + sx * j] = s * f; }
+    if (perX) for (let j = 1; j <= ny; j++) F[sx * j] = F[nx + sx * j];
+    for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const k = i + sx * j; C[k] += -(F[k] - F[k - 1]) + (cc[k] * (U[i + (nx + 1) * j] - U[i - 1 + (nx + 1) * j]) * dt) / dx; } fill(C); };
+  const sweepY = () => { const F = new Float64Array(C.length); for (let j = 0; j <= ny; j++) for (let i = 1; i <= nx; i++) { const v = V[i + sx * j], c = (Math.abs(v) * dt) / dy, d = v >= 0 ? i + sx * j : i + sx * (j + 1), s = v >= 0 ? sx : -sx; if (c === 0) continue; const w = wOf(d, 1), f = w * thincFlux(C[d - s] ?? C[d], C[d], C[d + s] ?? C[d], c) + (1 - w) * c * C[d]; F[i + sx * j] = Math.sign(s) * f; }
+    if (perY) for (let i = 1; i <= nx; i++) F[i] = F[i + sx * ny];
+    for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const k = i + sx * j; C[k] += -(F[k] - F[k - sx]) + (cc[k] * (V[k] - V[k - sx]) * dt) / dy; } fill(C); };
+  if (odd) { sweepY(); sweepX(); } else { sweepX(); sweepY(); }
+  for (let k = 0; k < C.length; k++) if (C[k] < 0) C[k] = Math.max(C[k], -1e-12) < 0 ? 0 : C[k]; // round-off only
+}
+/**
+ * Interface advection in a prescribed velocity field on the unit square (n × n cells, one period of the motion), comparing five families:
+ *  'vof' (THINC/WLIC volume of fluid), 'levelset' (signed distance, second-order upwind, PDE reinitialisation), 'clsvof' (volume of fluid with the
+ *  normal from the level set; the level set is shifted to enclose the VOF volume), 'phasefield' (conservative Allen–Cahn equation), 'front' (front tracking with markers).
+ * test: 'zalesak' (slotted disc in solid-body rotation) | 'circle' (rotation) | 'translateX' | 'translateDiag' (uniform translation over one period, periodic).
+ * Returns { scheme, test, n, x[], y[], c[][] (liquid fraction), exact[][], massError (relative), shapeError (L1 of the fraction / interface length … relative to the body area), steps }.
+ */
+export function interfaceAdvect2D(o = {}) {
+  const n = o.n || 64, scheme = o.scheme || 'vof', test = o.test || 'zalesak', dx = 1 / n, sx = n + 2, N = sx * sx, idx = (i, j) => i + sx * j, periodic = test.startsWith('translate'), xc = (i) => (i - 0.5) * dx;
+  const rot = !periodic, ux = (x, y) => (rot ? 2 * PI * (0.5 - y) : test === 'translateX' ? 1 : 1), uy = (x, y) => (rot ? 2 * PI * (x - 0.5) : test === 'translateX' ? 0 : 1), cx0 = rot ? 0.5 : 0.5, cy0 = rot ? 0.75 : 0.5, rad = 0.15;
+  const slot = test === 'zalesak', inside = (x, y) => { const xx = periodic ? ((x % 1) + 1) % 1 : x, yy = periodic ? ((y % 1) + 1) % 1 : y; return Math.hypot(xx - cx0, yy - cy0) <= rad && !(slot && Math.abs(xx - cx0) < 0.025 && yy < cy0 + 0.1); };
+  const frac = (i, j) => { let s = 0; const m = 6; for (let a = 0; a < m; a++) for (let b = 0; b < m; b++) if (inside(xc(i) + ((a + 0.5) / m - 0.5) * dx, xc(j) + ((b + 0.5) / m - 0.5) * dx)) s++; return s / (m * m); };
+  const sdf = (x, y) => { const d = Math.hypot(x - cx0, y - cy0) - rad; if (!slot) return -d; // positive inside
+    const inC = d <= 0, sxl = Math.abs(x - cx0) - 0.025, syt = y - (cy0 + 0.1), inS = sxl < 0 && syt < 0; if (inC && !inS) return Math.min(-d, sxl > 0 && syt > 0 ? Math.hypot(sxl, syt) : Math.max(sxl, syt) > 0 ? Math.max(sxl, syt) : 1); if (inC && inS) return -Math.min(-sxl, -syt); return -d; };
+  const fill = (A) => { for (let i = 1; i <= n; i++) { A[idx(i, 0)] = periodic ? A[idx(i, n)] : A[idx(i, 1)]; A[idx(i, n + 1)] = periodic ? A[idx(i, 1)] : A[idx(i, n)]; } for (let j = 0; j <= n + 1; j++) { A[idx(0, j)] = periodic ? A[idx(n, j)] : A[idx(1, j)]; A[idx(n + 1, j)] = periodic ? A[idx(1, j)] : A[idx(n, j)]; } };
+  const C = new Float64Array(N), E = new Float64Array(N), U = new Float64Array((n + 1) * (n + 2)), V = new Float64Array((n + 2) * (n + 1));
+  for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { C[idx(i, j)] = frac(i, j); E[idx(i, j)] = C[idx(i, j)]; }
+  for (let j = 0; j <= n + 1; j++) for (let i = 0; i <= n; i++) U[i + (n + 1) * j] = ux(i * dx, xc(j)); for (let j = 0; j <= n; j++) for (let i = 0; i <= n + 1; i++) V[i + sx * j] = uy(xc(i), j * dx);
+  fill(C); const umax = rot ? 2 * PI * 0.71 : 1, cfl = o.cfl || 0.25, steps = Math.ceil(1 / ((cfl * dx) / umax)), dt = 1 / steps, mass = (A) => { let s = 0; for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) s += A[idx(i, j)]; return s * dx * dx; }, m0 = mass(C);
+  let out = C;
+  if (scheme === 'front') { // markers on the interface, RK2 in the analytic velocity field, area by the shoelace formula
+    const pts = []; const m = o.markers || 8 * n; if (slot) { const a0 = Math.asin(0.025 / rad), top = cy0 + 0.1, add = (x, y) => pts.push([x, y]), seg = (x1, y1, x2, y2, k) => { for (let q = 0; q < k; q++) add(x1 + ((x2 - x1) * q) / k, y1 + ((y2 - y1) * q) / k); }; const yb = cy0 - rad * Math.cos(a0), arcN = Math.round(m * 0.7); for (let q = 0; q < arcN; q++) { const th = -PI / 2 + a0 + ((2 * PI - 2 * a0) * q) / arcN; add(cx0 + rad * Math.cos(th), cy0 + rad * Math.sin(th)); } seg(cx0 - 0.025, yb, cx0 - 0.025, top, Math.round(m * 0.13)); seg(cx0 - 0.025, top, cx0 + 0.025, top, Math.round(m * 0.04)); seg(cx0 + 0.025, top, cx0 + 0.025, yb, Math.round(m * 0.13)); } else for (let q = 0; q < m; q++) pts.push([cx0 + rad * Math.cos((2 * PI * q) / m), cy0 + rad * Math.sin((2 * PI * q) / m)]);
+    const area = () => { let s = 0; for (let q = 0; q < pts.length; q++) { const a = pts[q], b = pts[(q + 1) % pts.length]; s += a[0] * b[1] - b[0] * a[1]; } return Math.abs(s) / 2; }, a0 = area();
+    for (let s = 0; s < steps; s++) for (const p of pts) { const k1x = ux(p[0], p[1]), k1y = uy(p[0], p[1]), mx = p[0] + 0.5 * dt * k1x, my = p[1] + 0.5 * dt * k1y; p[0] += dt * ux(mx, my); p[1] += dt * uy(mx, my); }
+    const poly = pts.map((p) => (periodic ? [p[0] - 1, p[1] - (test === 'translateDiag' ? 1 : 0)] : p)), inPoly = (x, y) => { let c = false; for (let q = 0, w = poly.length - 1; q < poly.length; w = q++) { const a = poly[q], b = poly[w]; if (a[1] > y !== b[1] > y && x < ((b[0] - a[0]) * (y - a[1])) / (b[1] - a[1]) + a[0]) c = !c; } return c; };
+    out = new Float64Array(N); for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { let s = 0; const q = 4; for (let a = 0; a < q; a++) for (let b = 0; b < q; b++) if (inPoly(xc(i) + ((a + 0.5) / q - 0.5) * dx, xc(j) + ((b + 0.5) / q - 0.5) * dx)) s++; out[idx(i, j)] = s / (q * q); }
+    const sh = (() => { let s = 0; for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) s += Math.abs(out[idx(i, j)] - E[idx(i, j)]); return (s * dx * dx) / m0; })();
+    return pack(out, Math.abs(area() - a0) / a0, sh);
+  }
+  const P = new Float64Array(N), heav = (p) => { const e = 1.5 * dx; return p > e ? 1 : p < -e ? 0 : 0.5 * (1 + p / e + Math.sin((PI * p) / e) / PI); };
+  if (scheme === 'levelset' || scheme === 'clsvof') { for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) P[idx(i, j)] = sdf(xc(i), xc(j)); fill(P); }
+  const mm = (a, b) => (a * b <= 0 ? 0 : Math.abs(a) < Math.abs(b) ? a : b);
+  const lsRhs = (A, R) => { for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j), u = 0.5 * (U[i - 1 + (n + 1) * j] + U[i + (n + 1) * j]), v = 0.5 * (V[k - sx] + V[k]);
+    const ip = Math.min(i + 2, n + 1), im = Math.max(i - 2, 0), jp = Math.min(j + 2, n + 1), jm = Math.max(j - 2, 0), d2 = (a, b, c) => a - 2 * b + c; // second-order upwind (ENO-2)
+    const dxm = (A[k] - A[k - 1]) / dx + (mm(d2(A[k + 1], A[k], A[k - 1]), d2(A[k], A[k - 1], A[idx(im, j)])) / dx) * 0.5, dxp = (A[k + 1] - A[k]) / dx - (mm(d2(A[k + 1], A[k], A[k - 1]), d2(A[idx(ip, j)], A[k + 1], A[k])) / dx) * 0.5;
+    const dym = (A[k] - A[k - sx]) / dx + (mm(d2(A[k + sx], A[k], A[k - sx]), d2(A[k], A[k - sx], A[idx(i, jm)])) / dx) * 0.5, dyp = (A[k + sx] - A[k]) / dx - (mm(d2(A[k + sx], A[k], A[k - sx]), d2(A[idx(i, jp)], A[k + sx], A[k])) / dx) * 0.5;
+    R[k] = -(u * (u >= 0 ? dxm : dxp) + v * (v >= 0 ? dym : dyp)); } };
+  const fillLS = (A) => { if (periodic) return fill(A); for (let i = 1; i <= n; i++) { A[idx(i, 0)] = 2 * A[idx(i, 1)] - A[idx(i, 2)]; A[idx(i, n + 1)] = 2 * A[idx(i, n)] - A[idx(i, n - 1)]; } for (let j = 0; j <= n + 1; j++) { A[idx(0, j)] = 2 * A[idx(1, j)] - A[idx(2, j)]; A[idx(n + 1, j)] = 2 * A[idx(n, j)] - A[idx(n - 1, j)]; } };
+  const reinit = (A, iters) => { const S0 = new Float64Array(N), R = new Float64Array(N); for (let k = 0; k < N; k++) S0[k] = A[k] / Math.sqrt(A[k] * A[k] + dx * dx); for (let q = 0; q < iters; q++) { for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j), a = (A[k] - A[k - 1]) / dx, b = (A[k + 1] - A[k]) / dx, c = (A[k] - A[k - sx]) / dx, d = (A[k + sx] - A[k]) / dx, s = S0[k]; const g = s > 0 ? Math.sqrt(Math.max(Math.max(a, 0) ** 2, Math.min(b, 0) ** 2) + Math.max(Math.max(c, 0) ** 2, Math.min(d, 0) ** 2)) : Math.sqrt(Math.max(Math.min(a, 0) ** 2, Math.max(b, 0) ** 2) + Math.max(Math.min(c, 0) ** 2, Math.max(d, 0) ** 2)); R[k] = -s * (g - 1); } for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) A[idx(i, j)] += 0.3 * dx * R[idx(i, j)]; fillLS(A); } };
+  const volLS = (sh) => { let s = 0; for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) s += heav(P[idx(i, j)] + sh); return s * dx * dx; };
+  const R1 = new Float64Array(N), R2 = new Float64Array(N), T = new Float64Array(N), nrm = { nx: new Float64Array(N), ny: new Float64Array(N) };
+  const m0ls = scheme === 'levelset' ? volLS(0) : m0;
+  for (let s = 0; s < steps; s++) {
+    if (scheme === 'levelset' || scheme === 'clsvof') { lsRhs(P, R1); for (let k = 0; k < N; k++) T[k] = P[k] + dt * R1[k]; fillLS(T); lsRhs(T, R2); for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j); P[k] += 0.5 * dt * (R1[k] + R2[k]); } fillLS(P); if ((s + 1) % (o.reinitEvery || 40) === 0) reinit(P, 2); }
+    if (scheme === 'vof' || scheme === 'clsvof') { let nr = null; if (scheme === 'clsvof') { for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j); nrm.nx[k] = P[k + 1] - P[k - 1]; nrm.ny[k] = P[k + sx] - P[k - sx]; } nr = nrm; } vofStep(C, U, V, n, n, dx, dx, dt, s % 2 === 1, nr, fill, periodic, periodic);
+      if (scheme === 'clsvof' && (s + 1) % 4 === 0) { const target = mass(C), v0 = volLS(0), e = 0.2 * dx, slope = (volLS(e) - v0) / e, sh = slope > 1e-9 ? clamp((target - v0) / slope, -dx, dx) : 0; for (let k = 0; k < N; k++) P[k] += sh; } } // the level set is shifted so that it encloses the VOF volume
+    if (scheme === 'phasefield') { // conservative Allen–Cahn: ∂φ/∂t + ∇·(uφ) = ∇·[γ (ε ∇φ − φ(1 − φ) n)], n = ∇φ/|∇φ|
+      const eps = (o.epsCells || 0.75) * dx, gam = umax, sub = Math.max(1, Math.ceil((dt * gam * eps * (o.pfSafety || 8)) / (dx * dx)));
+      for (let q = 0; q < sub; q++) { const h = dt / sub, Fx = R1, Fy = R2;
+        for (let j = 1; j <= n; j++) for (let i = 0; i <= n; i++) { const k = idx(i, j), u = U[i + (n + 1) * j], d = u >= 0 ? k : k + 1, s1 = u >= 0 ? 1 : -1, sl = mm(C[d] - C[d - s1], C[d + s1] - C[d]), cf = C[d] + 0.5 * sl * (1 - (Math.abs(u) * h) / dx), g1 = (C[k + 1] - C[k]) / dx, gy = (C[k + sx] + C[k + 1 + sx] - C[k - sx] - C[k + 1 - sx]) / (4 * dx), mg = Math.hypot(g1, gy) + 1e-12, cm = 0.5 * (C[k] + C[k + 1]); Fx[k] = u * cf - gam * (eps * g1 - cm * (1 - cm) * (g1 / mg)); }
+        for (let j = 0; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j), v = V[k], d = v >= 0 ? k : k + sx, s1 = v >= 0 ? sx : -sx, sl = mm(C[d] - (C[d - s1] ?? C[d]), (C[d + s1] ?? C[d]) - C[d]), cf = C[d] + 0.5 * sl * (1 - (Math.abs(v) * h) / dx), g1 = (C[k + sx] - C[k]) / dx, gx = (C[k + 1] + C[k + 1 + sx] - C[k - 1] - C[k - 1 + sx]) / (4 * dx), mg = Math.hypot(g1, gx) + 1e-12, cm = 0.5 * (C[k] + C[k + sx]); Fy[k] = v * cf - gam * (eps * g1 - cm * (1 - cm) * (g1 / mg)); }
+        if (!periodic) { for (let j = 1; j <= n; j++) { Fx[idx(0, j)] = 0; Fx[idx(n, j)] = 0; } for (let i = 1; i <= n; i++) { Fy[idx(i, 0)] = 0; Fy[idx(i, n)] = 0; } } else { for (let j = 1; j <= n; j++) Fx[idx(0, j)] = Fx[idx(n, j)]; for (let i = 1; i <= n; i++) Fy[idx(i, 0)] = Fy[idx(i, n)]; }
+        for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) { const k = idx(i, j); T[k] = C[k] - (h / dx) * (Fx[k] - Fx[k - 1] + Fy[k] - Fy[k - sx]); } for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) C[idx(i, j)] = T[idx(i, j)]; fill(C); }
+    }
+  }
+  if (scheme === 'levelset') { out = new Float64Array(N); for (let k = 0; k < N; k++) out[k] = heav(P[k]); for (let k = 0; k < N; k++) E[k] = E[k]; }
+  const m1 = scheme === 'levelset' ? volLS(0) : mass(out); let sh = 0; for (let j = 1; j <= n; j++) for (let i = 1; i <= n; i++) sh += Math.abs(out[idx(i, j)] - E[idx(i, j)]);
+  return pack(out, Math.abs(m1 - m0ls) / m0ls, (sh * dx * dx) / m0);
+  function pack(A, massError, shapeError) { const xs = Array.from({ length: n }, (_, i) => xc(i + 1)), z = [], ex = []; for (let j = 1; j <= n; j++) { z.push(Array.from({ length: n }, (_, i) => A[idx(i + 1, j)])); ex.push(Array.from({ length: n }, (_, i) => E[idx(i + 1, j)])); } return { scheme, test, n, x: xs, y: xs, c: z, exact: ex, massError, shapeError, steps }; }
+}
+
+// Preconditioned conjugate gradients (symmetric Gauss–Seidel preconditioner) for the pressure equation −∇·(β ∇p) = b on nx × ny cells.
+// cE[k]: coefficient to the east neighbour, cN[k]: to the north; dg[k]: diagonal (sum of the neighbour coefficients + any Dirichlet part).
+function pcgPoisson(nx, ny, cE, cN, dg, b, p, perX, tol, maxIt, wk) {
+  const n = nx * ny, r = wk.r, z = wk.z, q = wk.q, d = wk.d;
+  const apply = (x, y) => { for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const k = i + nx * j; let s = dg[k] * x[k]; if (i < nx - 1) s -= cE[k] * x[k + 1]; else if (perX) s -= cE[k] * x[k + 1 - nx]; if (i > 0) s -= cE[k - 1] * x[k - 1]; else if (perX) s -= cE[k - 1 + nx] * x[k - 1 + nx]; if (j < ny - 1) s -= cN[k] * x[k + nx]; if (j > 0) s -= cN[k - nx] * x[k - nx]; y[k] = s; } };
+  const prec = (x, y) => { for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const k = i + nx * j; let s = x[k]; if (i > 0) s += cE[k - 1] * y[k - 1]; if (j > 0) s += cN[k - nx] * y[k - nx]; y[k] = s / dg[k]; } for (let k = 0; k < n; k++) y[k] *= dg[k]; for (let j = ny - 1; j >= 0; j--) for (let i = nx - 1; i >= 0; i--) { const k = i + nx * j; let s = y[k]; if (i < nx - 1) s += cE[k] * y[k + 1]; if (j < ny - 1) s += cN[k] * y[k + nx]; y[k] = s / dg[k]; } };
+  apply(p, q); let bn = 0, rz = 0; for (let k = 0; k < n; k++) { r[k] = b[k] - q[k]; bn += b[k] * b[k]; } bn = Math.sqrt(bn) || 1;
+  prec(r, z); for (let k = 0; k < n; k++) { d[k] = z[k]; rz += r[k] * z[k]; }
+  let it = 0, rn = 0;
+  for (; it < maxIt; it++) {
+    rn = 0; for (let k = 0; k < n; k++) rn += r[k] * r[k]; rn = Math.sqrt(rn); if (rn <= tol * bn) break;
+    apply(d, q); let dq = 0; for (let k = 0; k < n; k++) dq += d[k] * q[k]; if (!(Math.abs(dq) > 1e-300)) break; const a = rz / dq;
+    for (let k = 0; k < n; k++) { p[k] += a * d[k]; r[k] -= a * q[k]; }
+    prec(r, z); let rz2 = 0; for (let k = 0; k < n; k++) rz2 += r[k] * z[k]; const be = rz2 / rz; rz = rz2; for (let k = 0; k < n; k++) d[k] = z[k] + be * d[k];
+  }
+  return { iterations: it, residual: rn / bn };
+}
+/**
+ * Incompressible two-dimensional Navier–Stokes solver on a uniform staggered (MAC) grid: explicit momentum predictor (conservative
+ * convection with a central / upwind blend, full viscous stress with variable viscosity), pressure projection with a variable-density
+ * Poisson equation (conjugate gradients), optional second fluid by volume of fluid (THINC/WLIC, see vofStep) and optional Menter SST
+ * k–ω turbulence (2003 constants, ω fixed in the wall-adjacent cells). Walls on all sides, or periodic in x; the top wall may move (lid).
+ * o: { nx, ny, lx, ly, rho, mu (single fluid) | rhoL, rhoG, muL, muG + c0(x, y) (liquid fraction), gx, gy, fx (body force per volume, x), lid (m/s), periodicX,
+ *      turbulence: 'none' | 'sst', tEnd, cfl, dtMax, upwind (0 = central … 1 = first-order upwind), steady (stop when the velocity change per unit time falls below it),
+ *      poissonTol, maxSteps, u0(x, y), v0(x, y), k0, omega0, probeFront (track the liquid front along the bottom) }
+ * Returns { x[], y[], u[][], v[][], p[][], c[][] | null, nut[][] | null, k[][] | null, t, steps, dtMean, divergenceMax, poissonIterations (mean), steadyResidual,
+ *           mass: { initial, final, error } (liquid volume per unit depth), kinetic[] { t, e }, front: { t[], x[] } | null, uMid[] (u on the vertical centre line), vMid[] (v on the horizontal centre line), momentumX: { force, wall } }.
+ */
+export function cfd2d(o = {}) {
+  const nx = o.nx || 32, ny = o.ny || 32, lx = o.lx || 1, ly = o.ly || 1, dx = lx / nx, dy = ly / ny, perX = !!o.periodicX, two = typeof o.c0 === 'function', sst = o.turbulence === 'sst';
+  const rhoL = o.rhoL ?? o.rho ?? 1, rhoG = o.rhoG ?? rhoL, muL = o.muL ?? o.mu ?? 0.01, muG = o.muG ?? muL, gx = o.gx || 0, gy = o.gy || 0, fx = o.fx || 0, lid = o.lid || 0, upw = o.upwind ?? (two ? 0.3 : 0), tEnd = o.tEnd ?? 1, cfl = o.cfl ?? 0.4;
+  const sx = nx + 2, su = nx + 1, NC = sx * (ny + 2), F = (n) => new Float64Array(n), U = F(su * (ny + 2)), V = F(sx * (ny + 1)), Us = F(U.length), Vs = F(V.length), C = F(NC), P = F(nx * ny), RHO = F(NC), MU = F(NC), K = F(NC), W = F(NC), NUT = F(NC);
+  const ci = (i, j) => i + sx * j, ui = (i, j) => i + su * j, xc = (i) => (i - 0.5) * dx, yc = (j) => (j - 0.5) * dy;
+  for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) C[ci(i, j)] = two ? clamp(o.c0(xc(i), yc(j)), 0, 1) : 1;
+  if (o.u0) for (let j = 1; j <= ny; j++) for (let i = 0; i <= nx; i++) U[ui(i, j)] = o.u0(i * dx, yc(j)); if (o.v0) for (let j = 0; j <= ny; j++) for (let i = 1; i <= nx; i++) V[ci(i, j)] = o.v0(xc(i), j * dy);
+  const fillC = (A) => { for (let i = 1; i <= nx; i++) { A[ci(i, 0)] = A[ci(i, 1)]; A[ci(i, ny + 1)] = A[ci(i, ny)]; } for (let j = 0; j <= ny + 1; j++) { A[ci(0, j)] = perX ? A[ci(nx, j)] : A[ci(1, j)]; A[ci(nx + 1, j)] = perX ? A[ci(1, j)] : A[ci(nx, j)]; } };
+  const bcVel = (Ua, Va) => { // no-slip walls by reflection, moving lid, periodic or solid ends
+    if (perX) for (let j = 1; j <= ny; j++) { const m = 0.5 * (Ua[ui(0, j)] + Ua[ui(nx, j)]); Ua[ui(0, j)] = m; Ua[ui(nx, j)] = m; } else for (let j = 1; j <= ny; j++) { Ua[ui(0, j)] = 0; Ua[ui(nx, j)] = 0; }
+    for (let i = 0; i <= nx; i++) { Ua[ui(i, 0)] = -Ua[ui(i, 1)]; Ua[ui(i, ny + 1)] = 2 * lid - Ua[ui(i, ny)]; }
+    for (let i = 1; i <= nx; i++) { Va[ci(i, 0)] = 0; Va[ci(i, ny)] = 0; }
+    for (let j = 0; j <= ny; j++) { Va[ci(0, j)] = perX ? Va[ci(nx, j)] : -Va[ci(1, j)]; Va[ci(nx + 1, j)] = perX ? Va[ci(1, j)] : -Va[ci(nx, j)]; }
+  };
+  const props = () => { for (let k = 0; k < NC; k++) { const c = clamp(C[k], 0, 1); RHO[k] = rhoG + (rhoL - rhoG) * c; MU[k] = muG + (muL - muG) * c + (sst ? RHO[k] * NUT[k] : 0); } };
+  const dist = (i, j) => { let d = Math.min(yc(j), ly - yc(j)); if (!perX) d = Math.min(d, xc(i), lx - xc(i)); return d; };
+  if (sst) for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { K[ci(i, j)] = o.k0 ?? 1e-4; W[ci(i, j)] = o.omega0 ?? 10; }
+  fillC(C); if (sst) { fillC(K); fillC(W); } bcVel(U, V); props();
+  const cE = F(nx * ny), cN = F(nx * ny), dg = F(nx * ny), bb = F(nx * ny), wk = { r: F(nx * ny), z: F(nx * ny), q: F(nx * ny), d: F(nx * ny) }, liquid = () => { let s = 0; for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) s += C[ci(i, j)]; return s * dx * dy; };
+  const m0 = liquid(), kin = [], front = o.probeFront ? { t: [], x: [] } : null; let t = 0, steps = 0, pits = 0, divMax = 0, resid = Infinity, forceI = 0, wallI = 0;
+  const bS = 0.09, a1 = 0.31, sk1 = 0.85, sk2 = 1, sw1 = 0.5, sw2 = 0.856, b1 = 0.075, b2 = 0.0828, g1 = 5 / 9, g2 = 0.44, Kn = F(NC), Wn = F(NC);
+  while (t < tEnd - 1e-12 && steps < (o.maxSteps || 200000)) {
+    let vmax = 1e-9, numax = 0; for (let k = 0; k < U.length; k++) vmax = Math.max(vmax, Math.abs(U[k])); for (let k = 0; k < V.length; k++) vmax = Math.max(vmax, Math.abs(V[k])); for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) numax = Math.max(numax, MU[ci(i, j)] / RHO[ci(i, j)]);
+    const h = Math.min(dx, dy), gmag = Math.hypot(gx, gy) + Math.abs(fx) / Math.min(rhoL, rhoG), dt = Math.min((cfl * h) / vmax, (0.2 * h * h) / Math.max(numax, 1e-30), gmag > 0 ? 0.4 * Math.sqrt(h / gmag) : Infinity, o.dtMax ?? Infinity, tEnd - t);
+    // ---- interface
+    if (two) { vofStep(C, U, V, nx, ny, dx, dy, dt, steps % 2 === 1, null, fillC, perX, false); props(); }
+    // ---- turbulence (explicit convection and diffusion, point-implicit destruction)
+    if (sst) {
+      for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) {
+        const k = ci(i, j), uc = 0.5 * (U[ui(i - 1, j)] + U[ui(i, j)]), vc = 0.5 * (V[ci(i, j - 1)] + V[k]), nu = (muG + (muL - muG) * clamp(C[k], 0, 1)) / RHO[k], d = dist(i, j);
+        const dudx = (U[ui(i, j)] - U[ui(i - 1, j)]) / dx, dvdy = (V[k] - V[ci(i, j - 1)]) / dy, dudy = (U[ui(i, j + 1)] + U[ui(i - 1, j + 1)] - U[ui(i, j - 1)] - U[ui(i - 1, j - 1)]) / (4 * dy), dvdx = (V[ci(i + 1, j)] + V[ci(i + 1, j - 1)] - V[ci(i - 1, j)] - V[ci(i - 1, j - 1)]) / (4 * dx), S2 = 2 * dudx * dudx + 2 * dvdy * dvdy + (dudy + dvdx) ** 2, S = Math.sqrt(S2);
+        const kc = K[k], wc = Math.max(W[k], 1e-12), dkx = (K[k + 1] - K[k - 1]) / (2 * dx), dky = (K[k + sx] - K[k - sx]) / (2 * dy), dwx = (W[k + 1] - W[k - 1]) / (2 * dx), dwy = (W[k + sx] - W[k - sx]) / (2 * dy), cd = (2 * sw2 * (dkx * dwx + dky * dwy)) / wc;
+        const arg1 = Math.min(Math.max(Math.sqrt(kc) / (bS * wc * d), (500 * nu) / (d * d * wc)), (4 * sw2 * kc) / (Math.max(cd, 1e-10) * d * d)), F1 = Math.tanh(arg1 ** 4), arg2 = Math.max((2 * Math.sqrt(kc)) / (bS * wc * d), (500 * nu) / (d * d * wc)), F2 = Math.tanh(arg2 * arg2);
+        const nt = (a1 * kc) / Math.max(a1 * wc, S * F2), Pk = Math.min(nt * S2, 10 * bS * kc * wc), sk = F1 * sk1 + (1 - F1) * sk2, sw = F1 * sw1 + (1 - F1) * sw2, be = F1 * b1 + (1 - F1) * b2, gm = F1 * g1 + (1 - F1) * g2;
+        const adv = (A) => -(uc >= 0 ? (uc * (A[k] - A[k - 1])) / dx : (uc * (A[k + 1] - A[k])) / dx) - (vc >= 0 ? (vc * (A[k] - A[k - sx])) / dy : (vc * (A[k + sx] - A[k])) / dy);
+        const dif = (A, s) => ((nu + s * 0.5 * (NUT[k] + NUT[k + 1])) * (A[k + 1] - A[k]) - (nu + s * 0.5 * (NUT[k] + NUT[k - 1])) * (A[k] - A[k - 1])) / (dx * dx) + ((nu + s * 0.5 * (NUT[k] + NUT[k + sx])) * (A[k + sx] - A[k]) - (nu + s * 0.5 * (NUT[k] + NUT[k - sx])) * (A[k] - A[k - sx])) / (dy * dy);
+        Kn[k] = Math.max((kc + dt * (adv(K) + dif(K, sk) + Pk)) / (1 + dt * bS * wc), 1e-14);
+        const x = (1 - F1) * cd; Wn[k] = Math.max((wc + dt * (adv(W) + dif(W, sw) + (gm * Pk) / Math.max(nt, 1e-12) + Math.max(x, 0))) / (1 + dt * (be * wc + Math.max(-x, 0) / wc)), 1e-10);
+        if (j === 1 || j === ny || (!perX && (i === 1 || i === nx))) Wn[k] = (6 * nu) / (b1 * d * d); // wall-adjacent cells: analytic near-wall ω
+        NUT[k] = (a1 * Kn[k]) / Math.max(a1 * Wn[k], S * F2);
+      }
+      K.set(Kn); W.set(Wn); fillC(K); fillC(W); fillC(NUT);
+      for (let i = 1; i <= nx; i++) { K[ci(i, 0)] = -K[ci(i, 1)]; K[ci(i, ny + 1)] = -K[ci(i, ny)]; } if (!perX) for (let j = 1; j <= ny; j++) { K[ci(0, j)] = -K[ci(1, j)]; K[ci(nx + 1, j)] = -K[ci(nx, j)]; }
+      props();
+    }
+    // ---- momentum predictor
+    const muCorner = (i, j) => 0.25 * (MU[ci(i, j)] + MU[ci(i + 1, j)] + MU[ci(i, j + 1)] + MU[ci(i + 1, j + 1)]);
+    for (let j = 1; j <= ny; j++) for (let i = perX ? 0 : 1; i <= (perX ? nx : nx - 1); i++) {
+      const k = ui(i, j), iw = i === 0 ? nx - 1 : i - 1, ie = i === nx ? 1 : i + 1, cl = i === 0 ? nx : i, cr = i === nx ? 1 : i + 1; // cells left / right of the face (periodic wrap)
+      const uP = U[k], uE = U[ui(ie, j)], uW = U[ui(iw, j)], uN = U[ui(i, j + 1)], uS = U[ui(i, j - 1)], ue = 0.5 * (uP + uE), uw = 0.5 * (uP + uW), vn = 0.5 * (V[ci(cl, j)] + V[ci(cr, j)]), vs = 0.5 * (V[ci(cl, j - 1)] + V[ci(cr, j - 1)]);
+      const fe = ue * (0.5 * (uP + uE) - upw * 0.5 * Math.sign(ue) * (uE - uP)), fw = uw * (0.5 * (uW + uP) - upw * 0.5 * Math.sign(uw) * (uP - uW)), fn = vn * (0.5 * (uP + uN) - upw * 0.5 * Math.sign(vn) * (uN - uP)), fs = vs * (0.5 * (uS + uP) - upw * 0.5 * Math.sign(vs) * (uP - uS));
+      const conv = (fe - fw) / dx + (fn - fs) / dy, rf = 0.5 * (RHO[ci(cl, j)] + RHO[ci(cr, j)]);
+      const txxE = (2 * MU[ci(cr, j)] * (uE - uP)) / dx, txxW = (2 * MU[ci(cl, j)] * (uP - uW)) / dx, mN = muCorner(cl, j), mS = muCorner(cl, j - 1), txyN = mN * ((uN - uP) / dy + (V[ci(cr, j)] - V[ci(cl, j)]) / dx), txyS = mS * ((uP - uS) / dy + (V[ci(cr, j - 1)] - V[ci(cl, j - 1)]) / dx);
+      Us[k] = uP + dt * (-conv + ((txxE - txxW) / dx + (txyN - txyS) / dy + fx) / rf + gx);
+    }
+    for (let j = 1; j <= ny - 1; j++) for (let i = 1; i <= nx; i++) {
+      const k = ci(i, j), vP = V[k], vE = V[k + 1], vW = V[k - 1], vN = V[k + sx], vS = V[k - sx], vnn = 0.5 * (vP + vN), vss = 0.5 * (vP + vS), ue = 0.5 * (U[ui(i, j)] + U[ui(i, j + 1)]), uw = 0.5 * (U[ui(i - 1, j)] + U[ui(i - 1, j + 1)]);
+      const fn = vnn * (0.5 * (vP + vN) - upw * 0.5 * Math.sign(vnn) * (vN - vP)), fs = vss * (0.5 * (vS + vP) - upw * 0.5 * Math.sign(vss) * (vP - vS)), fe = ue * (0.5 * (vP + vE) - upw * 0.5 * Math.sign(ue) * (vE - vP)), fw = uw * (0.5 * (vW + vP) - upw * 0.5 * Math.sign(uw) * (vP - vW));
+      const conv = (fe - fw) / dx + (fn - fs) / dy, rf = 0.5 * (RHO[k] + RHO[k + sx]), tyyN = (2 * MU[k + sx] * (vN - vP)) / dy, tyyS = (2 * MU[k] * (vP - vS)) / dy, mE = muCorner(i, j), mW = muCorner(i - 1, j);
+      const txyE = mE * ((vE - vP) / dx + (U[ui(i, j + 1)] - U[ui(i, j)]) / dy), txyW = mW * ((vP - vW) / dx + (U[ui(i - 1, j + 1)] - U[ui(i - 1, j)]) / dy);
+      Vs[k] = vP + dt * (-conv + ((tyyN - tyyS) / dy + (txyE - txyW) / dx) / rf + gy);
+    }
+    bcVel(Us, Vs);
+    // ---- pressure projection
+    let bsum = 0;
+    for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const k = i - 1 + nx * (j - 1), c = ci(i, j); cE[k] = i < nx || perX ? 1 / (0.5 * (RHO[c] + RHO[ci(i === nx ? 1 : i + 1, j)])) / (dx * dx) : 0; cN[k] = j < ny ? 1 / (0.5 * (RHO[c] + RHO[c + sx])) / (dy * dy) : 0; bb[k] = -((Us[ui(i, j)] - Us[ui(i - 1, j)]) / dx + (Vs[c] - Vs[c - sx]) / dy) / dt; bsum += bb[k]; }
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const k = i + nx * j; dg[k] = cE[k] + (i > 0 ? cE[k - 1] : perX ? cE[k - 1 + nx] : 0) + cN[k] + (j > 0 ? cN[k - nx] : 0); bb[k] -= bsum / (nx * ny); }
+    dg[0] *= 1 + 1e-9; // pins the pressure level without disturbing the solution
+    const ps = pcgPoisson(nx, ny, cE, cN, dg, bb, P, perX, o.poissonTol ?? 1e-8, o.poissonMaxIt ?? 2000, wk); pits += ps.iterations;
+    let dU = 0;
+    for (let j = 1; j <= ny; j++) for (let i = perX ? 0 : 1; i <= (perX ? nx : nx - 1); i++) { const cl = i === 0 ? nx : i, cr = i === nx ? 1 : i + 1, rf = 0.5 * (RHO[ci(cl, j)] + RHO[ci(cr, j)]), un = Us[ui(i, j)] - (dt * (P[cr - 1 + nx * (j - 1)] - P[cl - 1 + nx * (j - 1)])) / (dx * rf); dU = Math.max(dU, Math.abs(un - U[ui(i, j)])); U[ui(i, j)] = un; }
+    for (let j = 1; j <= ny - 1; j++) for (let i = 1; i <= nx; i++) { const k = ci(i, j), rf = 0.5 * (RHO[k] + RHO[k + sx]), vn = Vs[k] - (dt * (P[i - 1 + nx * j] - P[i - 1 + nx * (j - 1)])) / (dy * rf); dU = Math.max(dU, Math.abs(vn - V[k])); V[k] = vn; }
+    bcVel(U, V);
+    t += dt; steps++; resid = dU / dt;
+    if (steps % 10 === 0 || t >= tEnd - 1e-12) { let e = 0, dv = 0; for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const c = ci(i, j), uc = 0.5 * (U[ui(i - 1, j)] + U[ui(i, j)]), vc = 0.5 * (V[c - sx] + V[c]); e += 0.5 * RHO[c] * (uc * uc + vc * vc) * dx * dy; dv = Math.max(dv, Math.abs((U[ui(i, j)] - U[ui(i - 1, j)]) / dx + (V[c] - V[c - sx]) / dy)); } divMax = Math.max(divMax, dv * h / Math.max(vmax, 1e-9)); if (kin.length < 400) kin.push({ t, e });
+      if (front) { let xf = 0; for (let i = 1; i <= nx; i++) if (C[ci(i, 1)] > 0.5) xf = i * dx; front.t.push(t); front.x.push(xf); } }
+    if (fx) { forceI += fx * lx * ly * dt; let w = 0; for (let i = 1; i <= nx; i++) w += (MU[ci(i, 1)] * 2 * U[ui(i, 1)]) / dy * dx + (MU[ci(i, ny)] * 2 * (U[ui(i, ny)] - lid)) / dy * dx; wallI += w * dt; }
+    if (o.steady && resid < o.steady && steps > 20) break;
+    if (!Number.isFinite(resid)) break;
+  }
+  const xs = Array.from({ length: nx }, (_, i) => xc(i + 1)), ys = Array.from({ length: ny }, (_, j) => yc(j + 1)), grid = (f) => ys.map((_, j) => xs.map((__, i) => f(i + 1, j + 1)));
+  const im = Math.round(nx / 2), jm = Math.round(ny / 2), m1 = liquid();
+  return { x: xs, y: ys, u: grid((i, j) => 0.5 * (U[ui(i - 1, j)] + U[ui(i, j)])), v: grid((i, j) => 0.5 * (V[ci(i, j - 1)] + V[ci(i, j)])), p: grid((i, j) => P[i - 1 + nx * (j - 1)]), c: two ? grid((i, j) => C[ci(i, j)]) : null, nut: sst ? grid((i, j) => NUT[ci(i, j)]) : null, k: sst ? grid((i, j) => K[ci(i, j)]) : null,
+    t, steps, dtMean: steps ? t / steps : 0, divergenceMax: divMax, poissonIterations: steps ? pits / steps : 0, steadyResidual: resid, mass: { initial: m0, final: m1, error: two ? (m1 - m0) / Math.max(m0, 1e-300) : 0 }, kinetic: kin, front,
+    uMid: ys.map((_, j) => (nx % 2 === 0 ? U[ui(im, j + 1)] : 0.5 * (U[ui(im, j + 1)] + U[ui(im - 1, j + 1)]))), vMid: xs.map((_, i) => (ny % 2 === 0 ? V[ci(i + 1, jm)] : 0.5 * (V[ci(i + 1, jm)] + V[ci(i + 1, jm - 1)]))), momentumX: { force: forceI, wall: wallI } };
+}
+
+// =====================================================================================================
+// 7g. Baker map, equipment boundary characteristics, branch junction, riser shapes
+// =====================================================================================================
+/**
+ * Baker (1954) horizontal flow-pattern map in Baker's coordinates  B_y = G_g / λ  and  B_x = (G_l / G_g) λ ψ  with
+ * λ = [(ρg/0.075)(ρl/62.3)]^½ and ψ = (73/σ)[μl (62.3/ρl)²]^⅓ (lb/h/ft², lb/ft³, cP, dyn/cm). The six boundary curves are
+ * log-polynomial fits of the chart; the fits and the region logic could not be compared with an openly readable copy (see PROVENANCE):
+ * above C5 bubble/froth, above C3 dispersed, above C1 (and C4 to the right of its minimum) annular, between C2 and C1 wave,
+ * below both: stratified up to the abscissa where C1 and C2 meet, beyond it slug above C6 and plug below.
+ * Returns { regime, Bx, By }.
+ */
+export function bakerRegime(p) {
+  const GL = p.rhoL * p.vsl * 737.338, GG = Math.max(p.rhoG * p.vsg, 1e-12) * 737.338, rl = p.rhoL / 16.01846, rg = p.rhoG / 16.01846, By = (2.16 * GG) / Math.sqrt(rl * rg), Bx = (531 * (GL / GG) * Math.sqrt(rl * rg) * (p.muL * 1000) ** (1 / 3)) / (rl ** (2 / 3) * Math.max(p.sigma, 1e-4) * 1000), x = Math.log(Math.max(Bx, 1e-9));
+  const c1 = Math.exp(9.774459 - 0.6548 * x), c2 = Math.exp(8.67694 - 0.1901 * x), c3 = Math.exp(11.3976 - 0.6084 * x + 0.0779 * x * x), c4 = Math.exp(10.7448 - 1.6265 * x + 0.2839 * x * x), c5 = Math.exp(14.569802 - 1.0173 * x), c6 = Math.exp(7.8206 - 0.2189 * x), xMin = 1.6265 / (2 * 0.2839), x12 = (9.774459 - 8.67694) / (0.6548 - 0.1901);
+  const regime = By > c5 ? 'bubble (froth)' : By > c3 ? 'dispersed' : By > c1 && (x < xMin || By > c4) ? 'annular' : By > c2 && By <= c1 ? 'wave' : x <= x12 ? 'stratified' : By > c6 ? 'slug' : 'plug';
+  return { regime, Bx, By };
+}
+/** Catenary riser profile hanging from the top: horizontal offset x and height z above the touch-down point for a top angle to the vertical (deg). Returns [{ x, z }] from the touch-down point upward. */
+export function catenaryProfile({ height, topAngle = 12, n = 14 }) {
+  const tanT = Math.tan((90 - clamp(topAngle, 1, 80)) * DEG), a = height / (Math.sqrt(1 + tanT * tanT) - 1), xT = a * Math.asinh(tanT); // z = a (cosh(x/a) − 1), slope at the top = tan(90° − top angle)
+  return Array.from({ length: n + 1 }, (_, i) => { const x = (xT * i) / n; return { x, z: a * (Math.cosh(x / a) - 1) }; });
+}
+/**
+ * Hydraulic characteristics imposed at the ends of the line.
+ *  pump (multiphase booster at the inlet):  Δp = Δp₀ s² − (Δp₀ / q_max²) q²   (parabolic head curve, affinity laws in the speed ratio s), q = actual volume rate at suction;
+ *  separator:  the gas leaves through a valve to the compressor suction, p_sep² − p_suc² = K_v q_std² (compressible valve equation), so the separator pressure floats with the gas rate;
+ *  compressor: polytropic head curve H = H₀ s² [1 − (q_s / q_surge-free max)²], p_suc = p_dis / [1 + (n − 1)/n · H M / (Z R T η_p)]^(n/(n−1)).
+ * Returns { pumpDp(q) (bar), sepPressure(qGasStd (Sm³/s), pSet (bara)) (bara), compressor(qSuction (m³/s), pDis (bara), T (K), Z, M (kg/mol)) → { pSuction, head, ratio, power (kW at mdot) } }.
+ */
+export function equipment(e = {}) {
+  const dp0 = e.pumpDp0 || 0, qmx = e.pumpQmax || 1, sp = e.pumpSpeed ?? 1, kv = e.sepKv || 0, h0 = e.compHead || 0, qc = e.compQmax || 1, sc = e.compSpeed ?? 1, npoly = e.compN ?? 1.3, eta = e.compEta ?? 0.78;
+  const pumpDp = (q) => (dp0 > 0 ? Math.max(dp0 * sp * sp - (dp0 / (qmx * qmx)) * q * q, 0) : 0);
+  const compressor = (q, pDis, T = 300, Z = 0.9, M = 0.02, mdot = 0) => { const head = Math.max(h0 * sc * sc * (1 - (q / (qc * sc)) ** 2), 0), ex = (npoly - 1) / npoly, ratio = (1 + (ex * head * M) / (Z * RGAS * T)) ** (1 / ex); return { head, ratio, pSuction: pDis / ratio, power: (mdot * head) / Math.max(eta, 0.05) / 1e3 }; };
+  const sepPressure = (qStd, pSet, pSuc = null) => (kv > 0 ? Math.sqrt((pSuc ?? pSet) ** 2 + kv * qStd * qStd) : pSet);
+  return { pumpDp, compressor, sepPressure, active: dp0 > 0 || kv > 0 || h0 > 0 };
+}
+/**
+ * Steady flow of a main line with one branch joining it (same fluid): the branch delivers the fraction `frac` of the total rate at the junction,
+ * where the pressures are equal and mass and enthalpy are mixed. The main line is marched in two parts on the sub-grids of one uniform grid;
+ * the inlet pressure of the main line is found by shooting on the outlet pressure and that of the branch by shooting on the junction pressure.
+ * base: options of steadySolve (fm, profile, n, id, …, mScale = total rate downstream of the junction, pOut); br: { x (junction distance along the main profile, m), frac, length, dz (elevation gain of the branch), idMm, tIn, U }.
+ * Returns the steadySolve result of the whole main line plus { junction: { s, x, P, tMain, tBranch, tMix, mMain, mBranch, hIn, hOut }, branch: (steadySolve result of the branch) }.
+ */
+export function steadyBranch(base, br) {
+  const full = discretise(base.profile, base.n || 150), N = full.n, jn = clamp(Math.round(interp1(full.x, full.s, clamp(br.x, full.x[1], full.x[N - 1])) / full.ds), 1, N - 1), m = base.mScale ?? 1, f = clamp(br.frac, 0.01, 0.95);
+  const sub = (a, b) => ({ s: full.s.slice(a, b + 1), x: full.x.slice(a, b + 1), z: full.z.slice(a, b + 1), theta: full.theta.slice(a, b), ds: full.ds, length: full.ds * (b - a), n: b - a });
+  const gA = sub(0, jn), gB = sub(jn, N), sJ = full.s[jn], fit = base.fittings || [], kT = base.kTotal || 0, fm = base.fm;
+  const optA = { ...base, grid: gA, pOut: undefined, mScale: m * (1 - f), kTotal: (kT * jn) / N, fittings: fit.filter((q) => q.s < sJ), hydrate: base.hydrate }, optB = { ...base, grid: gB, pOut: undefined, mScale: m, kTotal: (kT * (N - jn)) / N, fittings: fit.filter((q) => q.s >= sJ).map((q) => ({ ...q, s: q.s - sJ })) };
+  // sub-grid of part B keeps absolute arc length for the property functions but the fittings are placed relative to its first node
+  const idB = (br.idMm || 0) / 1000 || base.id, brOpt = { fm, profile: { x: [0, Math.max(br.length, 10)], z: [full.z[jn] - (br.dz || 0), full.z[jn]] }, n: Math.max(12, Math.round((base.n || 150) / 6)), id: idB, rough: base.rough, tIn: br.tIn ?? base.tIn, model: base.model, fModel: base.fModel, mp: base.mp, energy: base.energy, U: br.U ?? base.U ?? 3, tAmbOf: base.tAmbOf, mScale: m * f, hydrate: false, tolP: 1e-5 };
+  let A, Bq, Br, mix, pj = null;
+  const eval1 = (pIn) => {
+    A = steadySolve({ ...optA, pIn }); if (!A.ok) return -1e3;
+    Br = steadySolve({ ...brOpt, pOut: A.pOut, pGuess: Br && Br.ok ? Br.pIn : A.pOut + 2 }); if (!Br.ok) return -1e3;
+    const hA = enthalpyFlow(fm.at(A.pOut, A.tOut, m * (1 - f))), hB = enthalpyFlow(fm.at(A.pOut, Br.tOut, m * f)), hT = hA + hB, lo = Math.min(A.tOut, Br.tOut) - 2, hi = Math.max(A.tOut, Br.tOut) + 2, g = (T) => enthalpyFlow(fm.at(A.pOut, T, m)) - hT;
+    const tMix = Number.isFinite(hT) && g(lo) * g(hi) < 0 ? brent(g, lo, hi, 1e-8) : (1 - f) * A.tOut + f * Br.tOut; mix = { tMix, hIn: hT, hOut: enthalpyFlow(fm.at(A.pOut, tMix, m)) };
+    Bq = steadySolve({ ...optB, pIn: A.pOut, tIn: tMix }); pj = A.pOut;
+    return Bq.ok ? Bq.pOut - base.pOut : -1e3 - (gB.n - (Bq.reached || 0));
+  };
+  let lo = Math.max(base.pOut, 1.5), hi = lo + 20, fh = eval1(hi), g = 0; while (fh < 0 && hi < 1400 && g++ < 40) { lo = hi; hi = hi * 1.35 + 10; fh = eval1(hi); }
+  if (fh < 0) return { ok: false, reason: 'No inlet pressure below 1,400 bara can deliver the combined rate through the junction.' };
+  const pIn = brent(eval1, lo, hi, base.tolP ? Math.max(base.tolP, 1e-6) : 1e-6); eval1(pIn);
+  if (!A.ok || !Bq.ok) return { ok: false, reason: 'The junction solution did not converge.' };
+  const out = { ...Bq, ok: true, grid: full, n: N, ds: full.ds, length: full.length, s: full.s, x: full.x, z: full.z, pIn: A.pIn, tIn: A.tIn, pOut: Bq.pOut, tOut: Bq.tOut, mdot: Bq.mdot, marches: (A.marches || 0) + (Bq.marches || 0) };
+  for (const k of Object.keys(A)) if (Array.isArray(A[k]) && A[k].length === gA.n + 1 && Array.isArray(Bq[k]) && Bq[k].length === gB.n + 1 && !['s', 'x', 'z'].includes(k)) out[k] = (['P', 'T', 'tHyd', 'subcooling', 'tWall'].includes(k) ? A[k].slice(0, gA.n) : A[k].slice(0, gA.n)).concat(Bq[k]);
+  for (const k of ['liquidInventory', 'volume', 'dpFric', 'dpGrav', 'dpAcc', 'dpLocal', 'heatLoss', 'residence', 'residenceLiquid']) out[k] = A[k] + Bq[k];
+  out.energy = { hIn: A.energy.hIn + (mix.hIn - enthalpyFlow(fm.at(pj, A.tOut, m * (1 - f)))), hOut: Bq.energy.hOut, potential: A.energy.potential + Bq.energy.potential, kinetic: A.energy.kinetic + Bq.energy.kinetic, residual: Math.max(A.energy.residual, Bq.energy.residual), mixing: mix.hIn - mix.hOut };
+  out.junction = { s: sJ, x: full.x[jn], index: jn, P: pj, tMain: A.tOut, tBranch: Br.tOut, tMix: mix.tMix, mMain: A.mdot, mBranch: Br.mdot, mOut: Bq.mdot, hIn: mix.hIn, hOut: mix.hOut, pBranchIn: Br.pIn, pStepError: Math.abs(Bq.P[0] - A.pOut) };
+  out.branch = { pIn: Br.pIn, tIn: Br.tIn, tOut: Br.tOut, dp: Br.pIn - Br.pOut, holdup: Br.liquidInventory / Br.volume, mdot: Br.mdot, length: brOpt.profile.x[1], id: idB };
+  return out;
+}
+// closure parameters of the three-field annular model from the suite inputs
+const annularParams = (v = {}) => ({ kDep: num(v.kDep, 0.15, 1e-4, 10), entMult: num(v.entMult, 1, 0.01, 20), weCrit: num(v.weCrit, 12, 0.5, 100), dropMult: 1, fiMult: num(v.fiAnnMult, 1, 0.05, 20) });
+/**
+ * Critical superficial liquid velocity at which stratified flow becomes unstable (Taitel & Dukler Kelvin–Helmholtz criterion on the
+ * equilibrium level of the stratified balance with the friction multipliers o.fiMult, o.fwlMult, o.fwgMult); o.transMult scales the critical gas velocity.
+ * Returns { vslCrit, hD, ratio (gas velocity / critical gas velocity at the given vsl), tauI, level (h/D at the given vsl) }.
+ */
+export function stratifiedTransition(p, o = {}) {
+  const tm = o.transMult || 1, at = (vsl) => { const q = { ...p, vsl }, roots = stratifiedRoots(q, { ...o, n: 50 }), hD = roots[0], b = stratifiedBalance(hD, q, o), g = b.g, crit = tm * (1 - hD) * Math.sqrt((Math.max(p.rhoL - p.rhoG, 1e-6) * G * Math.max(Math.cos(p.theta || 0), 0.02) * g.AG) / (p.rhoG * Math.max(g.Si, 1e-9))); return { hD, ratio: b.vG / crit, tauI: b.ti, tauWL: b.tL, tauWG: b.tG }; };
+  const here = at(p.vsl); let lo = 1e-4, hi = 20;
+  if (at(hi).ratio < 1) return { vslCrit: hi, ...here, level: here.hD }; if (at(lo).ratio > 1) return { vslCrit: lo, ...here, level: here.hD };
+  for (let k = 0; k < 40; k++) { const m = Math.sqrt(lo * hi); if (at(m).ratio < 1) lo = m; else hi = m; }
+  return { vslCrit: Math.sqrt(lo * hi), ...here, level: here.hD };
+}
+/** Mixed liquid of an oil–water stream for point comparisons: volume-weighted density, viscosity of the dispersion (continuous phase × (1 − φ)^(−2.5 μ*), Ishii–Zuber form) with inversion at 50 % water. */
+export function liquidMixture({ rhoO, rhoW, muO, muW, wc }) {
+  const w = clamp(wc, 0, 1), rho = rhoO * (1 - w) + rhoW * w, waterCont = w >= 0.5, phi = Math.min(waterCont ? 1 - w : w, 0.74), muC = waterCont ? muW : muO, muD = waterCont ? muO : muW, mStar = (muD + 0.4 * muC) / (muD + muC);
+  return { rho, mu: muC * (1 - phi) ** (-2.5 * mStar), waterCont };
+}
+
+// =====================================================================================================
+// 7h. Point and system comparisons with measurements, extra results of a run, dedicated solver tasks
+// =====================================================================================================
+const CLASS6 = { 'stratified smooth': 'SS', 'stratified wavy': 'SW', slug: 'I', churn: 'I', annular: 'A', 'dispersed bubble': 'DB', bubble: 'B' };
+/** Observed-pattern class (file labels of the open flow-pattern data bases: SS, SW, I, A, DB, B) predicted by the mechanistic map for one point. */
+export const patternClass = (p) => CLASS6[flowPattern({ sigma: 0.02, theta: 0, ...p }).pattern] || '?';
+/**
+ * Model prediction for one measured local quantity. kind: 'holdup' | 'dpdx' (Pa/m, total, positive when the pressure falls) | 'slugFreq' (1/s) | 'slugLength' (m) |
+ * 'slugVelocity' (m/s) | 'bodyHoldup' | 'filmThickness' (mm) | 'level' (h/D of stratified flow) | 'entrainment' | 'regime' (returns the pattern name).
+ * pt: { D (m), angle (deg), vsl, vsg, rhoL, rhoG, muL, muG (Pa s), sigma (N/m), wc (% water in the liquid, optional, with rhoW, muW) }.
+ */
+export function predictPoint(kind, pt, model = 'beggsBrill', so = {}, mp = {}) {
+  let rhoL = pt.rhoL, muL = pt.muL, waterCont = false;
+  if (pt.wc > 0 && pt.rhoW > 0) { const m = liquidMixture({ rhoO: pt.rhoL, rhoW: pt.rhoW, muO: pt.muL, muW: pt.muW || 1e-3, wc: pt.wc / 100 }); rhoL = m.rho; muL = m.mu; waterCont = m.waterCont; }
+  const p = { vsl: pt.vsl, vsg: pt.vsg, rhoL, rhoG: pt.rhoG, muL, muG: pt.muG || 1.8e-5, sigma: pt.sigma || 0.03, D: pt.D, theta: (pt.angle || 0) * DEG, rough: pt.rough ?? 0, P: pt.P || 1e5, fModel: 'colebrook', waterCont };
+  if (kind === 'regime') return flowPattern(p).pattern;
+  if (kind === 'holdup' || kind === 'dpdx') { const r = holdupGradient({ ...p, label: false }, model, mp); return kind === 'holdup' ? r.holdup : r.dpdx; }
+  if (kind === 'level') return stratifiedRoots(p, so)[0];
+  if (kind === 'entrainment') return annularMist(p, mp.annular || {}).entEq;
+  const u = slugUnitCell(p, so);
+  return kind === 'slugFreq' ? u.freq : kind === 'slugLength' ? u.lengthFromFreq : kind === 'slugVelocity' ? u.vt : kind === 'bodyHoldup' ? u.holdupSlug : kind === 'filmThickness' ? u.filmThickness * 1000 : NaN;
+}
+const errStats = (meas, pred) => { const n = meas.length; if (!n) return null; let ape = 0, b = 0, se = 0; for (let i = 0; i < n; i++) { const e = pred[i] - meas[i]; ape += Math.abs(e) / Math.max(Math.abs(meas[i]), 1e-12); b += e; se += e * e; } return { n, mape: (100 * ape) / n, bias: b / n, rmse: Math.sqrt(se / n) }; };
+
+/** Results that every run adds after the line solution: closure detail, regime maps, tracer transport, equipment and junction, comparisons with user measurements. */
+function runExtras(v, ctx, R) {
+  const { st, cfg, fm, reg, units, im, cm, slug, tr, cyc, sev, cool, plots, tables, balances, warnings } = R, N = st.n, out = {}, kpis = [], so = slugOpts(v), xKm = st.x.map((x) => x / 1000);
+  // ---- regime maps and closure detail at the map location
+  if (cm.vsl > 1e-9 && cm.vsg > 1e-9) {
+    const bk = bakerRegime(cm), pc = { ...cm, rough: cfg.rough, P: st.P[im] * 1e5, fModel: cfg.fModel }, sT = stratifiedTransition(cm, { fiMult: num(v.fiMult, 1, 0.05, 20), fwlMult: num(v.fwlMult, 1, 0.05, 20), fwgMult: num(v.fwgMult, 1, 0.05, 20), transMult: num(v.transMult, 1, 0.2, 5) }), vn = velocityNumbers(cm);
+    const rows = [['Taitel–Dukler / Barnea (mechanistic)', reg[im], ''], ['Mandhane, Gregory & Aziz map', mandhaneRegime(cm.vsl, cm.vsg), 'air–water coordinates'], ['Baker map', bk.regime, `Bx = ${sig(bk.Bx, 3)}, By = ${sig(bk.By, 3)}`], ['Beggs & Brill horizontal pattern', gradient({ ...pc, theta: 0, label: false }).regime, 'correlation regime'],
+      ['Stratified → non-stratified: critical vsl', r3(sT.vslCrit, 4), `m/s (now ${r3(cm.vsl, 3)}; gas velocity / critical ${r3(sT.ratio, 2)})`], ['Equilibrium stratified level h/D', r3(sT.level, 3), `τ interface ${r3(sT.tauI, 2)} Pa, τ liquid wall ${r3(sT.tauWL, 2)} Pa, τ gas wall ${r3(sT.tauWG, 3)} Pa`],
+      ['Velocity numbers N_Lv / N_Gv / N_D / N_L', `${sig(vn.NLv, 3)} / ${sig(vn.NGv, 3)} / ${sig(vn.ND, 3)} / ${sig(vn.NL, 3)}`, 'Duns & Ros groups']];
+    if (cm.theta > 0.05) rows.push(['Ansari et al. pattern (upward)', ansariPattern(pc), ''], ['Duns & Ros region (upward)', dunsRos(pc).regime, '']);
+    tables.push({ title: `Flow-pattern maps and transition criteria at ${Math.round(st.x[im])} m`, columns: ['Map / criterion', 'Result', 'Note'], rows, note: 'The Baker boundaries are chart fits that could not be checked against an open copy; use the mechanistic map for design.' });
+    out.baker = bk.regime; out.stratified = { vslCrit: sT.vslCrit, level: sT.level, tauI: sT.tauI };
+  }
+  // ---- annular-flow closure with entrainment and deposition where the gas velocity is highest
+  { let ia = 0; for (let i = 1; i < N; i++) if (st.vsg[i] > st.vsg[ia]) ia = i;
+    if (st.vsl[ia] > 1e-9 && st.vsg[ia] > 1e-9) { const p = { ...cellOf(st, ia), rough: cfg.rough, P: st.P[ia] * 1e5, fModel: cfg.fModel }, a = annularMist(p, cfg.mp.annular), dev = annularDevelopment({ p, mp: cfg.mp.annular, length: 6 * a.relaxLength, n: 30, e0: 0 });
+      tables.push({ title: `Annular-flow closure (gas core, droplets, wall film) at ${Math.round(st.x[ia])} m`, columns: ['Quantity', 'Value', 'Unit'], rows: [['Flow pattern there (mechanistic map)', reg[ia], ''], ['Equilibrium entrained fraction', r3(a.entEq, 4), '–'], ['Film thickness', r3(a.filmThickness * 1000, 3), 'mm'], ['Film velocity', r3(a.filmVelocity, 3), 'm/s'], ['Core velocity', r3(a.coreVelocity, 2), 'm/s'], ['Interfacial / wall shear', `${sig(a.tauI, 3)} / ${sig(a.tauW, 3)}`, 'Pa'], ['Droplet size (critical Weber number)', r3(a.dropSize * 1e6, 0), 'µm'], ['Deposition = entrainment rate at equilibrium', sig(a.rateDep, 3), 'kg/m²/s'], ['Development length (1/e)', r3(a.relaxLength, 1), 'm'], ['Holdup: film + droplets', `${sig(a.holdupFilm, 3)} + ${sig(a.holdupDrops, 3)}`, '–'], ['Pressure gradient', r3(a.fric + a.grav + a.acc, 1), 'Pa/m']], note: 'Evaluated with the three-field model whatever the predicted pattern; it enters the line solution when the holdup model “Mechanistic + three-field annular flow” is selected and the cell is annular.' });
+      balances.push({ name: 'Annular three-field liquid (kg/s): film + droplets at the end of the development length vs liquid in', in: dev.balance.liquidIn, out: dev.film[dev.film.length - 1] + dev.drops[dev.drops.length - 1] });
+      out.annular = { x: st.x[ia], entrainment: a.entEq, filmThickness: a.filmThickness, dropSize: a.dropSize, relaxLength: a.relaxLength, rateDep: a.rateDep }; } }
+  // ---- outside film: forced and free convection at the coldest-margin location
+  { let ic = 0; for (let i = 1; i <= N; i++) if (st.subcooling[i] > st.subcooling[ic]) ic = i; const k = Math.min(ic, N - 1), c = { s: st.s[k], z: st.z[k], D: st.D[k], pr: fm.at(st.P[ic], st.T[ic], st.mScale), vm: st.vm[k], holdup: st.holdup[k], ta: st.tAmb[k], T: st.T[ic] }, net = cfg.network(c), hF = cfg.hOutOf(c, 0);
+    if (!cfg.buriedAt(c.s)) { tables.push({ title: `Outside film at ${Math.round(st.x[ic])} m: forced and free convection`, columns: ['Quantity', 'Value', 'Unit'], rows: [['Forced convection (Churchill–Bernstein)', r3(hF, 1), 'W/m²K'], ['Surface temperature above ambient', r3(fin(net.dTsurface, 0), 3), 'K'], ['Combined with free convection (Churchill–Chu)', r3(fin(net.hOut, hF), 1), 'W/m²K'], ['Layer-based U-value with the combined film', r3(net.U, 3), 'W/m²K on ID']], note: cfg.uMode === 'layers' ? 'Used in the line solution (U-value from films, wall, insulation and burial).' : 'Shown for information: the line solution uses the given U-value.' }); out.outsideFilm = { forced: hF, combined: fin(net.hOut, hF), dTsurface: fin(net.dTsurface, 0) }; } }
+  // ---- species transport with the liquid: arrival of an inlet step (inhibitor, tracer, water-cut change)
+  if (v.tracer !== false && st.qL.every((q) => q > 1e-9)) {
+    const ut = Math.sqrt(mean(st.tauW.slice(0, N)) / Math.max(mean(st.rhoL), 1)), Dd = num(v.dispersion, 0, 0, 1e4) || 10.1 * (st.D[0] / 2) * Math.max(ut, 1e-3), A = st.D.map((d) => (PI * d * d) / 4), tRes = st.residenceLiquid, sp = speciesTransport({ s: st.s, qL: st.qL, holdup: st.holdup.map((h) => Math.max(h, 0.01)), area: A, D: Dd, cIn: 1, tEnd: 1.6 * tRes, nSeries: 160, cfl: 0.9 });
+    plots.push({ type: 'line', title: 'Arrival of an inlet step carried by the liquid (species transport)', xlabel: 'Time (h)', ylabel: 'Outlet concentration / inlet', ymin: 0, series: [{ name: 'Outlet', x: sp.t.map((t) => t / 3600), y: sp.cOut }], vlines: [{ x: tRes / 3600, label: 'Liquid residence time' }], note: `Advection with the local liquid velocity and axial dispersion ${sig(Dd, 3)} m²/s (Taylor estimate 10.1 R u* unless given); breakthrough (50 %) after ${sp.breakthrough !== null ? (sp.breakthrough / 3600).toFixed(2) + ' h' : 'more than the simulated time'}.` });
+    balances.push({ name: 'Species transport: injected vs stored + produced (relative to the injected amount)', in: 1, out: 1 + sp.balance.error }); out.tracer = { breakthrough: sp.breakthrough !== null ? sp.breakthrough / 3600 : null, dispersion: Dd };
+  }
+  // ---- equipment characteristics and the branch junction
+  { const rows = [], q0 = st.qG[0] + st.qL[0], dpP = cfg.equip.pumpDp(q0);
+    if (dpP > 0) { rows.push(['Booster pump: suction volume rate', r3(q0 * 3600, 1), 'm³/h'], ['Booster pump: pressure rise from its curve', r3(dpP, 2), 'bar'], ['Pressure needed upstream of the pump', r3(st.pIn - dpP, 2), 'bara'], ['Booster pump: hydraulic power', r3((q0 * dpP * 1e5) / 1e3, 1), 'kW']); out.pump = { dp: dpP, suctionPressure: st.pIn - dpP, power: (q0 * dpP * 1e5) / 1e3 }; }
+    if (cfg.sepMode === 'valve' && cfg.compressor) { const c = cfg.compressor; rows.push(['Separator: gas rate at standard conditions', r3(c.qStd, 3), 'Sm³/s'], ['Compressor: suction pressure from its curve', r3(c.pSuction, 2), 'bara'], ['Compressor: pressure ratio / polytropic head', `${r3(c.ratio, 2)} / ${r3(c.head / 1e3, 1)}`, '– / kJ/kg'], ['Compressor: shaft power', r3(c.power, 0), 'kW'], ['Separator pressure imposed by the gas valve and the compressor', r3(fin(cfg.pOutEff, cfg.pOut), 2), 'bara']); out.separator = { pressure: fin(cfg.pOutEff, cfg.pOut), compressorPower: c.power, suction: c.pSuction }; }
+    if (st.junction) { const j = st.junction; rows.push(['Junction position', r3(j.x, 0), 'm'], ['Junction pressure', r3(j.P, 2), 'bara'], ['Main-line / branch arrival temperature', `${j.tMain.toFixed(2)} / ${j.tBranch.toFixed(2)}`, '°C'], ['Mixed temperature', r3(j.tMix, 2), '°C'], ['Main-line / branch mass rate', `${j.mMain.toFixed(2)} / ${j.mBranch.toFixed(2)}`, 'kg/s'], ['Branch inlet pressure', r3(j.pBranchIn, 2), 'bara']);
+      balances.push({ name: 'Junction mass (kg/s): main + branch vs downstream', in: j.mMain + j.mBranch, out: j.mOut }, { name: 'Junction energy (kW): enthalpy of main + branch vs mixed stream', in: j.hIn / 1e3, out: j.hOut / 1e3 }); out.junction = { x: j.x, P: j.P, tMix: j.tMix, mBranch: j.mBranch, pBranchIn: j.pBranchIn }; }
+    if (rows.length) tables.push({ title: 'Equipment characteristics and junction', columns: ['Quantity', 'Value', 'Unit'], rows, note: 'Pump: parabolic head curve with the affinity laws; separator: gas-outlet valve to the compressor suction; compressor: polytropic head curve; junction: equal pressure, mass and enthalpy mixing.' }); }
+  // ---- comparisons with user measurements (validation path for any configuration)
+  { const KINDS = ['holdup', 'dpdx', 'slugFreq', 'slugLength', 'slugVelocity', 'bodyHoldup', 'filmThickness', 'level', 'entrainment', 'regime'], pts = (Array.isArray(v.valPoints) ? v.valPoints : []).filter((r) => r && KINDS.includes(String(r.kind || '').trim()) && +r.D > 0 && (+r.vsl > 0 || +r.vsg > 0));
+    if (pts.length) { const rows = [], by = {}; for (const r of pts) { const kind = String(r.kind).trim(), pt = { D: +r.D / 1000, angle: fin(+r.angle, 0), vsl: Math.max(+r.vsl || 0, 1e-9), vsg: Math.max(+r.vsg || 0, 1e-9), rhoL: fin(+r.rhoL, 850), rhoG: fin(+r.rhoG, 50), muL: fin(+r.muL, 1) / 1000, muG: fin(+r.muG, 0.015) / 1000, sigma: fin(+r.sigma, 20) / 1000, wc: fin(+r.wc, 0), rhoW: 1020, muW: 1e-3, P: fin(+r.P, 1) * 1e5 }; let pred; try { pred = predictPoint(kind, pt, cfg.model, so, cfg.mp); } catch { pred = NaN; }
+        if (kind === 'regime') { rows.push([kind, r3(pt.D * 1000, 1), pt.angle, pt.vsl, pt.vsg, String(r.measured ?? ''), pred, pred === String(r.measured ?? '').trim() ? 'match' : 'differs']); (by.regime ||= { m: [], p: [] }).m.push(1); by.regime.p.push(pred === String(r.measured ?? '').trim() ? 1 : 0); }
+        else if (Number.isFinite(+r.measured) && Number.isFinite(pred)) { rows.push([kind, r3(pt.D * 1000, 1), pt.angle, pt.vsl, pt.vsg, sig(+r.measured, 5), sig(pred, 5), r3((100 * (pred - +r.measured)) / Math.max(Math.abs(+r.measured), 1e-12), 1) + ' %']); (by[kind] ||= { m: [], p: [] }).m.push(+r.measured); by[kind].p.push(pred); } }
+      tables.push({ title: 'Local measurements against the model', columns: ['Quantity', 'D (mm)', 'Angle (°)', 'vsl (m/s)', 'vsg (m/s)', 'Measured', 'Predicted', 'Deviation'], rows, note: Object.entries(by).map(([k, q]) => { const e = errStats(q.m, q.p); return `${k}: n = ${e.n}, ${k === 'regime' ? 'agreement ' + (100 * mean(q.p)).toFixed(0) + ' %' : 'MAPE ' + e.mape.toFixed(1) + ' %, bias ' + sig(e.bias, 3)}`; }).join(' · ') });
+      const num2 = Object.entries(by).filter(([k]) => k !== 'regime'); if (num2.length) plots.push({ type: 'line', title: 'Local measurements: predicted against measured', xlabel: 'Measured', ylabel: 'Predicted', logx: true, logy: true, series: [...num2.map(([k, q]) => ({ name: k, x: q.m.map((x) => Math.max(x, 1e-9)), y: q.p.map((x) => Math.max(x, 1e-9)), mode: 'points' })), { name: 'Parity', x: [1e-3, 1e4], y: [1e-3, 1e4], dash: true }] });
+      out.pointComparison = Object.fromEntries(Object.entries(by).map(([k, q]) => [k, errStats(q.m, q.p)])); }
+    const QS = { pIn: [st.pIn, 'bara'], pOut: [st.pOut, 'bara'], dp: [st.pIn - st.pOut, 'bar'], tOut: [st.tOut, '°C'], inventory: [st.liquidInventory, 'm³'], holdupMean: [st.liquidInventory / st.volume, '–'], heatLoss: [st.heatLoss / 1e3, 'kW'], slugPeriod: [slug.period, 's'], slugFrequency: [slug.freq, '1/s'], slugLength: [slug.length, 'm'], slugLengthMax: [slug.lengthMax, 'm'], slugVelocity: [slug.velocity, 'm/s'], bodyHoldup: [slug.holdupBody, '–'], surge: [slug.surge, 'm³'], catcherLoad: [1.25 * fin(slug.surge, 0), 'm³'], pAmplitude: [R.pAmp, 'bar'], severePeriod: [cyc && cyc.period ? cyc.period : null, 's'], severeAmplitude: [cyc ? cyc.amplitude / 1e5 : null, 'bar'], cooldown: [cool.tReach !== null ? cool.tReach / 3600 : null, 'h'], terrainVolume: [R.terrain.worst ? R.terrain.worst.volume : null, 'm³'], boe: [sev ? sev.boe : null, '–'], tracerArrival: [out.tracer ? out.tracer.breakthrough : null, 'h'] };
+    const sys = (Array.isArray(v.valSystem) ? v.valSystem : []).filter((r) => r && QS[String(r.quantity || '').trim()] && Number.isFinite(+r.measured));
+    if (sys.length) { const rows = sys.map((r) => { const [val, unit] = QS[String(r.quantity).trim()]; return [String(r.quantity).trim(), sig(+r.measured, 5), val === null || !Number.isFinite(val) ? '—' : sig(val, 5), unit, val === null || !Number.isFinite(val) ? '—' : r3((100 * (val - +r.measured)) / Math.max(Math.abs(+r.measured), 1e-12), 1) + ' %']; }); tables.push({ title: 'System measurements against this run', columns: ['Quantity', 'Measured', 'Predicted', 'Unit', 'Deviation'], rows, note: 'Quantities: ' + Object.keys(QS).join(', ') + '.' }); out.systemComparison = rows.length; }
+  }
+  return { outputs: out, kpis };
+}
+
+/** Dedicated solver tasks (run on request): two-fluid slug capturing, 2-D CFD, bubbly-flow closures, benchmark set. */
+async function runTask(task, v, ctx, R) {
+  const { st, cfg, cm, im, units, plots, tables, balances, warnings } = R, tick = typeof ctx.tick === 'function' ? ctx.tick : async () => {}, prog = typeof ctx.progress === 'function' ? ctx.progress : () => {}, out = {}, kpis = [];
+  if (task === 'twofluid') {
+    prog(0.86, 'Two-fluid model: slug capturing');
+    const D = clamp(num(v.tfDiameterMm, 0, 0, 2000) / 1000 || cm.D, 0.02, 1.5), L = num(v.tfLengthD, 200, 20, 5000) * D, n = Math.round(num(v.tfCells, 240, 40, 4000)), tEnd = num(v.tfTime, 20, 0.5, 600), Rs = (cm.zG ?? 0.9) * RGAS / ((R.mwG || 20) * 1e-3), T = st.T[im] + 273.15, p0 = (num(v.tfPbar, 0, 0, 1000) || st.P[im]) * 1e5, rhoG = p0 / (Rs * T);
+    const p = { ...cm, D, rhoG, vsl: num(v.tfVsl, 0, 0, 20) || cm.vsl, vsg: num(v.tfVsg, 0, 0, 100) || cm.vsg, theta: clamp(cm.theta, -0.1, 0.1) }, eq = stratifiedLevel(p), a0 = clamp(eq.holdup, 0.02, 0.9), stab = interfacialStability(p), reg = stab.ikhRatio > 0.9; // beyond the inviscid limit the equations are regularised with the interfacial-pressure term
+    const r = twoFluid({ n, length: L, D, theta: p.theta, interfacialPressure: reg ? 1.2 : 0, rhoL: cm.rhoL, muL: cm.muL, muG: cm.muG, Rs, T, pOut: p0, init: () => ({ al: a0, ul: eq.vL, ug: eq.vG, p: p0 }), inlet: (t) => ({ al: a0 * (1 + 0.02 * Math.sin((2 * PI * t) / 0.7) + 0.02 * Math.sin((2 * PI * t) / 1.9)), ul: eq.vL, ug: eq.vG }), tEnd, cfl: num(v.tfCfl, 0.4, 0.05, 0.9), dtMax: tEnd / 400, probes: [0.5 * L, 0.75 * L, 0.9 * L], nSeries: 600, nField: 60 });
+    await tick();
+    const late = (k) => r.slugs.filter((q) => q.probe === k && q.t > 0.3 * tEnd), s2 = late(2), fq = s2.length / (0.7 * tEnd), a = r.series.probes[1], b = r.series.probes[2], i0 = Math.floor(a.length * 0.3), dts = r.series.t[r.series.t.length - 1] / Math.max(r.series.t.length - 1, 1), ma = mean(a.slice(i0)), mb = mean(b.slice(i0));
+    let best = 0, bl = 0; for (let lag = 1; lag < Math.min(300, a.length - i0 - 2); lag++) { let c = 0; for (let i = i0; i + lag < a.length; i++) c += (a[i] - ma) * (b[i + lag] - mb); if (c > best) { best = c; bl = lag; } }
+    const swing = Math.max(...b.slice(i0)) - Math.min(...b.slice(i0)), vWave = bl > 0 && swing > 0.05 ? (0.15 * L) / (bl * dts) : null, // no velocity is reported when no waves pass the probes
+      uc = slugUnitCell({ ...p, sigma: cm.sigma }, { ...slugOpts(v), freqModel: 'zabaras' });
+    plots.push({ type: 'field', title: 'Two-fluid model: liquid holdup on the test section (slug capturing)', xlabel: 'Distance (m)', ylabel: 'Time (s)', zlabel: 'Holdup', zunit: '–', x: r.field.x, y: r.field.t, z: r.field.al, zmin: 0, zmax: 1, cmap: 'viridis' });
+    plots.push({ type: 'line', title: 'Two-fluid model: holdup at the probes', xlabel: 'Time (s)', ylabel: 'Liquid holdup', ymin: 0, ymax: 1.02, series: [0.5, 0.75, 0.9].map((f, k) => ({ name: `x = ${(f * L).toFixed(1)} m`, x: r.series.t, y: r.series.probes[k] })), hlines: [{ y: 0.95, label: 'Liquid bridge' }] });
+    tables.push({ title: 'Two-fluid slug capturing', columns: ['Quantity', 'Value', 'Unit'], rows: [['Test section: length / diameter / cells', `${L.toFixed(1)} / ${(D * 1000).toFixed(0)} mm / ${n}`, 'm'], ['Cell size', r3(L / n / D, 2), 'diameters'], ['Initial stratified holdup (equilibrium)', r3(a0, 3), '–'], ['Viscous Kelvin–Helmholtz ratio of the initial state', r3(stab.vkhRatio, 2), '> 1 = waves grow'], ['Inviscid Kelvin–Helmholtz ratio', r3(stab.ikhRatio, 2), reg ? '> 0.9: interfacial-pressure regularisation (δ = 1.2) switched on' : '> 1 = ill-posed without regularisation'], ['Superficial velocities liquid / gas, pressure', `${r3(p.vsl, 3)} / ${r3(p.vsg, 3)} m/s, ${r3(p0 / 1e5, 2)} bara`, ''], ['Time steps / mean step', `${r.steps} / ${sig(r.dtMean, 3)} s`, ''], ['Holdup swing at the last probe', r3(swing, 3), swing > 0.05 ? '–' : '– (the stratified state stays smooth)'], ['Slugs passing the last probe (after 30 % of the time)', s2.length, '–'], ['Captured slug frequency', r3(fq, 3), '1/s'], ['Unit-cell frequency (correlation)', r3(uc.freq, 3), '1/s'], ['Captured front / wave velocity (probe cross-correlation)', vWave === null ? '—' : r3(vWave, 2), 'm/s'], ['Bendiksen translational velocity', r3(uc.vt, 2), 'm/s'], ['Mean slug duration at the last probe', s2.length ? r3(mean(s2.map((q) => q.duration)), 3) : '—', 's'], ['Liquid mass error', sig(Math.abs(r.mass.errorL), 3), '–'], ['Gas mass error', sig(Math.abs(r.mass.errorG), 3), '–'], ['Largest volume-constraint error', sig(r.volErrMax, 3), '–'], ['Run completed', r.completed ? 'yes' : 'stopped early', '']], note: 'Waves grow from a 2 % inlet holdup disturbance when the stratified state is unstable; a face is a liquid bridge when the gas fraction next to it falls below 5 %. First-order upwind: the captured frequency depends on the cell size (use the mesh study).' });
+    balances.push({ name: 'Two-fluid liquid mass (kg): initial + inflow vs final + outflow', in: r.mass.liquid0 + r.mass.liquidIn, out: r.mass.liquid + r.mass.liquidOut }, { name: 'Two-fluid gas mass (kg): initial + inflow vs final + outflow', in: r.mass.gas0 + r.mass.gasIn, out: r.mass.gas + r.mass.gasOut });
+    if (!r.completed) warnings.push({ level: 'warn', msg: 'The two-fluid run stopped early: the flow left the well-posed range of the model on this grid (inviscid Kelvin–Helmholtz limit exceeded). Results up to that time are shown.' });
+    out.twoFluid = { slugs: s2.length, frequency: fq, waveVelocity: vWave, bendiksen: uc.vt, massErrorL: r.mass.errorL, massErrorG: r.mass.errorG, steps: r.steps, completed: r.completed, vkhRatio: stab.vkhRatio, holdupMean: mean(r.al) };
+    kpis.push({ label: 'Captured slug frequency (two-fluid)', value: sig(fq, 3), unit: '1/s', status: 'ok' }, { label: 'Captured front velocity', value: vWave === null ? '—' : r3(vWave, 2), unit: 'm/s', status: 'ok' });
+  }
+  if (task === 'cfd') {
+    const kind = ['cavity', 'dambreak', 'slugfront', 'channel'].includes(v.cfdCase) ? v.cfdCase : 'dambreak', n = Math.round(num(v.cfdN, 24, 8, 256)), turb = v.cfdTurbulence === 'sst' ? 'sst' : 'none'; prog(0.86, '2-D Navier–Stokes solver: ' + kind);
+    let r, title, note = '';
+    if (kind === 'cavity') { const Re = num(v.cfdRe, 100, 1, 5000); r = cfd2d({ nx: n, ny: n, rho: 1, mu: 1 / Re, lid: 1, tEnd: 60, steady: 1e-5, cfl: 0.5 }); title = `Lid-driven cavity, Re = ${Re}`; const g = REF.GHIA.rows.filter((q) => q[0] === 0), col = Re === 400 ? 3 : Re === 1000 ? 4 : 2; if ([100, 400, 1000].includes(Re)) { let e = 0; for (const q of g) e = Math.max(e, Math.abs(interp1(r.y, r.uMid, q[1]) - q[col])); note = `Largest difference of u on the vertical centre line from the Ghia, Ghia & Shin (1982) table: ${e.toFixed(4)} (lid velocity 1). `; out.cavityError = e; }
+      plots.push({ type: 'line', title: 'Cavity: u on the vertical centre line', xlabel: 'u / U lid', ylabel: 'y / L', series: [{ name: `${n} × ${n} cells`, x: r.uMid, y: r.y }, ...([100, 400, 1000].includes(Re) ? [{ name: 'Ghia et al. (1982)', x: g.map((q) => q[col]), y: g.map((q) => q[1]), mode: 'points' }] : [])] }); }
+    else if (kind === 'channel') { const ReT = num(v.cfdRe, 180, 50, 2000); r = cfd2d({ nx: 4, ny: 2 * n, lx: 0.4, ly: 2, rho: 1, mu: 1 / ReT, fx: 1, periodicX: true, turbulence: 'sst', tEnd: 60, steady: 1e-6, u0: (x, y) => 15 * (1 - (y - 1) ** 2), k0: 1, omega0: 20, cfl: 0.5 }); title = `Turbulent channel (SST k–ω), Re_τ = ${ReT}`; const ub = mean(r.u.map((q) => q[1])); note = `Bulk velocity U⁺ = ${ub.toFixed(2)} against ${(Math.log(ReT) / 0.41 + 5.2 - 1 / 0.41).toFixed(2)} from the log law. `; out.channelUb = ub;
+      plots.push({ type: 'line', title: 'Channel: mean velocity in wall units', xlabel: 'y⁺', ylabel: 'u⁺', logx: true, series: [{ name: 'SST k–ω (2-D solver)', x: r.y.slice(0, n).map((y) => y * ReT), y: r.u.slice(0, n).map((q) => q[1]) }, { name: 'Log law', x: r.y.slice(0, n).map((y) => y * ReT).filter((y) => y > 30), y: r.y.slice(0, n).map((y) => y * ReT).filter((y) => y > 30).map((y) => Math.log(y) / 0.41 + 5.2), dash: true }] }); }
+    else { const D = cm.D, front = kind === 'slugfront', hS = front ? clamp(levelOfHoldup(units[im] ? units[im].holdupSlug : 0.9), 0.3, 0.98) * D : 2 * 0.25 * D * 4, a = front ? 2 * D : D, lx = front ? 6 * D : 8 * D, ly = front ? D : 4 * D, hF = front ? (units[im] ? units[im].filmThickness : 0.2 * D) : 0;
+      r = cfd2d({ nx: Math.round((n * lx) / ly), ny: n, lx, ly, rhoL: cm.rhoL, rhoG: cm.rhoG, muL: cm.muL, muG: cm.muG, gy: -G, c0: (x, y) => ((x < a && y < (front ? hS : 2 * a)) || y < hF ? 1 : 0), tEnd: num(v.cfdTime, 0, 0, 60) || 2.2 * Math.sqrt(lx / G), probeFront: true, turbulence: turb }); title = front ? `Slug tail / front collapsing onto the film at ${Math.round(st.x[im])} m (channel analogue of the pipe)` : 'Dam break of a liquid column in a channel';
+      const h0 = front ? hS : 2 * a, tS = r.front.t.map((t) => t * Math.sqrt(G / h0)), ritter = hF > 0 ? null : r.front.t.map((t) => (a + 2 * Math.sqrt(G * h0) * t) / h0); note = `Liquid volume error ${Math.abs(r.mass.error).toExponential(1)}; ${turb === 'sst' ? 'SST k–ω turbulence. ' : 'laminar. '}`;
+      plots.push({ type: 'line', title: 'Front position along the bottom', xlabel: 't √(g / h₀)', ylabel: 'x front / h₀', series: [{ name: `${r.x.length} × ${r.y.length} cells`, x: tS, y: r.front.x.map((x) => x / h0) }, ...(ritter ? [{ name: 'Shallow-water limit (Ritter, frictionless)', x: tS, y: ritter.map((x) => Math.min(x, lx / h0)), dash: true }] : [])] });
+      balances.push({ name: '2-D solver liquid volume (m² per unit depth): initial vs final', in: r.mass.initial, out: r.mass.final }); out.cfdMassError = r.mass.error; out.frontX = r.front.x[r.front.x.length - 1]; }
+    await tick();
+    plots.push({ type: 'field', title: title + (r.c ? ': liquid fraction and velocity' : ': speed and streamlines'), xlabel: 'x (m)', ylabel: 'y (m)', zlabel: r.c ? 'Liquid fraction' : 'Speed', zunit: r.c ? '–' : 'm/s', x: r.x, y: r.y, z: r.c || r.u.map((row, j) => row.map((u, i) => Math.hypot(u, r.v[j][i]))), cmap: r.c ? 'salinity' : 'viridis', u: r.u, v: r.v, vectors: !!r.c, stream: !r.c, equal: kind !== 'channel' });
+    if (r.nut) plots.push({ type: 'field', title: 'Eddy viscosity (SST k–ω)', xlabel: 'x (m)', ylabel: 'y (m)', zlabel: 'ν_t', zunit: 'm²/s', x: r.x, y: r.y, z: r.nut, cmap: 'turbo', equal: kind !== 'channel' });
+    tables.push({ title: '2-D Navier–Stokes solver', columns: ['Quantity', 'Value', 'Unit'], rows: [['Case', title, ''], ['Cells', `${r.x.length} × ${r.y.length}`, ''], ['Time steps / mean step', `${r.steps} / ${sig(r.dtMean, 3)}`, 's'], ['Simulated time', sig(r.t, 4), 's'], ['Pressure iterations per step (mean)', r3(r.poissonIterations, 1), '–'], ['Largest cell divergence × Δx / |u|', sig(r.divergenceMax, 3), '–'], ['Velocity change per unit time at the end', sig(r.steadyResidual, 3), 'm/s²'], ['Liquid volume error', sig(Math.abs(r.mass.error), 3), '–']], note: note + 'Projection method on a staggered grid, THINC/WLIC volume of fluid, surface tension neglected. Three-dimensional and scale-resolving simulations are written as OpenFOAM cases on the hand-off page.' });
+    out.cfd = { case: kind, cells: r.x.length * r.y.length, steps: r.steps, divergence: r.divergenceMax, massError: r.mass.error, residual: r.steadyResidual, kineticEnd: r.kinetic.length ? r.kinetic[r.kinetic.length - 1].e : 0, uMin: Math.min(...r.uMid) };
+    kpis.push({ label: '2-D solver: liquid volume error', value: sig(Math.abs(r.mass.error), 2), unit: '–', status: Math.abs(r.mass.error) < 1e-6 ? 'ok' : 'warn' });
+  }
+  if (task === 'bubbly') {
+    prog(0.86, 'Bubbly-flow closures: radial void distribution'); let ib = 0; for (let i = 1; i < st.n; i++) if (st.theta[i] > st.theta[ib]) ib = i; const c = cellOf(st, ib), aM = clamp(1 - st.holdup[ib], 0.01, 0.15), d0 = num(v.bubbleMm, 3, 0.2, 30) / 1000;
+    const kTurb = 0.01 * (c.vsl + c.vsg) ** 2, ia = interfacialAreaTransport({ d0, alpha: aM, vg: Math.max(c.vsg / aM, 0.1), k: kTurb, length: Math.max(cfg.riserHeight, 50), rhoL: c.rhoL, rhoG: c.rhoG, muL: c.muL, sigma: c.sigma, crc: 0.04 * num(v.crcMult, 1, 0, 100), cti: 0.085 * num(v.ctiMult, 1, 0, 100), cwe: 0.002 * num(v.crcMult, 1, 0, 100) });
+    const mk = (d) => bubblyPipe({ R: c.D / 2, jl: c.vsl, alphaMean: aM, d, rhoL: c.rhoL, rhoG: c.rhoG, muL: c.muL, sigma: c.sigma, n: Math.round(num(v.bubblyN, 100, 30, 600)), cvm: num(v.cvm, 0.5, 0, 2) }), small = mk(d0), end = mk(clamp(ia.dEnd, 2e-4, 0.3 * c.D)); await tick();
+    plots.push({ type: 'line', title: `Radial void fraction of bubbly flow at ${Math.round(st.x[ib])} m (mean void ${aM.toFixed(3)})`, xlabel: 'r / R', ylabel: 'Void fraction', ymin: 0, series: [{ name: `Bubbles ${(d0 * 1000).toFixed(1)} mm (inlet size)`, x: small.r, y: small.alpha }, { name: `Bubbles ${(ia.dEnd * 1000).toFixed(1)} mm (after coalescence / breakup)`, x: end.r, y: end.alpha }], note: `Lift coefficient ${small.cl.toFixed(3)} → ${end.cl.toFixed(3)} (Tomiyama): small bubbles collect at the wall, large ones in the core.` });
+    plots.push({ type: 'line', title: 'Sauter diameter along the riser (interfacial-area transport)', xlabel: 'Height (m)', ylabel: 'mm', series: [{ name: 'Sauter diameter', x: ia.z, y: ia.d.map((x) => x * 1000) }], hlines: ia.dEquilibrium ? [{ y: ia.dEquilibrium * 1000, label: 'Coalescence = breakup' }] : [] });
+    tables.push({ title: 'Bubbly-flow closures', columns: ['Quantity', 'Inlet size', 'After the riser', 'Unit'], rows: [['Bubble diameter', r3(d0 * 1000, 2), r3(ia.dEnd * 1000, 2), 'mm'], ['Eötvös number', r3(small.eotvos, 2), r3(end.eotvos, 2), '–'], ['Relative (terminal) velocity', r3(small.uRel, 3), r3(end.uRel, 3), 'm/s'], ['Drag coefficient (Ishii–Zuber)', r3(small.cd, 3), r3(end.cd, 3), '–'], ['Lift coefficient (Tomiyama)', r3(small.cl, 3), r3(end.cl, 3), '–'], ['Void peak position r/R', r3(small.peak.r, 3), r3(end.peak.r, 3), '–'], ['Peak / centre-line void', `${small.peak.alpha.toFixed(3)} / ${small.alphaCentre.toFixed(3)}`, `${end.peak.alpha.toFixed(3)} / ${end.alphaCentre.toFixed(3)}`, '–'], ['Frictional + buoyant pressure gradient', r3(small.dpdz, 0), r3(end.dpdz, 0), 'Pa/m'], ['Coalescence (random collision / wake) and breakup rates of the curvature', `${sig(ia.rates.coalescenceRC, 3)} / ${sig(ia.rates.coalescenceWE, 3)}`, sig(ia.rates.breakup, 3), '1/m/s']], note: 'Lateral balance of turbulent dispersion (Burns), lift (Tomiyama, wall-damped) and wall lubrication (Antal); Sato bubble-induced viscosity; pseudo-turbulence ½ C_vm α u_r². Applied to the steepest cell with its superficial velocities, whatever the predicted pattern.' });
+    balances.push({ name: 'Bubbly model: area-mean void of the profile vs the given mean', in: aM, out: end.mean }, { name: 'Bubbly model: liquid flux of the profile vs the superficial velocity', in: c.vsl, out: end.liquidFlux });
+    out.bubbly = { dSauter: ia.dEnd, dEquilibrium: ia.dEquilibrium, peakR: end.peak.r, wallPeaked: end.wallPeaked, cl: end.cl, alphaCentre: end.alphaCentre };
+  }
+  if (task === 'benchmarks') {
+    prog(0.86, 'Benchmark set: shock tube, interface schemes, turbulence closures, flashing');
+    const n = Math.round(num(v.benchN, 200, 50, 4000)), e = 1e-7, ex = riemannExact({ rho: 1, u: 0, p: 1 }, { rho: 0.125, u: 0, p: 0.1 }), bn = baerNunziato({ n, tEnd: 0.2, left: { a1: 1 - e, rho1: 1, u1: 0, p1: 1, rho2: 1, u2: 0, p2: 1 }, right: { a1: 1 - e, rho1: 0.125, u1: 0, p1: 0.1, rho2: 0.125, u2: 0, p2: 0.1 } }), exR = bn.x.map((x) => ex.sample((x - 0.5) / 0.2).rho);
+    const two = baerNunziato({ n, tEnd: 2.2e-4, left: { a1: 0.2, rho1: 50, u1: 0, p1: 1e7, rho2: 1000, u2: 0, p2: 1e7 }, right: { a1: 0.8, rho1: 5, u1: 0, p1: 1e6, rho2: 1000, u2: 0, p2: 1e6 }, eos: [{ gamma: 1.4, pinf: 0 }, { gamma: 4.4, pinf: 6e8 }] });
+    plots.push({ type: 'line', title: 'Seven-equation model: Sod shock tube in the single-phase limit', xlabel: 'x', ylabel: 'Density', series: [{ name: `Baer–Nunziato model, ${n} cells`, x: bn.x, y: bn.rho1 }, { name: 'Exact Riemann solution', x: bn.x, y: exR, dash: true }] });
+    plots.push({ type: 'line', title: 'Seven-equation model: liquid–gas shock tube (two pressures, two velocities)', xlabel: 'x (m)', ylabel: 'see legend', series: [{ name: 'Gas volume fraction', x: two.x, y: two.a1 }, { name: 'Gas pressure / 10 MPa', x: two.x, y: two.p1.map((p) => p / 1e7) }, { name: 'Liquid pressure / 10 MPa', x: two.x, y: two.p2.map((p) => p / 1e7) }, { name: 'Gas velocity / 100 m/s', x: two.x, y: two.u1.map((u) => u / 100) }] });
+    await tick();
+    const m = Math.round(num(v.benchAdvN, 48, 16, 200)), rows = []; for (const sc of ['vof', 'levelset', 'clsvof', 'phasefield', 'front']) { const a = interfaceAdvect2D({ n: m, scheme: sc, test: 'translateDiag' }), b = interfaceAdvect2D({ n: m, scheme: sc, test: 'translateX' }); rows.push([{ vof: 'Volume of fluid (THINC/WLIC)', levelset: 'Level set', clsvof: 'Coupled level set / VOF', phasefield: 'Phase field (conservative Allen–Cahn)', front: 'Front tracking' }[sc], sig(a.massError, 2), r3(a.shapeError, 4), r3(b.shapeError, 4), r3(a.shapeError / Math.max(b.shapeError, 1e-12), 2)]); await tick(); }
+    tables.push({ title: `Interface-advection schemes: circle carried once across a periodic ${m} × ${m} grid`, columns: ['Scheme', 'Volume error (diagonal)', 'Shape error, diagonal', 'Shape error, along x', 'Mesh-orientation ratio'], rows, note: 'Shape error: L1 difference of the liquid fraction from the exact one, relative to the body area. The ratio of the diagonal to the grid-aligned error measures the mesh-orientation sensitivity.' });
+    const lam = cm.vsl / Math.max(cm.vsl + cm.vsg, 1e-9), ReL = clamp(((cm.rhoL * lam + cm.rhoG * (1 - lam)) * (cm.vsl + cm.vsg) * cm.D) / (cm.muL * lam + cm.muG * (1 - lam)), 1e4, 3e6), rt = reTauOf(ReL), rr = []; for (const q of RANS_MODELS) { const s = ransPipe({ reTau: rt, model: q.value, n: 70, tol: 1e-7, maxIter: 4000 }); rr.push([q.label, sig(s.Re, 4), r3(s.f, 5), r3(frictionFactor(s.Re, 0), 5), r3(100 * (s.f / frictionFactor(s.Re, 0) - 1), 1), s.iterations]); await tick(); }
+    tables.push({ title: `Turbulence closures in developed pipe flow at Re_τ = ${Math.round(rt)}`, columns: ['Closure', 'Re', 'Friction factor', 'Colebrook (smooth)', 'Difference (%)', 'Iterations'], rows: rr });
+    const k = st.n - 1, prA = fm0(R, st.P[k], st.T[k]), prB = fm0(R, st.P[st.n], st.T[st.n]); // flashing over the last cell at the riser top
+    if (prA && prB && prA.mG + prA.mO + prA.mW > 0) { const mt = prA.mG + prA.mO + prA.mW, A = (PI * st.D[k] ** 2) / 4, xe = (p) => clamp(interp1([st.P[st.n] * 1e5, st.P[k] * 1e5], [prB.mG / mt, prA.mG / mt], p), 0, 1), vG = (p) => 1 / (prA.rhoG * (p / (st.P[k] * 1e5))), opt = { G: mt / A, D: st.D[k], length: st.ds, n: 120, p0: st.P[k] * 1e5, x0: prA.mG / mt, pSat: 1.5 * st.P[k] * 1e5, xEq: xe, vG, vL: 1 / prA.rhoL, f: 0.02, theta: st.theta[k] }, hrm = flashingFlow({ ...opt, model: 'hrm' }), hem = flashingFlow({ ...opt, model: 'hem' });
+      tables.push({ title: 'Flashing over the last cell of the riser: homogeneous relaxation against equilibrium', columns: ['Quantity', 'Relaxation model', 'Equilibrium model', 'Unit'], rows: [['Outlet pressure', r3(hrm.p[hrm.p.length - 1] / 1e5, 3), r3(hem.p[hem.p.length - 1] / 1e5, 3), 'bara'], ['Gas mass fraction at the outlet', sig(hrm.x[hrm.x.length - 1], 4), sig(hem.x[hem.x.length - 1], 4), '–'], ['Largest lag behind equilibrium', sig(hrm.lag, 3), '0', '–'], ['Outlet velocity', r3(hrm.u[hrm.u.length - 1], 2), r3(hem.u[hem.u.length - 1], 2), 'm/s']], note: 'Relaxation time of Downar-Zapolski et al. (fitted to flashing water below 10 bar; indicative for hydrocarbons). Equilibrium gas fraction interpolated between the two ends of the cell.' }); out.flashingLag = hrm.lag; }
+    balances.push({ name: 'Seven-equation model: total energy of the closed tube, initial vs final (normalised)', in: 1, out: 1 + bn.conservation.energy }, { name: 'Seven-equation model: mass of phase 1, initial vs final (normalised)', in: 1, out: 1 + bn.conservation.mass1 });
+    out.benchmarks = { sodL1: mean(bn.rho1.map((x, i) => Math.abs(x - exR[i]))), entropyProduction: bn.entropy.production, schemes: rows.map((q) => ({ scheme: q[0], massError: q[1], shape: q[2] })) };
+  }
+  return { outputs: out, kpis };
+}
+const fm0 = (R, P, T) => { try { return R.fm.at(P, T, R.st.mScale); } catch { return null; } };
+
+// =====================================================================================================
+// 7i. Reference data sets wired to the engine, and the provenance of the constants
+// =====================================================================================================
+const TASKS = [{ value: 'line', label: 'Line solution (steady, slugging, transient)' }, { value: 'twofluid', label: 'Two-fluid model: slug capturing on a test section' }, { value: 'cfd', label: '2-D Navier–Stokes solver (projection, VOF, SST)' }, { value: 'bubbly', label: 'Bubbly-flow closures: radial void distribution' }, { value: 'benchmarks', label: 'Benchmark set (shock tube, interface schemes, turbulence closures, flashing)' }];
+const AIR20 = { rhoL: 998.2, muL: 1.0e-3, sigma: 0.0728, muG: 1.82e-5 }; // water and air at 20 °C, used where a source gives no fluid temperature (stated in the data-set notes)
+const rowsOf = (d, f = () => true) => d.rows.map((r) => Object.fromEntries(d.cols.map((c, i) => [c, r[i]]))).filter(f);
+const memo = {}; const once = (k, f) => (k in memo ? memo[k] : (memo[k] = f()));
+function buildValidation() {
+  const sh = rowsOf(REF.SHOHAM).map((r) => ({ ...r, match: 1 })), fl = REF.SHOHAM.fluid, pcl = (r, f = fl) => patternClass({ vsl: r.vsl, vsg: r.vsg, rhoL: f.rhoL ?? r.rhoL, rhoG: f.rhoG ?? r.rhoG, muL: f.muL ?? r.muL, muG: f.muG ?? r.muG, sigma: f.sigma ?? r.sigma, D: r.D, theta: r.angle * DEG });
+  const fpCols = [{ key: 'D', label: 'Diameter', unit: 'm' }, { key: 'angle', label: 'Inclination', unit: '°' }, { key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity', unit: 'm/s' }, { key: 'pattern', label: 'Observed pattern', type: 'text' }, { key: 'match', label: 'Observed class reproduced (1 = yes)' }];
+  const fp = (id, title, rows, tol, note, covers, src = REF.SHOHAM.source, f = fl) => ({ id, title, quantity: 'Flow-pattern class reproduced', unit: '–', kind: 'experiment', source: src, columns: fpCols, rows, target: 'match', model: (r) => (pcl(r, f) === r.pattern ? 1 : 0), tolerance: { mape: tol }, covers,
+    note: `${note} Accuracy measure: the target is 1 for every row and the model returns 1 when the mechanistic map (Taitel–Dukler / Barnea, kernel flowPattern) gives the observed class (SS, SW, I, A, DB, B) and 0 otherwise, so the reported MAPE is the percentage of misclassified points and −bias the misclassified fraction. ${REF.SHOHAM.note}` });
+  const A = [];
+  A.push(fp('fp-shoham-horizontal', 'Flow pattern, horizontal air–water, 25 and 51 mm (Shoham 1982)', sh.filter((r) => r.angle === 0), 25, 'Horizontal pipes.', ['Horizontal multiphase flow', 'Gas-liquid flow']));
+  A.push(fp('fp-shoham-up', 'Flow pattern, upward inclined air–water, +0.25° to +80° (Shoham 1982)', sh.filter((r) => r.angle > 0 && r.angle < 90), 30, 'Upward inclinations.', ['Inclined flow']));
+  A.push(fp('fp-shoham-down', 'Flow pattern, downward inclined air–water, −1° to −80° (Shoham 1982)', sh.filter((r) => r.angle < 0 && r.angle > -90), 50, 'Downward inclinations; the map has no falling-film / annular criterion for steep downward flow, which is where most misses occur.', ['Inclined flow']));
+  A.push(fp('fp-shoham-vertical', 'Flow pattern, vertical upward and downward air–water (Shoham 1982)', sh.filter((r) => Math.abs(r.angle) === 90), 45, 'Vertical pipes (+90° and −90°); churn is counted as intermittent.', ['Vertical upward/downward flow']));
+  const cls = (set) => sh.filter((r) => set.includes(r.pattern));
+  A.push(fp('fp-class-stratified', 'Observed stratified flow (smooth and wavy), all inclinations (Shoham 1982)', cls(['SS', 'SW']), 35, 'Recall of the stratified classes; smooth and wavy are distinct classes here, and the smooth / wavy boundary is the least certain of the map.', ['Stratified flow']));
+  A.push(fp('fp-class-annular', 'Observed annular flow, all inclinations (Shoham 1982)', cls(['A']), 35, 'Recall of annular flow.', ['Annular flow']));
+  A.push(fp('fp-class-bubbly', 'Observed bubble and dispersed-bubble flow, all inclinations (Shoham 1982)', cls(['B', 'DB']), 50, 'Recall of the bubbly classes.', ['Bubbly flow']));
+  A.push(fp('fp-class-intermittent', 'Observed intermittent flow (slug, plug, churn), all inclinations (Shoham 1982)', cls(['I']), 30, 'Recall of intermittent flow.', ['Intermittent flow', 'Hydrodynamic slugging']));
+  A.push(fp('fp-kokal', 'Flow pattern, oil–air, 26, 51 and 76 mm, 0, ±1, ±5, ±9° (Kokal 1987)', rowsOf(REF.KOKAL).map((r) => ({ ...r, match: 1 })), 50, `A second fluid pair and three diameters. ${REF.KOKAL.note}`, ['Gas-liquid flow', 'Hilly-terrain pipelines'], REF.KOKAL.source, {}));
+  // ---- UNICAMP inclined slug flow: pressure gradient, frequency, length, bubble-nose velocity
+  const un = rowsOf(REF.UNICAMP), uSrc = REF.UNICAMP.source, pt = (r) => ({ vsl: r.vsl, vsg: r.vsg, rhoL: AIR20.rhoL, rhoG: r.p / (287.05 * 293.15), muL: AIR20.muL, muG: AIR20.muG, sigma: AIR20.sigma, D: r.D, theta: r.angle * DEG, rough: 0, P: r.p, fModel: 'colebrook', label: false });
+  const uCols = [{ key: 'angle', label: 'Inclination', unit: '°' }, { key: 'station', label: 'Station (1: 77 D, 2: 257 D)' }, { key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity (local)', unit: 'm/s' }, { key: 'p', label: 'Pressure', unit: 'Pa' }], uNote = ` ${REF.UNICAMP.note} Water and air properties at 20 °C are assumed for the model (998 kg/m³, 1.0 mPa s, 0.073 N/m; air as an ideal gas at the station pressure).`;
+  const dpRows = un.filter((r) => r.station === 1 && r.dpdx !== 0).map((r) => ({ ...r, dp: -r.dpdx }));
+  const dpSet = (id, model, label, tol, note) => ({ id, title: `Pressure gradient of air–water slug flow, 26 mm, 0–90° — ${label}`, quantity: 'Pressure gradient', unit: 'Pa/m', kind: 'experiment', source: uSrc, columns: [...uCols, { key: 'dp', label: 'Measured pressure gradient', unit: 'Pa/m' }], rows: dpRows, target: 'dp', model: (r) => holdupGradient(pt(r), model).dpdx, tolerance: { mape: tol }, covers: ['Pressure gradient', 'Inclined flow', 'Vertical upward/downward flow', 'Liquid holdup'], note: note + uNote });
+  A.push(dpSet('dp-unicamp-bb', 'beggsBrill', 'Beggs & Brill', 25, 'Total gradient (static head + friction) at 77 diameters from the injector; in the inclined cases the gradient is mostly the static head, so this is chiefly a test of the liquid holdup. No tabulated holdup measurements with complete fluid properties were found in open sources, so holdup is validated through this static-head-dominated gradient.'));
+  A.push(dpSet('dp-unicamp-mech', 'mechanistic', 'mechanistic unit-cell model', 45, 'Same measurements against the mechanistic closure (slug unit cell).'));
+  A.push(dpSet('dp-unicamp-df', 'driftFlux', 'drift flux (Bendiksen)', 25, 'Same measurements against the drift-flux closure with the Bendiksen slug-bubble velocity.'));
+  const st2 = un.filter((r) => r.station === 2);
+  A.push({ id: 'slugfreq-unicamp', title: 'Slug frequency, air–water, 26 mm, 0–90° at 257 D (UNICAMP)', quantity: 'Slug frequency', unit: '1/s', kind: 'experiment', source: uSrc, columns: [...uCols, { key: 'freq', label: 'Measured frequency', unit: '1/s' }], rows: st2, target: 'freq', model: (r) => slugFrequency(r.vsl, r.vsl + r.vsg, r.D, r.angle * DEG, 'zabaras'), tolerance: { mape: 150 }, covers: ['Slug frequency', 'Hydrodynamic slugging'], note: 'Zabaras (2000) correlation (kernel slugFrequency) at the downstream station. The correlation overpredicts these frequencies by a factor of about 2.4 on average (it was developed for larger, longer lines); the tolerance records that miss rather than hiding it.' + uNote });
+  A.push({ id: 'sluglength-unicamp', title: 'Mean slug-body length, air–water, 26 mm, 0–90° at 257 D (UNICAMP)', quantity: 'Slug length', unit: 'm', kind: 'experiment', source: uSrc, columns: [...uCols, { key: 'ls', label: 'Measured slug length', unit: 'm' }], rows: st2, target: 'ls', model: (r) => slugLength(r.D, r.vsl + r.vsg), tolerance: { mape: 160 }, covers: ['Slug length'], note: 'Developed-slug length of the kernel (32 D below 0.1 m). The measured bodies are 12–18 D: slugs 257 D from the injector are not developed, and the 32 D rule overpredicts them by about a factor of two — a known limit of the correlation, not corrected here.' + uNote });
+  A.push({ id: 'slugvelocity-unicamp', title: 'Bubble-nose (translational) velocity, air–water, 26 mm, 0–90° (UNICAMP)', quantity: 'Translational velocity', unit: 'm/s', kind: 'experiment', source: uSrc, columns: [...uCols, { key: 'vb', label: 'Measured bubble-nose velocity', unit: 'm/s' }], rows: un, target: 'vb', model: (r) => slugVelocity(r.vsl + r.vsg, r.D, r.angle * DEG).vt, tolerance: { mape: 15 }, covers: ['Slug velocity'], note: 'Bendiksen (1984) relation (kernel slugVelocity) at both stations and all inclinations.' + uNote });
+  // ---- Mohmmed et al. horizontal 74 mm
+  const mNote = (d) => ` ${d.note} Water and air properties at 24 °C and 1.013 bar as stated by the source (no property values given).`;
+  A.push({ id: 'slugfreq-mohmmed', title: 'Slug frequency, horizontal air–water, 74 mm (Mohmmed et al. 2018)', quantity: 'Slug frequency', unit: '1/s', kind: 'experiment', source: REF.MOHMMED_FREQ.source, columns: [{ key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity', unit: 'm/s' }, { key: 'xD', label: 'Station', unit: 'D' }, { key: 'freq', label: 'Measured frequency', unit: '1/s' }], rows: rowsOf(REF.MOHMMED_FREQ), target: 'freq', model: (r) => slugFrequency(r.vsl, r.vsl + r.vsg, r.D, 0, 'gregory'), tolerance: { mape: 35 }, covers: ['Slug frequency', 'Horizontal multiphase flow'], note: 'Gregory & Scott (1969) correlation.' + mNote(REF.MOHMMED_FREQ) });
+  A.push({ id: 'sluglength-mohmmed', title: 'Slug-body length, horizontal air–water, 74 mm (Mohmmed et al. 2018)', quantity: 'Slug length', unit: 'm', kind: 'experiment', source: REF.MOHMMED_LEN.source, columns: [{ key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity', unit: 'm/s' }, { key: 'xD', label: 'Station', unit: 'D' }, { key: 'ls', label: 'Measured slug length', unit: 'm' }], rows: rowsOf(REF.MOHMMED_LEN), target: 'ls', model: (r) => slugLength(r.D, r.vsl + r.vsg), tolerance: { mape: 600 }, covers: ['Slug length'], note: 'Developed-slug length of the kernel (32 D). The test section is only 108 D long and the reported bodies are 4–10 D: undeveloped slugs, which the developed-length rule overpredicts several-fold. Shown as a limit of applicability.' + mNote(REF.MOHMMED_LEN) });
+  A.push({ id: 'slugvelocity-mohmmed', title: 'Slug translational velocity, horizontal air–water, 74 mm (Mohmmed et al. 2018)', quantity: 'Translational velocity', unit: 'm/s', kind: 'experiment', source: REF.MOHMMED_VEL.source, columns: [{ key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity', unit: 'm/s' }, { key: 'vt', label: 'Measured translational velocity', unit: 'm/s' }], rows: rowsOf(REF.MOHMMED_VEL), target: 'vt', model: (r) => slugVelocity(r.vsl + r.vsg, r.D, 0).vt, tolerance: { mape: 20 }, covers: ['Slug velocity'], note: 'Bendiksen (1984) relation.' + mNote(REF.MOHMMED_VEL) });
+  // ---- severe slugging with a choke or gas lift (Jansen, Shoham & Taitel 1996)
+  { const g = REF.JANSEN.rig, A0 = (PI * g.D * g.D) / 4, model = (r) => { const wG = 1.204 * (r.vsg0 + r.gasLift) * A0, wL = 998.2 * r.vsl * A0, rhoG0 = 101325 / (287.05 * 293.15), u0 = r.vsl + (wG / rhoG0) / A0, lam = r.vsl / u0, rhoN = lam * 998.2 + (1 - lam) * rhoG0, c = riserSluggingCycle({ D: g.D, feedLength: g.pipeline + g.bufferLength, feedAngle: 1 * DEG, riserHeight: g.riser, riserLength: g.riser, wG, wL, rhoL: 998.2, muL: 1e-3, T: 293.15, zG: 1, mwG: 28.96, pSep: 101325, alphaL: (stratifiedLevel({ vsl: r.vsl, vsg: Math.max(r.vsg0, 1e-3), rhoL: 998.2, rhoG: rhoG0, muL: 1e-3, muG: 1.82e-5, D: g.D, theta: -1 * DEG }).holdup * g.pipeline) / (g.pipeline + g.bufferLength), chokeDp: Math.max((r.chokeC / 998.2) * rhoN * u0 * u0, 10), rough: 1.5e-6, maxCycles: 4 }); const last = c.stages; return c.period ?? last.buildUp + last.production + last.blowout + last.fallback; };
+    A.push({ id: 'severe-jansen', title: 'Severe-slugging cycle time with a riser-top choke or riser-base gas lift (Jansen, Shoham & Taitel 1996)', quantity: 'Cycle time', unit: 's', kind: 'experiment', source: REF.JANSEN.source, columns: [{ key: 'table', label: 'Table (1 choke, 2 gas lift)' }, { key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg0', label: 'Superficial gas velocity at standard conditions', unit: 'm/s' }, { key: 'chokeC', label: 'Choke coefficient', unit: 'Pa s²/m²' }, { key: 'gasLift', label: 'Gas-lift velocity at standard conditions', unit: 'm/s' }, { key: 'cycle', label: 'Measured cycle time', unit: 's' }], rows: rowsOf(REF.JANSEN), target: 'cycle', model, tolerance: { mape: 50 }, covers: ['Severe riser slugging', 'Pressure fluctuations'], note: `Lumped riser cycle (riserSluggingCycle) with the rig geometry; the gas buffer is added to the feed-line gas volume (liquid fraction of the feed line from the stratified equilibrium level of the −1° pipeline), the choke is Δp = C v² on the liquid, and the lift gas is added to the feed gas (the model has no separate riser-base injection). ${REF.JANSEN.note} No open tabulated record of pressure amplitude was found; amplitudes are compared through the measurement table of the suite.` }); }
+  // ---- single-phase friction, cavity benchmark, bubbly void profile
+  A.push({ id: 'friction-superpipe', title: 'Smooth-pipe friction factor, Re = 7.4·10⁴ – 3.6·10⁷ (Princeton Superpipe, McKeon et al. 2004)', quantity: 'Darcy friction factor', unit: '–', kind: 'experiment', source: REF.SUPERPIPE.source, columns: [{ key: 'Re', label: 'Reynolds number' }, { key: 'f', label: 'Measured friction factor' }], rows: rowsOf(REF.SUPERPIPE), target: 'f', model: (r) => frictionFactor(r.Re, 0, 'colebrook'), tolerance: { mape: 3 }, covers: ['Pressure gradient'], note: 'Colebrook–White in the smooth limit (Prandtl law). ' + REF.SUPERPIPE.note });
+  { const g = rowsOf(REF.GHIA), sol = () => once('cavity100', () => cfd2d({ nx: 32, ny: 32, rho: 1, mu: 0.01, lid: 1, tEnd: 40, steady: 1e-4, cfl: 0.5, poissonTol: 1e-6 }));
+    A.push({ id: 'cavity-ghia', title: 'Lid-driven cavity at Re = 100: centre-line velocities (Ghia, Ghia & Shin 1982)', quantity: 'Velocity / lid velocity', unit: '–', kind: 'benchmark', source: REF.GHIA.source, columns: [{ key: 'profile', label: 'Profile (0: u on x = 0.5, 1: v on y = 0.5)' }, { key: 'coord', label: 'Coordinate' }, { key: 're100', label: 'Benchmark value' }], rows: g.filter((r) => r.re100 !== 0), target: 're100', model: (r) => { const s = sol(); return r.coord <= 0 || r.coord >= 1 ? (r.profile === 0 && r.coord >= 1 ? 1 : 0) : r.profile === 0 ? interp1(s.y, s.uMid, r.coord) : interp1(s.x, s.vMid, r.coord); }, tolerance: { maxAbs: 0.012, rmse: 0.006 }, covers: ['Code-to-code benchmark problems'], note: '2-D Navier–Stokes solver of the suite on 32 × 32 cells (computed once and cached). ' + REF.GHIA.note }); }
+  { const g = REF.GROSSETETE.rig, sol = () => once('gros', () => bubblyPipe({ R: g.R, jl: g.uLiquid * (1 - g.alphaMean), alphaMean: g.alphaMean, d: g.d, rhoL: g.rhoL, rhoG: 1.19, muL: g.muL, sigma: g.sigma, cl: 0.288 }));
+    A.push({ id: 'void-grossetete', title: 'Radial void fraction of bubbly upflow, 38 mm pipe (Grossetete 1995, experiment 11-01, Z/D = 55)', quantity: 'Void fraction', unit: '–', kind: 'experiment', source: REF.GROSSETETE.source, columns: [{ key: 'rR', label: 'r / R' }, { key: 'alpha', label: 'Measured void fraction' }], rows: rowsOf(REF.GROSSETETE, (r) => r.alpha < 0.5), target: 'alpha', model: (r) => { const s = sol(); return interp1(s.r, s.alpha, r.rR); }, tolerance: { rmse: 0.025, maxAbs: 0.045 }, covers: ['Bubbly flow', 'Liquid holdup'], note: 'Lateral force balance (Burns dispersion, lift coefficient 0.288 with wall damping, Antal wall force −0.01 / 0.05, Sato viscosity — the closure set of the OpenFOAM tutorial case). The wall peak is reproduced in position and height; the core void is underpredicted by about half. ' + REF.GROSSETETE.note }); }
+  return A;
+}
+
+// =====================================================================================================
+// 7j. Verification of the solvers added in sections 7a–7g (called from verify)
+// =====================================================================================================
+async function verifyExtra(add) {
+  const flag = (name, cond, note) => add(name, 1, cond ? 1 : 0, 0, note, false);
+  { // kernel correlations against the worked examples printed in open libraries
+    add('Colebrook friction factor at Re = 10⁵, ε/D = 10⁻⁴ (fluids library example)', 0.018513866077471, frictionFactor(1e5, 1e-4, 'colebrook'), 1e-9, 'Independent implementation: Caleb Bell, fluids.friction.Colebrook docstring');
+    add('Haaland friction factor (fluids library example)', 0.018265053014793857, frictionFactor(1e5, 1e-4, 'haaland'), 1e-12, 'fluids.friction.Haaland(1E5, 1E-4)');
+    add('Swamee–Jain friction factor (fluids library example)', 0.018452424431901808, frictionFactor(1e5, 1e-4, 'swamee'), 2e-6, 'fluids.friction.Swamee_Jain_1976(1E5, 1E-4); the library writes (6.97/Re)^0.9, the kernel the rounded 5.74/Re^0.9 (6.97^0.9 = 5.7407)');
+    add('Churchill friction factor (fluids library example)', 0.018462624566280075, frictionFactor(1e5, 1e-4, 'churchill'), 1e-12, 'fluids.friction.Churchill_1977(1E5, 1E-4)');
+    const A = (PI * 0.05 ** 2) / 4, bb = gradient({ vsl: (0.6 * 0.9) / 915 / A, vsg: (0.6 * 0.1) / 2.67 / A, rhoL: 915, rhoG: 2.67, muL: 180e-6, muG: 14e-6, sigma: 0.0487, D: 0.05, theta: 0, rough: 0, P: 1e7, label: false });
+    add('Code-to-code: Beggs & Brill pressure gradient against the fluids library example', 686.9724506803469, bb.dpdx, 1e-10, 'Pa/m; fluids.two_phase.Beggs_Brill(m=0.6, x=0.1, rhol=915, rhog=2.67, mul=180E-6, mug=14E-6, sigma=0.0487, P=1E7, D=0.05, angle=0)');
+    add('Churchill–Bernstein Nusselt number (ht library example)', 40.63708594124974, nuCrossFlow(6071, 0.7), 1e-12, 'ht.conv_external.Nu_cylinder_Churchill_Bernstein(6071, 0.7)');
+    add('Churchill–Chu free-convection Nusselt number (ht library example)', 139.13493970073597, nuFreeCylinder(0.69 * 2.63e9, 0.69), 1e-12, 'ht.conv_free_immersed.Nu_horizontal_cylinder_Churchill_Chu(0.69, 2.63E9)');
+    add('Gnielinski Nusselt number at Re = 10⁵, Pr = 1.2 (ht library example with f = 0.0185)', 254.62682749359632, hInside(1e5, 1.2, 1, 1), 0.04, 'The kernel uses the smooth-pipe Haaland friction factor (0.0180) instead of the 0.0185 of the example, which lowers the result by 3.5 %');
+    const g = gradient({ vsl: 0, vsg: 12, rhoL: 800, rhoG: 40, muL: 1e-3, muG: 1.3e-5, D: 0.3, theta: 0.2, rough: 4.5e-5, P: 4e6 }), ek = (40 * 144) / 4e6;
+    add('Single-phase gas: acceleration term of the kernel', ((g.fric + g.grav) * ek) / (1 - ek), g.acc, 1e-12, 'Pa/m; (friction + gravity) Ek / (1 − Ek) with Ek = ρ v² / P');
+    const u = slugUnit({ vsl: 1, vsg: 1.5, rhoL: 800, rhoG: 60, muL: 2e-3, muG: 1.4e-5, D: 0.254, theta: 0 }), uf = slugUnit({ vsl: 1, vsg: 1.5, rhoL: 800, rhoG: 60, muL: 2e-3, muG: 1.4e-5, D: 0.254, theta: 0, basis: 'frequency' });
+    add('Kernel slug unit cell: frequency × unit length = translational velocity', u.vt, u.freq * u.unitLength, 1e-12, 'm/s, length basis (frequency derived from the length correlation)');
+    add('Kernel slug unit cell, frequency basis: length = slug fraction × v_t / frequency', (uf.slugFraction * uf.vt) / uf.freqCorrelation, uf.length, 1e-12, 'm; the length is derived when the frequency correlation is kept');
+  }
+  { // kernel march and suite march now use the same energy equation
+    const a = steadyFlow({}, {}), k = marchSteady({ fm: a.cfg.fm, profile: a.cfg.profile, id: a.cfg.id, rough: a.cfg.rough, U: a.cfg.U, tAmbOf: a.cfg.tAmbOf, tIn: a.cfg.tIn, pOut: a.cfg.pOut, n: a.cfg.n, label: false });
+    add('Kernel and suite agree on the arrival temperature (flowing-enthalpy balance in both)', a.tOut, k.tOut, 0.02, '°C on the reference case, same grid; the kernel default was a frozen-cp / Joule–Thomson form before', false);
+    add('Kernel and suite agree on the inlet pressure of the reference case', a.pIn, k.pIn, 2e-4, 'bara');
+  }
+  { // two-fluid model: water faucet, Kelvin–Helmholtz limits, slug capturing, phase energies
+    const fa = (n) => { const r = twoFluid({ n, length: 12, D: 1, theta: -PI / 2, rhoL: 1000, friction: false, pOut: 1e5, init: () => ({ al: 0.8, ul: 10, ug: 0 }), inlet: () => ({ al: 0.8, ul: 10, ug: 0 }), tEnd: 0.5, cfl: 0.4, dtMax: 1 }), xf = 5 + (G * 0.25) / 2; let e = 0; for (let i = 0; i < n; i++) e += Math.abs(1 - r.al[i] - (r.x[i] < xf ? 1 - 8 / Math.sqrt(100 + 2 * G * r.x[i]) : 0.2)); return { l1: e / n, r }; }, f1 = fa(100), f2 = fa(400);
+    add('Water-faucet benchmark (Ransom): mean error of the gas fraction against the analytic solution', 0, f2.l1, 0.006, `400 cells at t = 0.5 s; α_g = 1 − α_l0 u_0 / √(u_0² + 2 g x) behind the front. 100 cells: ${f1.l1.toExponential(2)}`, false);
+    add('Water faucet: observed order of the first-order upwind scheme on a discontinuous solution', 0.67, Math.log(f1.l1 / f2.l1) / Math.log(4), 0.2, 'L1 error on 100 and 400 cells; a contact discontinuity limits a first-order scheme to an order between ½ and 1', false);
+    add('Water faucet: liquid mass conservation of the two-fluid solver', 0, f2.r.mass.errorL, 1e-11, 'Relative', false);
+    await 0;
+    // inviscid Kelvin–Helmholtz: plane channel, periodic, no friction
+    const H = 0.1, rhoG = 1e5 / (287 * 293.15), Uc = Math.sqrt(((1000 * 0.5 + rhoG * 0.5) * (1000 - rhoG) * G * H) / (1000 * rhoG));
+    const mode = (al, a0) => { let s = 0, c = 0; const n = al.length; for (let i = 0; i < n; i++) { const ph = (2 * PI * (i + 0.5)) / n; s += (al[i] - a0) * Math.sin(ph); c += (al[i] - a0) * Math.cos(ph); } return (2 * Math.hypot(s, c)) / n; };
+    const rate = (r, a0) => { const A = r.field.al.map((q) => mode(q, a0)), k0 = Math.floor(A.length / 3), xs = r.field.t.slice(k0), ys = A.slice(k0).map(Math.log), mx = mean(xs), my = mean(ys); let nu = 0, de = 0; xs.forEach((x, i) => { nu += (x - mx) * (ys[i] - my); de += (x - mx) ** 2; }); return nu / de; };
+    const ikh = (f) => rate(twoFluid({ n: 64, length: 2, channelH: H, rhoL: 1000, Rs: 287, T: 293.15, friction: false, periodic: true, pOut: 1e5, init: (x) => ({ al: 0.5 + 1e-4 * Math.sin((2 * PI * x) / 2), ul: 0, ug: f * Uc, p: 1e5 }), tEnd: 0.5, cfl: 0.3, dtMax: 1, nField: 31 }), 0.5), g1 = ikh(0.9), g2 = ikh(1.1);
+    add('Inviscid Kelvin–Helmholtz limit: gas velocity at which waves start to grow / theory', 1, 0.9 + (0.2 * -g1) / (g2 - g1), 0.03, `Two-fluid model, periodic plane channel; growth rates ${g1.toFixed(3)} and ${g2.toFixed(3)} 1/s at 0.9 and 1.1 times ΔU² = (ρl αg + ρg αl)(ρl − ρg) g H / (ρl ρg) = (${Uc.toFixed(2)} m/s)²`);
+    await 0;
+    // viscous Kelvin–Helmholtz: pipe, periodic with the equilibrium pressure gradient as body force, long wave
+    const base = { rhoL: 998, rhoG, muL: 1e-3, muG: 1.8e-5, D: 0.078, theta: 0, vsg: 2 }, vk = brent((x) => interfacialStability({ ...base, vsl: x }).vkhRatio - 1, 0.05, 0.6, 1e-7), Lw = 32;
+    const vgr = (f) => { const p = { ...base, vsl: f * vk }, st = stratifiedLevel(p), gg = st.geom, B = -(st.tauWL * gg.SL + st.tauWG * gg.SG) / gg.A; return rate(twoFluid({ n: 96, length: Lw, D: 0.078, rhoL: 998, muL: 1e-3, muG: 1.8e-5, Rs: 287, T: 293.15, periodic: true, pOut: 1e5, bodyForce: B, init: (x) => ({ al: st.holdup + 2e-4 * Math.sin((2 * PI * x) / Lw), ul: st.vL, ug: st.vG, p: 1e5 }), tEnd: 70, cfl: 0.4, dtMax: 1, nField: 41 }), st.holdup); }, h1 = vgr(0.95), h2 = vgr(1.15);
+    add('Viscous Kelvin–Helmholtz limit: liquid velocity at which long waves start to grow / theory', 1, 0.95 + (0.2 * -h1) / (h2 - h1), 0.08, `Two-fluid model against the Barnea–Taitel criterion (interfacialStability) at vsg = 2 m/s in a 78 mm air–water pipe: theory ${vk.toFixed(4)} m/s; wavelength ${Lw} m on 96 cells (the upwind damping of shorter waves delays the numerical onset)`);
+    await 0;
+    // slug capturing
+    { const D = 0.078, L = 16, p = { vsl: 1, vsg: 1.5, rhoL: 998, rhoG, muL: 1e-3, muG: 1.8e-5, D, theta: 0 }, st = stratifiedLevel(p), tE = 16;
+      const r = twoFluid({ n: 240, length: L, D, rhoL: 998, muL: 1e-3, muG: 1.8e-5, Rs: 287, T: 293.15, pOut: 1e5, init: () => ({ al: st.holdup, ul: st.vL, ug: st.vG, p: 1e5 }), inlet: (t) => ({ al: st.holdup * (1 + 0.02 * Math.sin((2 * PI * t) / 0.7) + 0.02 * Math.sin((2 * PI * t) / 1.9)), ul: st.vL, ug: st.vG }), tEnd: tE, cfl: 0.4, dtMax: 0.01, probes: [0.75 * L, 0.9 * L], nSeries: 1600 });
+      const a = r.series.probes[0], b = r.series.probes[1], i0 = Math.floor(a.length * 0.3), dts = tE / (r.series.t.length - 1), ma = mean(a.slice(i0)), mb = mean(b.slice(i0)); let best = 0, bl = 1; for (let lag = 1; lag < 400; lag++) { let c = 0; for (let i = i0; i + lag < a.length; i++) c += (a[i] - ma) * (b[i + lag] - mb); if (c > best) { best = c; bl = lag; } }
+      flag('Slug capturing: interfacial waves grow into liquid bridges on the test section', r.completed && r.slugs.filter((q) => q.probe === 1).length >= 2 && Math.max(...b) > 0.95, `${r.slugs.filter((q) => q.probe === 1).length} slugs pass the probe at 0.9 L in ${tE} s (vsl = 1, vsg = 1.5 m/s, 78 mm, 240 cells); the initial stratified state is viscous-Kelvin–Helmholtz unstable`);
+      add('Slug capturing: velocity of the captured slugs against the Bendiksen relation', slugVelocity(2.5, D, 0).vt, (0.15 * L) / (bl * dts), 0.15, 'm/s from the cross-correlation of the holdup at 0.75 L and 0.9 L; the model has no closure for the translational velocity, it follows from the mass and momentum balances');
+      add('Slug capturing: liquid mass conservation', 0, r.mass.errorL, 1e-10, 'Relative, with bridging and unbridging cells', false); }
+    await 0;
+    // six-equation form: closed periodic box, phases at different temperatures
+    { const cvL = 4180, cvG = 718, al = 0.3, Tl0 = 320, Tg0 = 290, p0 = 2e5, Rs = 287, Cg = ((1 - al) * p0) / (Rs * Tg0) * cvG, Cl = al * 1000 * cvL, Teq = (Cl * Tl0 + Cg * Tg0) / (Cl + Cg);
+      const r = twoFluid({ n: 16, length: 4, channelH: 0.1, rhoL: 1000, Rs, friction: false, periodic: true, pOut: p0, init: () => ({ al, ul: 0, ug: 0, p: p0, Tl: Tl0, Tg: Tg0 }), tEnd: 40, cfl: 0.4, dtMax: 0.02, energy: { cvL, cvG, hi: 400 } });
+      add('Six-equation model: equilibrium temperature of gas heated by the liquid in a closed volume', Teq, r.Tg[5], 2e-4, 'K; isochoric gas (heat capacity c_v) and incompressible liquid exchanging heat through the interface');
+      add('Six-equation model: pressure rise of the heated gas (ideal gas at constant volume)', (p0 * Teq) / Tg0, r.p[5], 2e-3, 'Pa; p / T_g constant, which couples the gas internal-energy equation to the pressure equation');
+      add('Six-equation model: total internal-energy conservation', 0, r.energy.error, 1e-9, 'Relative', false); }
+  }
+  await 0;
+  { // seven-equation model, exact Riemann solution, entropy
+    const e = 1e-7, ex = riemannExact({ rho: 1, u: 0, p: 1 }, { rho: 0.125, u: 0, p: 0.1 }), run = (n) => baerNunziato({ n, tEnd: 0.2, left: { a1: 1 - e, rho1: 1, u1: 0, p1: 1, rho2: 1, u2: 0, p2: 1 }, right: { a1: 1 - e, rho1: 0.125, u1: 0, p1: 0.1, rho2: 0.125, u2: 0, p2: 0.1 } }), l1 = (r) => mean(r.rho1.map((x, i) => Math.abs(x - ex.sample((r.x[i] - 0.5) / 0.2).rho))), a = run(200), b = run(800);
+    // independent check of the exact solution: mass flux through the right shock from the Rankine–Hugoniot relations
+    const sR = ex.sample(0.5 * (ex.uStar + 1.75)), S = (sR.rho * ex.uStar) / (sR.rho - 0.125);
+    add('Exact Riemann solution of the Sod shock tube: Rankine–Hugoniot momentum jump across the shock', ex.pStar - 0.1, 0.125 * S * ex.uStar, 1e-9, `p* − p_R = ρ_R S u*; p* = ${ex.pStar.toFixed(5)}, u* = ${ex.uStar.toFixed(5)}, shock speed ${S.toFixed(4)}`);
+    add('Seven-equation (Baer–Nunziato) model, shock-tube benchmark: density error against the exact solution', 0, l1(b), 0.008, `Mean absolute error on 800 cells in the single-phase limit (200 cells: ${l1(a).toExponential(2)}); first-order Rusanov fluxes`, false);
+    add('Seven-equation model: observed order on the shock tube', 0.6, Math.log(l1(a) / l1(b)) / Math.log(4), 0.25, 'Between ½ (contact) and 1 (shock) for a first-order scheme', false);
+    add('Seven-equation model: total energy conservation', 0, b.conservation.energy, 1e-12, 'Relative drift of the closed tube', false);
+    add('Seven-equation model: momentum balance with the end-pressure impulse', 0, b.conservation.momentum, 1e-10, 'Relative', false);
+    flag('Entropy inequality: the captured shock produces entropy', a.entropy.production > 0 && b.entropy.production > 0 && b.entropy.production < a.entropy.production, `Total entropy rises by ${a.entropy.production.toExponential(3)} (200 cells) and ${b.entropy.production.toExponential(3)} (800 cells): positive, and falling towards the physical shock production as the numerical dissipation is refined`);
+    const c = baerNunziato({ n: 100, tEnd: 0.002, left: { a1: 0.9, rho1: 1.2, u1: 100, p1: 1e5, rho2: 1000, u2: 100, p2: 1e5 }, right: { a1: 0.1, rho1: 1.2, u1: 100, p1: 1e5, rho2: 1000, u2: 100, p2: 1e5 }, eos: [{ gamma: 1.4, pinf: 0 }, { gamma: 4.4, pinf: 6e8 }] });
+    add('Seven-equation model: a moving volume-fraction contact keeps pressure and velocity uniform', 0, Math.max(...c.p1.map((p) => Math.abs(p / 1e5 - 1)), ...c.p2.map((p) => Math.abs(p / 1e5 - 1)), ...c.u1.map((u) => Math.abs(u / 100 - 1))), 1e-8, 'Largest relative deviation (air / stiffened-gas water interface advected at 100 m/s): the non-conservative terms are discretised consistently', false);
+    // species transport: Ogata–Banks
+    const n = 400, L = 100, D = 0.5, s = Array.from({ length: n + 1 }, (_, i) => (i * L) / n), sp = speciesTransport({ s, qL: s.map(() => 0.1), holdup: s.map(() => 1), A: 0.1, D, cIn: 1, tEnd: 60, cfl: 0.5 });
+    const erfc = (x) => { const z = Math.abs(x), t = 1 / (1 + 0.5 * z), y = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))))); return x >= 0 ? y : 2 - y; };
+    let em = 0; sp.s.forEach((x, i) => { if (x > 15) em = Math.max(em, Math.abs(sp.c[i] - 0.5 * erfc((x - 60) / (2 * Math.sqrt(D * 60))))); });
+    add('Species transport: advection–dispersion of an inlet step (Ogata–Banks solution)', 0, em, 0.02, 'Largest concentration error away from the inlet, u = 1 m/s, D = 0.5 m²/s, t = 60 s, 400 cells', false);
+    add('Species transport: mass balance', 0, sp.balance.error, 1e-12, 'Relative', false);
+  }
+  await 0;
+  { // turbulence closures in the radial solve
+    const tol = { sa: 0.04, sst: 0.05, kestd: 0.04, rng: 0.08, realizable: 0.09, rsm: 0.03 }, lab = Object.fromEntries(RANS_MODELS.map((q) => [q.value, q.label]));
+    for (const m of Object.keys(tol)) { const r = ransPipeExtra({ reTau: 2000, model: m, n: 60, tol: 2e-6 }); add(`${lab[m]}: pipe friction factor against Colebrook (smooth)`, frictionFactor(r.Re, 0), r.f, tol[m], `Re = ${r.Re.toFixed(0)}, ${r.iterations} iterations${m === 'rng' || m === 'realizable' ? '; these closures sit a few per cent low in a plain pipe' : ''}`); if (m === 'rsm') { const j = r.y.findIndex((y) => y > 200), C1 = 1.8, C2 = 0.6, c1 = 0.5, c2 = 0.3, vvk = ((2 / 3) * (C1 - 1) + (2 / 3) * C2 - 3 * (4 / 9) * c2 * C2) / (C1 + 2 * c1), uvk = Math.sqrt(((1 - C2 + 1.5 * c2 * C2) / (C1 + 1.5 * c1)) * vvk); add('Reynolds-stress model: structure parameter −⟨uv⟩/k in the log layer', uvk, -r.stress.uv[j] / r.k[j], 0.08, `Local-equilibrium value of the LRR closure with wall reflection worked out by hand (⟨vv⟩/k = ${vvk.toFixed(3)}); solver at y⁺ = ${r.y[j].toFixed(0)}`); } await 0; }
+  }
+  { // bubbly-flow closures
+    const b = bubbleRise({});
+    add('Virtual (added) mass: initial acceleration of a bubble released from rest', (G * (998 - 1.2)) / (1.2 + 0.5 * 998), b.a0, 1e-12, 'm/s² ≈ 2 g for C_vm = ½: (ρl − ρg) g / (ρg + C_vm ρl)');
+    add('Bubble rise: the transient reaches the terminal velocity of the drag law', b.terminal, b.v[b.v.length - 1], 1e-4, 'm/s, 3 mm bubble in water, Ishii–Zuber drag');
+    const ia = interfacialAreaTransport({ d0: 2e-3, alpha: 0.1, vg: 1, k: 1e-6, length: 20, crc: 0, cti: 0, cdFixed: 1 });
+    add('Interfacial-area transport with wake entrainment only: analytic diameter growth', 2e-3 + 6 * (12 / (36 * PI)) * 0.002 * 0.1 * ia.uRel * 20, ia.dEnd, 1e-9, 'm; dκ/dz = −K κ² gives d(z) = d₀ + 6 K z');
+    const g = REF.GROSSETETE.rig, sm = once('gros', () => bubblyPipe({ R: g.R, jl: g.uLiquid * (1 - g.alphaMean), alphaMean: g.alphaMean, d: g.d, rhoL: g.rhoL, rhoG: 1.19, muL: g.muL, sigma: g.sigma, cl: 0.288 })), big = bubblyPipe({ R: g.R, jl: g.uLiquid * (1 - g.alphaMean), alphaMean: g.alphaMean, d: 0.008, rhoL: g.rhoL, rhoG: 1.19, muL: g.muL, sigma: g.sigma });
+    add('Bubbly pipe flow: position of the void peak against the published profile (Grossetete 1995)', 0.892, sm.peak.r, 0.05, 'r/R of the wall peak of 3.4 mm bubbles (measured maximum at r/R = 0.892)');
+    add('Bubbly pipe flow: height of the void peak against the published profile', 0.107, sm.peak.alpha, 0.2, 'Measured maximum void fraction 0.107');
+    flag('Lift-force sign change: 8 mm bubbles collect in the core', big.cl < 0 && !big.wallPeaked && sm.wallPeaked, `Tomiyama lift coefficient ${big.cl.toFixed(3)} at 8 mm against ${sm.cl.toFixed(3)} at 3.4 mm`);
+    add('Bubbly pipe flow: the profile carries the prescribed mean void', g.alphaMean, sm.mean, 1e-5, 'Area average of the computed profile');
+  }
+  { // annular entrainment / deposition, homogeneous relaxation, closures
+    const p = { vsl: 0.1, vsg: 12, rhoL: 800, rhoG: 60, muL: 1.5e-3, muG: 1.4e-5, sigma: 0.02, D: 0.1, theta: PI / 2, rough: 4.5e-5, P: 6e6, fModel: 'colebrook' }, a = annularMist(p), dv = annularDevelopment({ p, length: a.relaxLength, n: 200, e0: 0 }), cq = (E) => (p.rhoL * p.vsl * E) / (p.vsg + p.vsl * E);
+    add('Annular flow: entrained fraction after one deposition length', 1 - Math.exp(-1), cq(dv.entrained[200]) / cq(dv.eq), 5e-3, 'Droplet concentration relative to equilibrium: the three-field mass balance relaxes exponentially with the length Q_g / (π D k_D) when the droplet volume is small', false);
+    add('Annular flow: film and core momentum balances give the same pressure gradient', a.fric + a.grav, (a.tauW * 4) / p.D + (p.rhoL * a.holdupFilm + (p.rhoG * (1 - a.holdup) + p.rhoL * a.holdupDrops)) * G, 0.03, 'Pa/m: wall shear × perimeter / area + weight of film and core (overall force balance worked out separately)');
+    const xe = 0.05, r = flashingFlow({ G: 500, D: 0.05, length: 2, n: 400, p0: 5e5, x0: 0, pSat: 6e5, xEq: () => xe, vG: () => 1e-3, vL: 1e-3, f: 0, tau: 2, model: 'hrm' });
+    add('Homogeneous relaxation: analytic approach to equilibrium at constant velocity', xe * (1 - Math.exp(-2 / (2 * 500 * 1e-3))), r.x[r.x.length - 1], 1e-5, 'x(z) = x_eq [1 − exp(−z / (Θ u))] for a fixed relaxation time, equal phase volumes and no friction');
+    const R = 461.5, vG = (pp) => (R * 400) / pp, xq = (pp) => Math.max(0, (0.2 * (3e5 - pp)) / 3e5), o = { G: 300, D: 0.05, length: 3, n: 600, p0: 2.9e5, x0: xq(2.9e5), pSat: 3e5, xEq: xq, vG, vL: 1e-3, f: 0.02 }, hem = flashingFlow({ ...o, model: 'hem' }), fast = flashingFlow({ ...o, model: 'hrm', tau: 1e-7 });
+    add('Homogeneous relaxation → homogeneous equilibrium as the relaxation time vanishes', hem.p[hem.p.length - 1], fast.p[fast.p.length - 1], 2e-3, 'Pa at the outlet of a flashing pipe');
+    add('Downar-Zapolski relaxation time at α = 0.1, ψ = 0.1', 6.51e-4 * 0.1 ** -0.257 * 0.1 ** -2.24, relaxationTime(0.1, 0.1), 1e-12, 's; Θ = 6.51·10⁻⁴ α^−0.257 ψ^−2.24');
+    const pb = { vsl: 1, vsg: 0.1, rhoL: 800, rhoG: 60, muL: 1.5e-3, muG: 1.4e-5, sigma: 0.02, D: 0.1, theta: PI / 2, rough: 4.5e-5, P: 6e6 }, ab = holdupGradient(pb, 'ansari'), v0 = 1.53 * ((G * 0.02 * 740) / 800 ** 2) ** 0.25;
+    add('Ansari bubble flow: the holdup satisfies the slip relation v_g = 1.2 v_m + v_s H_L^½', 1.2 * 1.1 + v0 * Math.sqrt(ab.holdup), 0.1 / (1 - ab.holdup), 1e-6, 'm/s, gas velocity from both sides');
+    const dr = holdupGradient(pb, 'dunsRos'), vn = velocityNumbers(pb), S = interp1(DR.NL.map(log10), DR.F1, log10(vn.NL)) + interp1(DR.NL.map(log10), DR.F2, log10(vn.NL)) * vn.NLv + (interp1(DR.NL.map(log10), DR.F3, log10(vn.NL)) - interp1(DR.NL.map(log10), DR.F4, log10(vn.NL)) / vn.ND) * (vn.NGv / (1 + vn.NLv)) ** 2, vs = S / (800 / (G * 0.02)) ** 0.25;
+    add('Duns & Ros bubble region: holdup from the slip velocity', (vs - 1.1 + Math.sqrt((1.1 - vs) ** 2 + 4 * vs * 1)) / (2 * vs), dr.holdup, 1e-9, 'Hand evaluation of S = F1 + F2 N_Lv + F3′ (N_Gv / (1 + N_Lv))² with the chart values');
+    const eq = equipment({ pumpDp0: 20, pumpQmax: 0.4, pumpSpeed: 0.9, sepKv: 2, compHead: 60e3, compQmax: 2 }), cs = eq.compressor(1, 100, 300, 0.9, 0.02, 10);
+    add('Pump characteristic: affinity laws at 90 % speed and half the run-out rate', 20 * 0.81 - (20 / 0.16) * 0.04, eq.pumpDp(0.2), 1e-12, 'bar');
+    add('Compressor characteristic: suction pressure from the polytropic head', 100 / (1 + ((0.3 / 1.3) * 60e3 * 0.75 * 0.02) / (0.9 * RGAS * 300)) ** (1.3 / 0.3), cs.pSuction, 1e-12, 'bara at half the maximum flow (head 45 kJ/kg)');
+    add('Separator characteristic: gas-outlet valve equation', Math.sqrt(20 * 20 + 2 * 9), eq.sepPressure(3, 25, 20), 1e-12, 'bara: p_sep² = p_suction² + K_v q²');
+    const cat = catenaryProfile({ height: 1000, topAngle: 12, n: 400 }), top = cat[400], prev = cat[399];
+    add('Catenary riser: top angle of the generated profile', 12, 90 - Math.atan2(top.z - prev.z, top.x - prev.x) / DEG, 0.02, 'degrees from the vertical (finite-difference slope of the last segment)');
+  }
+  await 0;
+  { // junction
+    const cfg = flowConfig({}, {}), r = steadyBranch({ ...cfg.base, n: 60, mScale: 1, pOut: cfg.pOut, hydrate: false }, { x: 9000, frac: 0.3, length: 2500, dz: 20, tIn: 45 });
+    add('Branch junction: mass balance', r.junction.mMain + r.junction.mBranch, r.junction.mOut, 1e-12, 'kg/s: main + branch = downstream');
+    add('Branch junction: enthalpy of the mixed stream', r.junction.hIn, r.junction.hOut, 1e-6, 'W: the mixed temperature carries the enthalpy of both streams');
+    add('Branch junction: the outlet pressure of the two-part march is met', cfg.pOut, r.pOut, 1e-5, 'bara', false);
+    flag('Branch junction: the mixed temperature lies between the two arriving streams', r.junction.tMix > Math.min(r.junction.tMain, r.junction.tBranch) - 1e-6 && r.junction.tMix < Math.max(r.junction.tMain, r.junction.tBranch) + 1e-6, `${r.junction.tMain.toFixed(2)} °C (main) and ${r.junction.tBranch.toFixed(2)} °C (branch) mix to ${r.junction.tMix.toFixed(2)} °C`);
+  }
+  await 0;
+  { // 2-D solver and interface schemes
+    const cav = once('cavity100', () => cfd2d({ nx: 32, ny: 32, rho: 1, mu: 0.01, lid: 1, tEnd: 40, steady: 1e-4, cfl: 0.5, poissonTol: 1e-6 })); let e = 0; for (const q of REF.GHIA.rows) if (q[0] === 0 && q[1] > 0 && q[1] < 1) e = Math.max(e, Math.abs(interp1(cav.y, cav.uMid, q[1]) - q[2]));
+    add('Lid-driven cavity at Re = 100: u on the vertical centre line against Ghia, Ghia & Shin (1982)', 0, e, 0.01, 'Largest difference from the 15 tabulated interior values (lid velocity 1), 32 × 32 cells', false);
+    add('2-D solver: discrete continuity', 0, cav.divergenceMax, 1e-6, 'Largest cell divergence × Δx / |u|max over the run', false);
+    const mu = 0.1, po = cfd2d({ nx: 4, ny: 16, lx: 0.5, ly: 1, rho: 1, mu, fx: 1, periodicX: true, tEnd: 30, steady: 1e-9 });
+    add('Plane Poiseuille flow: maximum velocity', 1 / (8 * mu), Math.max(...po.u.map((q) => q[1])), 2e-3, 'Body-force driven periodic channel, 16 cells across');
+    await 0;
+    const za = interfaceAdvect2D({ n: 50, scheme: 'vof', test: 'zalesak' }), zf = interfaceAdvect2D({ n: 50, scheme: 'front', test: 'zalesak' });
+    add('Zalesak slotted disc, volume of fluid (THINC/WLIC): volume conservation', 0, za.massError, 1e-6, 'Relative after one revolution on 50 × 50 cells', false);
+    add('Zalesak slotted disc, volume of fluid: shape error', 0, za.shapeError, 0.35, 'L1 error of the liquid fraction relative to the disc area; the slot is 2.5 cells wide on this grid, so the bridge above it is smeared; front tracking below shows the same test without that limit', false);
+    add('Zalesak slotted disc, front tracking: shape error', 0, zf.shapeError, 0.05, 'Markers advected with a second-order Runge–Kutta step', false);
+    await 0;
+    const sch = ['vof', 'levelset', 'clsvof', 'phasefield'], lim = { vof: 0.15, levelset: 0.2, clsvof: 0.15, phasefield: 0.45 }, cons = { vof: 1e-11, levelset: 0.25, clsvof: 1e-11, phasefield: 1e-11 }, nm = { vof: 'Volume of fluid', levelset: 'Level set', clsvof: 'Coupled level set / VOF', phasefield: 'Phase field' }; let rv = null;
+    for (const q of sch) { const d = interfaceAdvect2D({ n: 40, scheme: q, test: 'translateDiag' }); add(`${nm[q]}: circle advected diagonally across a periodic grid, shape error`, 0, d.shapeError, lim[q], `Volume error ${d.massError.toExponential(1)}${q === 'levelset' ? ' (the level set does not conserve volume; the coupled scheme takes it from the VOF field)' : q === 'phasefield' ? ' (diffuse interface about three cells wide)' : ''}`, false); add(`${nm[q]}: volume conservation`, 0, d.massError, cons[q], 'Relative', false); if (q === 'vof') rv = d; await 0; }
+    const ax = interfaceAdvect2D({ n: 40, scheme: 'vof', test: 'translateX' });
+    add('Mesh-orientation sensitivity: diagonal against grid-aligned advection (volume of fluid)', 1, rv.shapeError / ax.shapeError, 1, `Ratio of the shape errors (${rv.shapeError.toFixed(4)} diagonal, ${ax.shapeError.toFixed(4)} along x): the split scheme is at most about twice as inaccurate across the mesh`, false);
+    const a0 = 0.25, dm = cfd2d({ nx: 32, ny: 16, lx: 2, ly: 1, rhoL: 1000, rhoG: 1.2, muL: 1e-3, muG: 1.8e-5, gy: -G, c0: (x, y) => (x < a0 && y < 2 * a0 ? 1 : 0), tEnd: 0.4, probeFront: true, turbulence: 'sst' });
+    add('RANS + VOF dam break in a channel (SST k–ω): liquid volume conservation', 0, dm.mass.error, 1e-8, 'Relative, 32 × 16 cells, water and air', false);
+    flag('RANS + VOF dam break: the front stays behind the frictionless shallow-water limit', dm.front.x[dm.front.x.length - 1] > 2 * a0 && dm.front.x[dm.front.x.length - 1] < a0 + 2 * Math.sqrt(G * 2 * a0) * 0.4, `Front at ${dm.front.x[dm.front.x.length - 1].toFixed(2)} m after 0.4 s; Ritter limit ${(a0 + 2 * Math.sqrt(G * 2 * a0) * 0.4).toFixed(2)} m`);
+    await 0;
+    const ReT = 180, ch = cfd2d({ nx: 4, ny: 32, lx: 0.4, ly: 2, rho: 1, mu: 1 / ReT, fx: 1, periodicX: true, turbulence: 'sst', tEnd: 25, steady: 2e-4, u0: (x, y) => 17 * Math.max(1 - Math.abs(y - 1), 0.02) ** (1 / 7), k0: 1, omega0: 20, cfl: 0.5, poissonTol: 1e-6 });
+    add('SST k–ω in the 2-D solver: bulk velocity of a turbulent channel against the log law', Math.log(ReT) / 0.41 + 5.2 - 1 / 0.41, mean(ch.u.map((q) => q[1])), 0.1, `U_b / u_τ at Re_τ = 180 on 32 uniform cells (first cell centre at y⁺ = 5.6), started from a 1/7-power profile and run until the velocity changes by less than ${ch.steadyResidual.toExponential(1)} per unit time; the integral of the log law is the reference`);
+  }
+}
+
+// =====================================================================================================
+// 7k. Provenance of the constants used by this suite and by the pipe-flow kernel (js/core/pipe.js)
+// =====================================================================================================
+const FL = 'https://github.com/CalebBell/fluids', HT = 'https://github.com/CalebBell/ht', UF = 'https://github.com/unifloc/unifloc_vba/blob/master/modules_txt/u7_Multiphase_PVT.txt', OF = 'https://github.com/OpenFOAM/OpenFOAM-dev', D0 = '2026-10-08';
+const pv = (item, used, source, url, status, note) => ({ item, used, source, url, retrieved: D0, status, note });
+export const PROVENANCE = [
+  pv('Colebrook–White, Haaland, Swamee–Jain and Churchill (1977) friction factors', 'pipe.js frictionFactor()', 'C. Bell, fluids (MIT), fluids/friction.py', FL + '/blob/master/fluids/friction.py', 'verified', 'Formulas compared term by term; the library examples at Re = 1e5, ε/D = 1e-4 are reproduced to 1e-9 or better (Swamee–Jain to 1e-6: the kernel uses the rounded constant 5.74 where the library writes 6.97^0.9 = 5.7407).'),
+  pv('Gnielinski turbulent Nusselt number', 'pipe.js hInside()', 'C. Bell, ht (MIT), ht/conv_internal.py turbulent_Gnielinski', HT + '/blob/master/ht/conv_internal.py', 'verified', 'Same expression; the kernel inserts the smooth-pipe Haaland friction factor, which gives 3.5 % less than the library example with f = 0.0185.'),
+  pv('Churchill–Bernstein cross-flow Nusselt number', 'pipe.js nuCrossFlow(), hOutside()', 'C. Bell, ht (MIT), ht/conv_external.py Nu_cylinder_Churchill_Bernstein', HT + '/blob/master/ht/conv_external.py', 'verified', 'Library example Nu(6071, 0.7) = 40.637 reproduced to 1e-12.'),
+  pv('Churchill–Chu free convection of a horizontal cylinder; Nu³ = Nu_forced³ + Nu_free³', 'pipe.js nuFreeCylinder(), hOutside(…, dT)', 'C. Bell, ht (MIT), ht/conv_free_immersed.py Nu_horizontal_cylinder_Churchill_Chu', HT + '/blob/master/ht/conv_free_immersed.py', 'verified', 'New in the kernel. Library example Nu(Pr = 0.69, Gr = 2.63e9) = 139.135 reproduced to 1e-12. The cubic combining rule for mixed convection is the usual engineering rule and was not compared with a source.'),
+  pv('Seawater properties in the outside film', 'pipe.js hOutside()', 'core/props.js (Sharqawy, Lienhard & Zubair 2010; Nayar et al. 2016)', 'https://web.mit.edu/seawater/', 'corrected', 'Old: hard-coded fits μ = 1.9e-3 exp(−0.027 T) + 3.5e-4 Pa s and Pr = 13.4 exp(−0.027 T) + 2, which were 23–37 % and 20–39 % above the property module at 4–25 °C. New: density, viscosity, conductivity and heat capacity of core/props.js at 35 g/kg. The forced-convection film coefficient rises by about 10 %.'),
+  pv('Beggs & Brill (1973) flow-pattern limits L1–L4, holdup coefficients a, b, c, inclination coefficients, friction-factor ratio', 'pipe.js beggsBrill()', 'C. Bell, fluids (MIT), fluids/two_phase.py Beggs_Brill', FL + '/blob/master/fluids/two_phase.py', 'verified', 'All 4 + 9 + 12 + 5 constants identical; the library example (m = 0.6 kg/s, x = 0.1, 50 mm, horizontal) gives 686.9724506803 Pa/m in both codes.'),
+  pv('Payne et al. (1979) holdup factors 0.924 (uphill) and 0.685 (downhill)', 'pipe.js beggsBrill()', 'not found in an openly readable source during this task', 'https://doi.org/10.2118/6874-PA', 'corrected', 'The factors themselves are unverified (the paper is not open). Corrected use: the kernel applied 0.924 to horizontal flow as well; the original correlation, fitted to horizontal data, is now left unscaled at exactly 0°, which is what makes the kernel agree with the independent library example.'),
+  pv('Taitel & Dukler (1976) stratified momentum balance and transitions (Kelvin–Helmholtz, wave generation s = 0.01, dispersed bubble)', 'pipe.js stratifiedLevel(), flowPattern()', 'C. Bell, fluids (MIT), fluids/two_phase.py Taitel_Dukler_regime (dimensionless groups X, T, F, K)', FL + '/blob/master/fluids/two_phase.py', 'verified', 'The kernel solves the level and evaluates the criteria directly instead of interpolating the published curves; the groups are equivalent. Deviations kept on purpose: interfacial friction f_i = max(f_G, 0.0142) and annular flow below h/D = 0.35 (Barnea) instead of 0.5.'),
+  pv('Taitel, Barnea & Dukler (1980) upward transitions: bubble–slug, dispersed bubble 4.0{…}, annular 3.1[σ g Δρ]^¼/ρg^½, D > 19[…]^½', 'pipe.js flowPattern()', 'unifloc_vba (MIT), Ansari flow-pattern routines fpup / mpoint / dbtran', UF, 'corrected', 'Bubble–slug boundary: old vsg < (vsl + 1.15 × 1.53 [gΔρσ/ρl²]^¼ sinθ)/3, new (vsl + 0.75 × 1.53 […]^¼ sinθ)/3 — the 1.15 of the published form already contains the 1.53 of the Harmathy velocity (0.75 × 1.53 = 1.15), as in the open code. The annular constant 3.1 and the diameter limit 19 agree. The dispersed-bubble constant 4.0 and exponents, the 0.52 packing limit and the churn rule (vsg > 0.6 v_annular) were not found in an open source: unverified; the churn rule is an engineering simplification of the entry-length criterion.'),
+  pv('Bendiksen (1984) C0 = 1.05 + 0.15 sin²θ, v_d = (0.54 cosθ + 0.35 sinθ)√(gD), Fr < 3.5; C0 = 1.2 above', 'pipe.js slugVelocity()', 'not found in an openly readable source', 'https://doi.org/10.1016/0301-9322(84)90057-0', 'unverified', 'Checked only against measurements: 134 bubble-nose velocities at 0–90° (UNICAMP) are reproduced with 12.6 % mean error and 15 horizontal ones (Mohmmed et al.) with 11.4 %.'),
+  pv('Gregory, Nicholson & Aziz (1978) slug-body holdup 1/(1 + (v_m/8.66)^1.39)', 'pipe.js slugBodyHoldup()', 'not found in an openly readable source', 'https://doi.org/10.1016/0301-9322(78)90023-X', 'unverified', 'No open copy of the formula and no open slug-body holdup measurements were found.'),
+  pv('Gregory & Scott (1969) and Zabaras (2000) slug-frequency correlations; Heywood & Richardson (1979)', 'pipe.js slugFrequency(); slugUnitCell()', 'not found in an openly readable source', 'https://doi.org/10.1002/aic.690150623', 'unverified', 'Checked against measurements instead: Gregory–Scott gives 19.6 % mean error on 30 horizontal 74 mm points (Mohmmed et al.); the Zabaras form overpredicts 67 points in an inclined 26 mm pipe by a factor of about 2.4.'),
+  pv('Slug length: Scott, Shoham & Brill (1989) ln L = −26.6 + 28.5 [ln D + 3.67]^0.1, 32 D below 0.1 m; Brill et al. (1981); Norris (1982)', 'pipe.js slugLength(); slugUnitCell()', 'not found in an openly readable source', 'https://doi.org/10.2118/15103-PA', 'unverified', 'The only open length data found are for short laboratory lines (108 D and 306 D), where slugs are not developed: the 32 D rule overpredicts them 2 to 6 times (see the reference data sets).'),
+  pv('Slug unit cell: frequency and length', 'pipe.js slugUnit()', 'unit-cell identity f L_u = v_t, L_s = β L_u', 'https://github.com/CalebBell/fluids', 'corrected', 'Old: frequency from the Zabaras correlation and length from the Scott correlation side by side (0.26 1/s with 79 m bodies on the reference line, i.e. 2 m bodies implied by the frequency). New: one of the two is derived from the other (default: length kept, frequency = β v_t / L_s = 0.0066 1/s there); the unused correlation value is reported as freqCorrelation / lengthCorrelation.'),
+  pv('Bøe (1981) criterion, Pots (1987) number, Taitel (1986) stability pressure', 'pipe.js severeSlugging(); severeScreen()', 'not found in an openly readable source', 'https://doi.org/10.1016/0301-9322(86)90027-4', 'unverified', 'The forms are derived balances (liquid head build-up against gas pressure build-up) without fitted constants except the 0.89 of the Taitel criterion. The cycle model is compared with 23 measured cycle times (Jansen, Shoham & Taitel 1996): 32 % mean error.'),
+  pv('API RP 14E erosional velocity v_e = C/√ρ, C = 100 continuous service (122 in SI)', 'steadySolve() evr', 'pengtools wiki, Erosional velocity', 'https://wiki.pengtools.com/index.php?title=Erosional_velocity', 'verified', 'C = 100 for continuous and 125 for non-continuous service in lb, ft, s units; factor 1.22 converts to kg, m, s.'),
+  pv('Hagedorn & Brown (1965) holdup chart fits H_L/ψ and ψ, Griffith bubble-flow limit 1.071 − 0.2218 v_m²/D ≥ 0.13', 'hagedornBrown()', 'unifloc_vba (MIT), unf_HagedornandBrawnmodified', UF, 'verified', 'Both polynomials agree to the digits carried (b0…b4 = −0.1030658, 0.617774, −0.632946, 0.29598, −0.0401; c0…c4 = 0.9116257, −4.821756, 1232.25, −22253.58, 116174.3). The CN_L fit used here (log-polynomial) differs in form from the two open fits found (quartic in N_L; Economides cubic) and was not compared point by point: that part is unverified.'),
+  pv('Gray (1974): A = −2.314 [N_v (1 + 205/N_D)]^B, B = 0.0814 [1 − 0.0554 ln(1 + 730 R/(R + 1))], pseudo-roughness 28.5 σ/(ρ v²) ≥ 2.77e-5', 'gray()', 'unifloc_vba (MIT) unf_GrayModifiedGradient; pengtools wiki Gray correlation', UF, 'verified', 'The two open sources disagree with each other in single digits (the wiki prints −2.2314 and 0.554, the code 250/N_D); each constant used here is confirmed by one of them and the remaining digits by the other: −2.314, 0.0554, 730 (code) and 205, 28.5, 0.007, 2.77e-5 (wiki).'),
+  pv('Orkiszewski (1967) liquid-distribution coefficient (four equations), limits, Griffith–Wallis boundary', 'orkiszewski()', 'N. Antipin, orkiszewski_model (GitHub, no licence stated), two_phases/orkiszewski_model.py', 'https://github.com/Nikita-antipin/orkiszewski_model', 'verified', 'Three of the four equations agree in every constant. The fourth (oil, v_m > 10 ft/s) has 0.161 here and 0.167 in the open code; 0.161 is kept because it makes the two oil equations continuous at 10 ft/s for tubing sizes (the 0.167 would not): that single constant is unverified. Bubble-rise Reynolds-number branches (0.546, 0.35, 0.251, 8.74e-6, 13.59) were not found in an open source: unverified.'),
+  pv('Mukherjee & Brill (1985): three holdup coefficient sets, four transition equations, friction-ratio table', 'mukherjeeBrill()', 'S. Sakurai, MukherjeeBrill R package (MIT), R/MukherjeeBrill.R', 'https://github.com/sshunsuke/MukherjeeBrill', 'verified', 'All 18 holdup coefficients, the 4 transition equations and the 8-point f_R table identical.'),
+  pv('Duns & Ros (1963): F1–F7, L1, L2, f2 chart values, L_S = 50 + 36 N_Lv, L_M = 75 + 84 N_Lv^0.75, slip and friction procedure, mist-flow film roughness', 'dunsRos(), mistFriction()', 'open digitisations and code: ObuxoffCost/Duns-Ros (dense chart digitisation), TRUEVORO/duns_ros_cor (algorithm and a coarse table), lucasnasution/DunsRos (MIT; L1, L2, F5, F6)', 'https://github.com/TRUEVORO/duns_ros_cor', 'verified', 'New. Chart values sampled from the dense digitisation at 13 N_L nodes; the independent coarse table agrees within 10 % except L1 near N_D = 30 (1.6 against 2.0), where two of the three digitisations agree and are used. The procedure follows the open code. The mist-flow roughness constants (0.0749, 0.3713, 0.302, 0.005) agree with it.'),
+  pv('Ansari et al. (1994) mechanistic model: transitions, Taylor-bubble relations (1.2 v_m + 0.35 √(gDΔρ/ρl), 9.916 √(gD(1 − √α))), H_gLS = v_sg/(0.425 + 2.65 v_m), entrainment 1 − exp[−0.125(v_crit − 1.5)], Z = 1 + 300 δ/D or 1 + 24 (ρl/ρg)^⅓ δ/D, film stability', 'ansari(), ansariPattern(), entrainmentFraction()', 'unifloc_vba (MIT): Ansari, anmist, bubble, slug, chkan, Func, fpup, mpoint, dbtran', UF, 'verified', 'New. Implemented from the open code (a port of the Tulsa routines); the falling-film constant is 9.916 in one routine and 9.961 in another there — 9.916 is used.'),
+  pv('Baker (1954) map: coordinates B_x, B_y (531 and 2.16 follow from λ and ψ) and six log-polynomial boundary fits', 'bakerRegime()', 'not found in an openly readable source', 'https://github.com/CalebBell/fluids', 'unverified', 'New, and the weakest item of the suite: the boundary fits and the region logic are reproduced without an open reference; the split between stratified and plug flow below the wave region is an assumption (see the function comment). On the open horizontal data the six curves separate the observed classes plausibly, but the map is shown for comparison only and is not used by any solver.'),
+  pv('Wallis interfacial friction 0.005 (1 + 300 δ/D) form, critical Weber number 12 for droplets, deposition velocity 0.15 m/s', 'annularMist(), annularDevelopment()', 'Z = 1 + 300 δ/D: unifloc_vba (MIT); the other two: not found in an open source', UF, 'unverified', 'New. The equilibrium entrained fraction is the sourced Wallis / Ansari correlation; the entrainment rate is written as k_D C_eq so that only the development length depends on the unverified deposition velocity, which is a calibration parameter. Ishii–Mishima and Pan–Hanratty could not be read from an open source and are not used.'),
+  pv('Homogeneous-relaxation model: Θ = 6.51e-4 α^−0.257 ψ^−2.24 s, ψ = (p_sat − p)/p_sat (Downar-Zapolski et al. 1996, below 10 bar)', 'relaxationTime(), flashingFlow()', 'arXiv:2109.15203 (LaTeX source, eqs. for Θ)', 'https://arxiv.org/abs/2109.15203', 'verified', 'New. Constants and exponents identical. The correlation was fitted to flashing water; its use for hydrocarbons is indicative.'),
+  pv('Bubble closures: Tomiyama lift polynomial, Wellek aspect ratio 1/(1 + 0.163 Eo^0.757), Antal wall force (−0.01, 0.05), Burns dispersion (σ = 0.7), Sato viscosity 0.6, virtual mass 0.5, Ishii–Zuber drag', 'liftTomiyama(), dragIshiiZuber(), bubblyPipe(), bubbleRise()', 'OpenFOAM-dev (GPL-3.0) multiphaseEuler interfacial models and the tutorial case Grossetete', OF + '/tree/master/applications/modules/multiphaseEuler/phaseSystem/interfacialModels', 'verified', 'New. Formulas and default coefficients read from the source files and the tutorial dictionaries.'),
+  pv('One-group interfacial-area transport: C_RC = 0.04, C = 3, α_max = 0.75, C_WE = 0.002, C_TI = 0.085, We_cr = 6', 'interfacialAreaTransport()', 'OpenFOAM-dev (GPL-3.0) IATE sources and tutorial bubbleColumnIATE', OF + '/tree/master/applications/modules/multiphaseEuler/phaseSystem/diameterModels/IATE', 'verified', 'New. Source terms and coefficients as in the open code.'),
+  pv('Turbulence constants: SST k–ω (0.85, 1, 0.5, 0.856, 5/9, 0.44, 0.075, 0.0828, 0.09, a1 = 0.31, c1 = 10), Spalart–Allmaras (0.1355, 0.622, 2/3, 0.41, 0.3, 2, 7.1), standard / RNG (0.0845, 1.42, 1.68, 0.71942, η0 = 4.38, β = 0.012) / realizable (A0 = 4, C2 = 1.9, σε = 1.2) k–ε, LRR (1.8, 0.6, 0.25, 0.15, 1.44, 1.92, wall reflection 0.5, 0.3), wall functions κ = 0.41, E = 9.8', 'ransPipeExtra(), cfd2d()', 'OpenFOAM-dev (GPL-3.0) src/MomentumTransportModels; Turbulence Modeling Resource (SST, SA)', OF + '/tree/master/src/MomentumTransportModels/momentumTransportModels', 'verified', 'New. Default coefficients read from the source files. Each closure is also checked against the smooth-pipe friction law (verification tab).'),
+  pv('Wilcox (1988) k–ω (5/9, 0.075, 0.09, 0.5, 0.5) and Chien (1982) low-Reynolds k–ε damping functions', 'ransPipe()', 'not compared with an open source in this task (OpenFOAM ships the 1998 Wilcox constants 0.52 / 0.072)', OF, 'unverified', 'Both closures reproduce the smooth-pipe friction law within 5–6 %.'),
+  pv('Taylor axial dispersion 10.1 R u*', 'runExtras() species transport default', 'not found in an openly readable source', 'https://doi.org/10.1098/rspa.1954.0130', 'unverified', 'Used only as the default of the dispersion input.'),
+  pv('Mandhane, Gregory & Aziz (1974) transition lines', 'mandhaneRegime()', 'C. Bell, fluids (MIT), fluids/two_phase.py Mandhane_Gregory_Aziz_regime', FL + '/blob/master/fluids/two_phase.py', 'corrected', 'Annular-mist line: the break points (70, 60, 38, 40, 50, 100, 230 ft/s) agree with the piecewise power laws of the open code. Stratified / wave line: old break points (0.01, 14), (0.1, 10.5), (0.3, 2.5), (0.5, 2.5), (1.7, 3.25) ft/s were shifted; new (0.01, 32.7), (0.1, 14), (0.2, 10.5), (1.15, 2.5), (4.8, 2.5), (14, 3.26) from the open code. The property corrections X1, Y1 of the original are not applied (air–water coordinates).'),
+  pv('Reference validation data', 'validationData', 'see each data set', 'https://data.mendeley.com/datasets/dngzx3dy72/1', 'verified', 'All rows were read from the cited addresses on the retrieval date and are stored in js/data/ref/flow.js rounded to five significant figures.'),
+];
+
+/*NEW-SECTIONS-END*/
 // =====================================================================================================
 // 8. Suite assembly
 // =====================================================================================================
 const cellOf = (st, i) => ({ vsl: st.vsl[i], vsg: st.vsg[i], rhoL: st.rhoL[i], rhoG: st.rhoG[i], muL: st.muL[i], muG: st.muG[i], sigma: st.sigma[i], D: st.D[i], theta: st.theta[i] });
-const slugOpts = (v) => ({ freqModel: ['zabaras', 'gregory', 'heywood', 'unitCell'].includes(v.freqModel) ? v.freqModel : 'unitCell', lengthModel: ['scott', 'brill', 'norris'].includes(v.lengthModel) ? v.lengthModel : 'scott', vtModel: v.vtModel === 'nicklin' ? 'nicklin' : 'bendiksen', bodyModel: v.bodyModel === 'barnea' ? 'barnea' : 'gregory', freqMult: num(v.freqMult, 1, 0.01, 100), lenMult: num(v.lenMult, 1, 0.01, 100), filmMult: num(v.filmMult, 1, 0.2, 3) });
+const slugOpts = (v) => ({ freqModel: ['zabaras', 'gregory', 'heywood', 'unitCell'].includes(v.freqModel) ? v.freqModel : 'unitCell', lengthModel: ['scott', 'brill', 'norris'].includes(v.lengthModel) ? v.lengthModel : 'scott', vtModel: v.vtModel === 'nicklin' ? 'nicklin' : 'bendiksen', bodyModel: v.bodyModel === 'barnea' ? 'barnea' : 'gregory', freqMult: num(v.freqMult, 1, 0.01, 100), lenMult: num(v.lenMult, 1, 0.01, 100), filmMult: num(v.filmMult, 1, 0.2, 3), vtMult: num(v.vtMult, 1, 0.5, 2), bodyMult: num(v.bodyMult, 1, 0.5, 1.5) });
 const isSlug = (r) => r === 'slug' || r === 'churn';
 const pwl = (ts, ys) => (t) => interp1(ts, ys, t);
 const DEFAULT_SCHEDULE = [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.25, rate: 1, dp: 0, choke: 100 }, { t: 0.5, rate: 0.6, dp: 0, choke: 100 }, { t: 6, rate: 0.6, dp: 0, choke: 100 }];
@@ -1099,7 +2405,8 @@ function buildTransient(v, st) {
   }
   const mid = fm.at(0.5 * (st.pIn + st.pOut), 0.5 * (st.tIn + st.tOut)), D = cfg.idOf ? cfg.idMin : cfg.id, jOut = ref ? ref.vm[ref.n] : 1, rhoOut = ref ? ref.rhoM[ref.n] : 100;
   const chokeK = cfg.chokeDp > 0 ? (cfg.chokeDp * 1e5 * (st.mScale * Math.max(r0, 0.05)) ** 2) / Math.max(rhoOut * jOut * jOut, 1e-6) : 0;
-  const sim = makeTransient({ fm, grid, D, rough: cfg.rough, init, mdot0, mdotOf: (t) => mdotCase * rateOf(t), tInOf: () => cfg.tIn, pOutOf: (t) => Math.max(cfg.pSep + dpOf(t), 1.05), chokeOf, chokeK,
+  const jn = st.junction || null, mMain = jn ? jn.mMain : mdotCase; if (jn && !uniform) mdot0 = mMain * r0;
+  const sim = makeTransient({ fm, grid, D, rough: cfg.rough, init, mdot0, mdotOf: (t) => mMain * rateOf(t), sources: jn ? [{ s: jn.s, mdotOf: (t) => jn.mBranch * rateOf(t), T: jn.tBranch }] : [], tInOf: () => cfg.tIn, pOutOf: (t) => Math.max(cfg.pSep + dpOf(t), 1.05), chokeOf, chokeK,
     slip, fricMult: slip.fricMult, U: at(st, st.U), tAmb: grid.sc.map((s, i) => cfg.tAmbOf(s, grid.zc[i])), wallC: (BASE.rhoSteel * 470 * ((D + 2 * cfg.wt) ** 2 - D * D)) / (D * D), cpG: mid.cpG, cpL: mid.cpL,
     cfl: num(v.cfl, 0.6, 0.05, 0.95), tEnd, nSeries: 380, nField: 70, maxSteps: 60000 });
   return { sim, grid, tEnd, slip, matched, ref, rows, uniform };
@@ -1190,8 +2497,71 @@ const INPUTS = [
   ] },
   { group: 'Local models and comparisons', tab: 'setup', fields: [
     { key: 'localModels', label: 'Run the local models (radial RANS, interface capturing)', type: 'bool', value: true },
-    { key: 'ransModel', label: 'Turbulence model of the radial solve', type: 'select', value: 'mixing', options: [{ value: 'mixing', label: 'Mixing length (van Driest)' }, { value: 'komega', label: 'k–ω (Wilcox)' }, { value: 'kepsilon', label: 'Low-Reynolds k–ε (Chien)' }], showIf: (v) => v.localModels !== false },
+    { key: 'ransModel', label: 'Turbulence model of the radial solve', type: 'select', value: 'mixing', options: RANS_MODELS, showIf: (v) => v.localModels !== false },
     { key: 'compareModels', label: 'Compare all holdup models', type: 'bool', value: true },
+  ] },
+  { group: 'Branch, pump, separator and compressor', tab: 'inputs', help: 'Flows between connected branches and the hydraulic characteristics of the equipment at the ends of the line. With a branch the boundary condition is the outlet pressure with given rates.', fields: [
+    { key: 'branchFrac', label: 'Branch share of the total rate', unit: '–', value: 0, min: 0, max: 0.95, help: '0 = no branch. The branch carries the same fluid and joins the main line at the junction; mass and enthalpy are mixed there.' },
+    { key: 'branchX', label: 'Junction position on the main line', unit: 'm', value: 9000, min: 0, max: 1e6, showIf: (v) => v.branchFrac > 0 },
+    { key: 'branchLength', label: 'Branch length', unit: 'm', value: 3000, min: 10, max: 1e6, showIf: (v) => v.branchFrac > 0 },
+    { key: 'branchDz', label: 'Elevation gain along the branch', unit: 'm', value: 0, min: -3000, max: 3000, showIf: (v) => v.branchFrac > 0 },
+    { key: 'branchIdMm', label: 'Branch inner diameter (0 = as the main line)', unit: 'mm', value: 0, min: 0, max: 1500, showIf: (v) => v.branchFrac > 0 },
+    { key: 'branchTin', label: 'Branch inlet temperature', unit: '°C', value: BASE.tIn, min: -20, max: 200, showIf: (v) => v.branchFrac > 0 },
+    { key: 'pumpDp0', label: 'Booster pump at the inlet: shut-off pressure rise', unit: 'bar', value: 0, min: 0, max: 400, help: '0 = no pump. Δp = Δp₀ s² − (Δp₀/q_max²) q² with the suction volume rate q.' },
+    { key: 'pumpQmax', label: 'Booster pump: run-out volume rate at rated speed', unit: 'm³/s', value: 0.5, min: 0.001, max: 50, showIf: (v) => v.pumpDp0 > 0 },
+    { key: 'pumpSpeed', label: 'Booster pump: speed / rated speed', unit: '–', value: 1, min: 0.2, max: 1.5, showIf: (v) => v.pumpDp0 > 0 },
+    { key: 'sepMode', label: 'Separator pressure', type: 'select', value: 'fixed', options: [{ value: 'fixed', label: 'Fixed (given outlet pressure)' }, { value: 'valve', label: 'From the gas-outlet valve and the compressor curve' }] },
+    { key: 'sepKv', label: 'Gas-outlet valve coefficient K_v in p_sep² − p_suc² = K_v q²', unit: 'bar²/(Sm³/s)²', value: 0.5, min: 0, max: 1e5, showIf: (v) => v.sepMode === 'valve' },
+    { key: 'compPd', label: 'Compressor discharge pressure', unit: 'bara', value: 120, min: 2, max: 800, showIf: (v) => v.sepMode === 'valve' },
+    { key: 'compHead', label: 'Compressor polytropic head at zero flow', unit: 'kJ/kg', value: 200, min: 0, max: 500, showIf: (v) => v.sepMode === 'valve' },
+    { key: 'compQmax', label: 'Compressor suction volume rate at zero head', unit: 'm³/s', value: 2, min: 0.001, max: 500, showIf: (v) => v.sepMode === 'valve' },
+    { key: 'compSpeed', label: 'Compressor speed / rated speed', unit: '–', value: 1, min: 0.3, max: 1.3, showIf: (v) => v.sepMode === 'valve' },
+  ] },
+  { group: 'Measurements for comparison', tab: 'inputs', help: 'Optional. Local measurements of any flow configuration (horizontal, inclined, vertical; gas–liquid, oil–water with the lighter liquid as the “gas” phase, gas–oil–water through the water cut) and system measurements of this line are compared with the model; the deviations and error statistics appear in the result tables.', fields: [
+    { key: 'valPoints', label: 'Local measurements', type: 'table', columns: [{ key: 'kind', label: 'Quantity (holdup, dpdx, regime, slugFreq, slugLength, slugVelocity, bodyHoldup, filmThickness, level, entrainment)', type: 'text' }, { key: 'D', label: 'Diameter', unit: 'mm' }, { key: 'angle', label: 'Inclination', unit: '°' }, { key: 'vsl', label: 'Superficial liquid velocity', unit: 'm/s' }, { key: 'vsg', label: 'Superficial gas velocity', unit: 'm/s' }, { key: 'rhoL', label: 'Liquid (oil) density', unit: 'kg/m³' }, { key: 'rhoG', label: 'Gas density', unit: 'kg/m³' }, { key: 'muL', label: 'Liquid (oil) viscosity', unit: 'mPa·s' }, { key: 'muG', label: 'Gas viscosity', unit: 'mPa·s' }, { key: 'sigma', label: 'Interfacial tension', unit: 'mN/m' }, { key: 'wc', label: 'Water cut of the liquid', unit: '%' }, { key: 'P', label: 'Pressure', unit: 'bara' }, { key: 'measured', label: 'Measured value (SI; dpdx in Pa/m, film in mm; text for regime)', type: 'text' }], value: [], help: 'One row per measured point.' },
+    { key: 'valSystem', label: 'System measurements of this line', type: 'table', columns: [{ key: 'quantity', label: 'Quantity (pIn, dp, tOut, inventory, holdupMean, slugPeriod, slugFrequency, slugLength, slugLengthMax, slugVelocity, bodyHoldup, surge, catcherLoad, pAmplitude, severePeriod, severeAmplitude, cooldown, terrainVolume, tracerArrival)', type: 'text' }, { key: 'measured', label: 'Measured value' }], value: [], help: 'Field or loop measurements of the simulated line, e.g. slug-catcher load, pressure-fluctuation amplitude, cooldown time, terrain-slug volume.' },
+  ] },
+  { group: 'Closure parameters', tab: 'setup', help: 'Multipliers and constants of the closure laws; all can be estimated on the Calibration tab.', fields: [
+    { key: 'fiMult', label: 'Interfacial-friction multiplier (stratified flow)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'fwlMult', label: 'Liquid-wall friction multiplier (stratified flow)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'fwgMult', label: 'Gas-wall friction multiplier (stratified flow)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'transMult', label: 'Stratified → slug transition: multiplier on the critical gas velocity', unit: '×', value: 1, min: 0.3, max: 3 },
+    { key: 'entMult', label: 'Entrainment-rate multiplier (annular flow)', unit: '×', value: 1, min: 0.05, max: 10 },
+    { key: 'kDep', label: 'Droplet deposition velocity', unit: 'm/s', value: 0.15, min: 0.001, max: 5 },
+    { key: 'weCrit', label: 'Critical Weber number of the droplets (droplet size)', unit: '–', value: 12, min: 1, max: 60 },
+    { key: 'fiAnnMult', label: 'Interfacial-friction multiplier (annular film)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'vtMult', label: 'Slug-celerity multiplier', unit: '×', value: 1, min: 0.6, max: 1.6 },
+    { key: 'bodyMult', label: 'Slug-body holdup multiplier', unit: '×', value: 1, min: 0.6, max: 1.3 },
+    { key: 'initMult', label: 'Slug-initiation frequency multiplier (tracking)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'relaxMult', label: 'Slug growth / decay: film relaxation-length multiplier', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'wakeMult', label: 'Slug merging: wake-acceleration multiplier', unit: '×', value: 1, min: 0, max: 5 },
+    { key: 'hOutMult', label: 'External heat-transfer coefficient multiplier', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'natConv', label: 'Add free convection to the outside film', type: 'bool', value: true },
+    { key: 'bubbleMm', label: 'Bubble size at the riser base', unit: 'mm', value: 3, min: 0.3, max: 25 },
+    { key: 'crcMult', label: 'Bubble coalescence coefficient multiplier', unit: '×', value: 1, min: 0, max: 20 },
+    { key: 'ctiMult', label: 'Bubble breakup coefficient multiplier', unit: '×', value: 1, min: 0, max: 20 },
+    { key: 'cvm', label: 'Virtual-mass coefficient', unit: '–', value: 0.5, min: 0, max: 2 },
+    { key: 'tracer', label: 'Transport an inlet step of a species with the liquid', type: 'bool', value: true },
+    { key: 'dispersion', label: 'Axial dispersion coefficient (0 = Taylor estimate)', unit: 'm²/s', value: 0, min: 0, max: 1000, showIf: (v) => v.tracer !== false },
+  ] },
+  { group: 'Solver task', tab: 'setup', help: 'The line solution always runs. The other solvers run on request, on top of it, with their own resolution inputs.', fields: [
+    { key: 'task', label: 'Additional solver', type: 'select', value: 'line', options: TASKS },
+    { key: 'tfLengthD', label: 'Two-fluid test section length', unit: 'diameters', value: 200, min: 30, max: 3000, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfDiameterMm', label: 'Two-fluid test section diameter (0 = line diameter)', unit: 'mm', value: 0, min: 0, max: 1500, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfVsl', label: 'Two-fluid superficial liquid velocity (0 = at the map location)', unit: 'm/s', value: 0, min: 0, max: 10, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfVsg', label: 'Two-fluid superficial gas velocity (0 = at the map location)', unit: 'm/s', value: 0, min: 0, max: 50, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfPbar', label: 'Two-fluid pressure (0 = at the map location)', unit: 'bara', value: 0, min: 0, max: 500, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfCells', label: 'Two-fluid cells', unit: '–', value: 240, min: 40, max: 3000, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfTime', label: 'Two-fluid simulated time', unit: 's', value: 20, min: 1, max: 600, showIf: (v) => v.task === 'twofluid' },
+    { key: 'tfCfl', label: 'Two-fluid CFL number', unit: '–', value: 0.4, min: 0.05, max: 0.9, showIf: (v) => v.task === 'twofluid' },
+    { key: 'cfdCase', label: '2-D case', type: 'select', value: 'dambreak', options: [{ value: 'dambreak', label: 'Dam break of a liquid column (water–gas, local properties)' }, { value: 'slugfront', label: 'Slug tail collapsing onto the film (local slug body and film)' }, { value: 'cavity', label: 'Lid-driven cavity (benchmark)' }, { value: 'channel', label: 'Turbulent channel, SST k–ω (benchmark)' }], showIf: (v) => v.task === 'cfd' },
+    { key: 'cfdN', label: '2-D cells across the height', unit: '–', value: 24, min: 8, max: 200, showIf: (v) => v.task === 'cfd' },
+    { key: 'cfdRe', label: 'Reynolds number (cavity) or friction Reynolds number (channel)', unit: '–', value: 100, min: 1, max: 5000, showIf: (v) => v.task === 'cfd' && (v.cfdCase === 'cavity' || v.cfdCase === 'channel') },
+    { key: 'cfdTime', label: '2-D simulated time (0 = automatic)', unit: 's', value: 0, min: 0, max: 60, showIf: (v) => v.task === 'cfd' && (v.cfdCase === 'dambreak' || v.cfdCase === 'slugfront') },
+    { key: 'cfdTurbulence', label: '2-D turbulence closure', type: 'select', value: 'sst', options: [{ value: 'sst', label: 'SST k–ω' }, { value: 'none', label: 'None (laminar)' }], showIf: (v) => v.task === 'cfd' && (v.cfdCase === 'dambreak' || v.cfdCase === 'slugfront') },
+    { key: 'bubblyN', label: 'Radial nodes of the bubbly-flow model', unit: '–', value: 100, min: 30, max: 500, showIf: (v) => v.task === 'bubbly' },
+    { key: 'benchN', label: 'Cells of the shock-tube benchmark', unit: '–', value: 200, min: 50, max: 3000, showIf: (v) => v.task === 'benchmarks' },
+    { key: 'benchAdvN', label: 'Cells per side of the interface-advection benchmark', unit: '–', value: 40, min: 16, max: 160, showIf: (v) => v.task === 'benchmarks' },
   ] },
   { group: 'Discretisation and convergence', tab: 'mesh', fields: [
     { key: 'nSteady', label: 'Cells of the steady march', unit: '–', value: 150, min: 20, max: 2000 },
@@ -1206,12 +2576,18 @@ const INPUTS = [
 
 const HILLY = [0, 120, 1500, 210, 3200, 150, 5000, 290, 6800, 205, 8500, 330, 10200, 240, 12000, 300].reduce((a, _, i, s) => (i % 2 ? a : a.concat([{ x: s[i], z: s[i + 1] }])), []);
 const TRUNK = [0, -95, 8000, -110, 16000, -102, 24000, -118, 32000, -90, 40000, -70, 46000, -30, 49000, -8, 50000, 12].reduce((a, _, i, s) => (i % 2 ? a : a.concat([{ x: s[i], z: s[i + 1] }])), []);
+const SCR = (() => { const flow = [0, -1250, 3000, -1280, 6000, -1265, 9000, -1310, 12000, -1295, 15000, -1340, 18000, -1350].reduce((a, _, i, q) => (i % 2 ? a : a.concat([{ x: q[i], z: q[i + 1] }])), []), cat = catenaryProfile({ height: 1375, topAngle: 12, n: 12 }); return flow.concat(cat.slice(1).map((q) => ({ x: +(18000 + q.x).toFixed(1), z: +(-1350 + q.z).toFixed(1) }))); })();
 const PRESETS = [
   { name: 'Deep-water oil tie-back (reference case)', values: { rateFrac: 1 } },
   { name: 'Low-rate turndown (riser slugging)', values: { rateFrac: 0.4, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 4, rate: 1, dp: 0, choke: 100 }], tEnd: 3, matchSteady: false } },
   { name: 'Gas-condensate trunk line', values: { fluidSel: 'gascond', profile: TRUNK, riserBaseX: 50000, idMm: 590, wtMm: 19.1, pOut: 70, tIn: 55, uValue: 12, insT: 3, insK: 0.3, model: 'mechanistic', mapX: 24000, nCells: 40, tEnd: 4, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.5, rate: 1, dp: 0, choke: 100 }, { t: 1, rate: 0.7, dp: 0, choke: 100 }, { t: 8, rate: 0.7, dp: 0, choke: 100 }] } },
   { name: 'Hilly-terrain onshore multiphase line', values: { profile: HILLY, riserBaseX: 12000, idMm: 203, wtMm: 8.2, rateFrac: 0.45, pOut: 15, tAir: 15, uMode: 'layers', insT: 0, burialDepth: 1.2, kSoil: 1.4, model: 'mukherjeeBrill', mapX: 5000, nCells: 40, tEnd: 1.5, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.2, rate: 1, dp: 0, choke: 100 }, { t: 0.4, rate: 1.3, dp: 0, choke: 100 }, { t: 4, rate: 1.3, dp: 0, choke: 100 }] } },
   { name: 'High-water-cut late life', values: { wc: 75, rateFrac: 0.7, model: 'mechanistic', tEnd: 1.5, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.3, rate: 1, dp: 0, choke: 100 }, { t: 0.4, rate: 1, dp: 5, choke: 100 }, { t: 4, rate: 1, dp: 5, choke: 100 }] } },
+  { name: 'Catenary riser with a satellite branch, booster pump and floating separator pressure', values: { profile: SCR, riserBaseX: 18000, branchFrac: 0.3, branchX: 9000, branchLength: 4000, branchDz: 30, branchTin: 55, pumpDp0: 25, pumpQmax: 0.6, sepMode: 'valve', sepKv: 0.5, compPd: 120, compHead: 200, compQmax: 2, tEnd: 1, uMode: 'layers' } },
+  { name: 'Two-fluid slug capturing on a laboratory test section', values: { task: 'twofluid', tfDiameterMm: 78, tfLengthD: 200, tfCells: 200, tfTime: 16, tfVsl: 1, tfVsg: 1.5, tfPbar: 1.05, transient: false, compareModels: false, mapX: 9000 } },
+  { name: 'Slug tail collapse in the 2-D solver (RANS + VOF)', values: { task: 'cfd', cfdCase: 'slugfront', cfdN: 16, transient: false, compareModels: false } },
+  { name: 'Bubbly-flow closures in the riser', values: { task: 'bubbly', transient: false, compareModels: false } },
+  { name: 'Benchmark set of the local solvers', values: { task: 'benchmarks', benchN: 100, benchAdvN: 32, transient: false, compareModels: false, trackSlugs: false } },
   { name: 'Ramp-up transient', values: { rateFrac: 0.4, tEnd: 2, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.2, rate: 1, dp: 0, choke: 100 }, { t: 0.7, rate: 2.5, dp: 0, choke: 100 }, { t: 5, rate: 2.5, dp: 0, choke: 100 }] } },
 ];
 
@@ -1241,7 +2617,7 @@ async function run(v, ctx = {}) {
     const field = trackingField(st, units), sites = [{ s: st.s[slugIdx[0]], freq: units[slugIdx[0]].freq, length: units[slugIdx[0]].lengthFromFreq }];
     for (let i = 2; i < N - 1; i++) if (st.theta[i - 1] < -1e-5 && st.theta[i] > 1e-5 && isSlug(reg[i + 1]) && st.s[i] > sites[0].s) sites.push({ s: st.s[i], freq: 0.5 * units[i + 1].freq, length: units[i + 1].lengthFromFreq }); // low points re-initiate slugs
     const uo = units[N];
-    track = slugTracking(field, { sites, nSlugs: Math.round(num(v.nSlugs, 150, 5, 5000)), seed: Math.round(num(v.slugSeed, 42, 1, 2 ** 31)), theta: st.theta, drainFactor: num(v.drainFactor, 1.2, 1, 10), qSlugOut: A0 * uo.holdupSlug * st.vm[N], qFilmOut: A0 * uo.holdupFilm * Math.max(uo.filmVelocity, 0) });
+    track = slugTracking(field, { sites, nSlugs: Math.round(num(v.nSlugs, 150, 5, 5000)), seed: Math.round(num(v.slugSeed, 42, 1, 2 ** 31)), theta: st.theta, drainFactor: num(v.drainFactor, 1.2, 1, 10), initMult: num(v.initMult, 1, 0.05, 20), relaxMult: num(v.relaxMult, 1, 0.05, 20), wakeMult: num(v.wakeMult, 1, 0, 10), qSlugOut: A0 * uo.holdupSlug * st.vm[N], qFilmOut: A0 * uo.holdupFilm * Math.max(uo.filmVelocity, 0) });
     if (!track.n) track = null;
   }
   const terrain = terrainSlugging(st), sev = cfg.hasRiser ? severeScreen(st, { riserBaseS: cfg.riserBaseS, feedLength: num(v.feedLength, 0, 0, 1e7), pSep: cfg.pSep }) : null;
@@ -1271,10 +2647,10 @@ async function run(v, ctx = {}) {
   const radSteady = radialConduction({ ri: st.D[kc] / 2, layers: radLayers, hIn: st.hIn[kc], hOut: hOutC, tFluid: st.T[ic], tAmb: st.tAmb[kc], T0: 'steady', tEnd: 0, nPer });
   const tauC = fluidC / Math.max(netC.U * cfg.uMult * PI * st.D[kc], 1e-9), cool = radialConduction({ ri: st.D[kc] / 2, layers: radLayers, hIn: clamp(0.25 * st.hIn[kc], 30, 400), hOut: hOutC, tFluid: st.T[ic], tAmb: st.tAmb[kc], fluidC, T0: 'steady', tEnd: clamp(5 * tauC, 3600, 60 * 86400), nSteps: 240, nPer, stopAt: st.tHyd[ic], nProfiles: 5 });
   // ---- local models ---------------------------------------------------------------------------------------
-  let rans = null, ransRef = null, vof = null, vofUp = null, dam = null;
+  let rans = null, ransRef = null, vof = null, vofUp = null, dam = null, mdl = 'mixing';
   if (v.localModels !== false) {
     const lam = cm.vsl / Math.max(cm.vsl + cm.vsg, 1e-9), rhoN = cm.rhoL * lam + cm.rhoG * (1 - lam), muN = cm.muL * lam + cm.muG * (1 - lam), ReLoc = clamp((rhoN * (cm.vsl + cm.vsg) * cm.D) / muN, 3000, 3e6), nR = Math.round(num(v.nRans, 70, 30, 400));
-    const mdl = ['komega', 'kepsilon', 'mixing'].includes(v.ransModel) ? v.ransModel : 'mixing';
+    mdl = RANS_MODELS.some((q) => q.value === v.ransModel) ? v.ransModel : 'mixing';
     rans = ransPipe({ reTau: reTauOf(ReLoc), model: mdl, n: nR, tol: 1e-7, maxIter: 2500 }); ransRef = mdl === 'mixing' ? null : ransPipe({ reTau: reTauOf(ReLoc), model: 'mixing', n: nR });
     await tick();
     vof = vofAdvect1D({ n: 120, scheme: 'thinc' }); vofUp = vofAdvect1D({ n: 120, scheme: 'upwind' });
@@ -1311,6 +2687,7 @@ async function run(v, ctx = {}) {
   } else if (cyc && !cyc.stable) pAmp = cyc.amplitude / 1e5;
 
   // ---- warnings ---------------------------------------------------------------------------------------------
+  if (st.junction) warnings.push({ level: 'info', msg: `A branch delivers ${(100 * cfg.branch.frac).toFixed(0)} % of the rate at ${Math.round(st.junction.x)} m: junction pressure ${st.junction.P.toFixed(1)} bara, mixed temperature ${st.junction.tMix.toFixed(1)} °C. Screening scans (minimum stable rate, model comparison) use the line without the branch.` });
   if (subMax > 0) warnings.push({ level: subMax > 3 ? 'bad' : 'warn', msg: `The stream is inside the hydrate region over ${Math.round(hydLen)} m (from ${Math.round(st.x[Math.max(iHyd, 0)])} m); the largest subcooling is ${subMax.toFixed(1)} °C at ${Math.round(st.x[ic])} m.` });
   if (evrMax > 1) warnings.push({ level: 'bad', msg: `The mixture velocity reaches ${evrMax.toFixed(2)} times the API RP 14E erosional velocity (C = ${cfg.cErosion}) at ${Math.round(st.x[iEvr])} m.` });
   else if (evrMax > 0.8) warnings.push({ level: 'warn', msg: `The mixture velocity is ${(100 * evrMax).toFixed(0)} % of the erosional velocity at ${Math.round(st.x[iEvr])} m.` });
@@ -1374,7 +2751,7 @@ async function run(v, ctx = {}) {
     plots.push({ type: 'line', title: `Radial temperature at ${Math.round(st.x[ic])} m and cooldown after a stop`, xlabel: 'Radius (mm)', ylabel: '°C', series: cool.profiles.map((p) => ({ name: p.t === 0 ? 'Flowing (steady)' : `${(p.t / 3600).toFixed(1)} h after the stop`, x: rmm, y: p.T, mode: 'both' })), hlines: [{ y: st.tHyd[ic], label: 'Hydrate temperature' }], note: `Layers from the bore outwards: ${[...new Set(lay)].join(', ')}.` });
     plots.push({ type: 'line', title: 'Cooldown of the contents at the coldest-margin location', xlabel: 'Time after the stop (h)', ylabel: '°C', series: [{ name: 'Contents', x: cool.t.map((t) => t / 3600), y: cool.fluid }, { name: 'Inner wall', x: cool.t.map((t) => t / 3600), y: cool.wall, dash: true }], hlines: [{ y: st.tHyd[ic], label: 'Hydrate temperature' }] }); }
   if (rans) {
-    plots.push({ type: 'line', title: `Developed turbulent velocity profile (radial RANS, Re = ${sig(rans.Re, 3)})`, xlabel: 'y⁺', ylabel: 'u⁺', logx: true, series: [{ name: `${v.ransModel === 'komega' ? 'k–ω' : v.ransModel === 'kepsilon' ? 'k–ε (Chien)' : 'Mixing length'}`, x: rans.y.slice(1), y: rans.u.slice(1) }, ...(ransRef ? [{ name: 'Mixing length', x: ransRef.y.slice(1), y: ransRef.u.slice(1), dash: true }] : []), { name: 'Log law (κ = 0.41, B = 5.2)', x: rans.y.filter((y) => y > 30), y: rans.y.filter((y) => y > 30).map((y) => Math.log(y) / 0.41 + 5.2), dash: true }], note: `Darcy friction factor ${rans.f.toFixed(5)} against ${frictionFactor(rans.Re, 0).toFixed(5)} from the smooth-pipe Colebrook law (${(100 * (rans.f / frictionFactor(rans.Re, 0) - 1)).toFixed(1)} %). Single-phase flow at the local no-slip mixture Reynolds number.` });
+    plots.push({ type: 'line', title: `Developed turbulent velocity profile (radial RANS, Re = ${sig(rans.Re, 3)})`, xlabel: 'y⁺', ylabel: 'u⁺', logx: true, series: [{ name: RANS_MODELS.find((q) => q.value === mdl).label, x: rans.y.slice(1), y: rans.u.slice(1) }, ...(ransRef ? [{ name: 'Mixing length', x: ransRef.y.slice(1), y: ransRef.u.slice(1), dash: true }] : []), { name: 'Log law (κ = 0.41, B = 5.2)', x: rans.y.filter((y) => y > 30), y: rans.y.filter((y) => y > 30).map((y) => Math.log(y) / 0.41 + 5.2), dash: true }], note: `Darcy friction factor ${rans.f.toFixed(5)} against ${frictionFactor(rans.Re, 0).toFixed(5)} from the smooth-pipe Colebrook law (${(100 * (rans.f / frictionFactor(rans.Re, 0) - 1)).toFixed(1)} %). Single-phase flow at the local no-slip mixture Reynolds number.` });
     plots.push({ type: 'line', title: 'Interface capturing: liquid slug advected once around a periodic pipe', xlabel: 'Position (–)', ylabel: 'Liquid fraction', series: [{ name: 'Exact', x: vof.x, y: vof.exact, dash: true }, { name: 'THINC volume-of-fluid', x: vof.x, y: vof.phi }, { name: 'First-order upwind', x: vofUp.x, y: vofUp.phi }], note: `Interface thickness ${vof.thickness.toFixed(1)} cells with THINC against ${vofUp.thickness.toFixed(1)} with upwind; both conserve the liquid volume to round-off.` });
     plots.push({ type: 'line', title: 'Slug-tail collapse onto the film (shallow-water dam break)', xlabel: 'Distance from the tail (m)', ylabel: 'Liquid depth (m)', series: [{ name: 'Finite volume (HLL)', x: dam.x, y: dam.h }, { name: 'Exact (Stoker)', x: dam.x, y: dam.exact, dash: true }], note: `Channel analogue at ${Math.round(st.x[im])} m, ${dam.tEnd.toFixed(2)} s after release; mean error ${(100 * dam.l1).toFixed(2)} % of the initial depth.` });
   }
@@ -1405,6 +2782,10 @@ async function run(v, ctx = {}) {
   if (cfg.energy === 'enthalpy') balances.push({ name: 'Steady energy (kW): enthalpy in vs enthalpy out + heat loss + elevation + kinetic', in: st.energy.hIn / 1e3, out: (st.energy.hOut + st.heatLoss + st.energy.potential + st.energy.kinetic) / 1e3 });
   if (tr) { balances.push({ name: 'Transient mass (kg): initial + inflow vs final + outflow', in: tr.mass.initial + tr.mass.inflow, out: tr.mass.final + tr.mass.outflow }); balances.push({ name: 'Transient thermal energy (MJ): initial + inflow vs final + outflow + loss', in: (tr.energy.initial + tr.energy.inflow) / 1e6, out: (tr.energy.final + tr.energy.outflow + tr.energy.loss) / 1e6 }); }
 
+  // ---- closure detail, comparisons and dedicated solver tasks ------------------------------------------------
+  cm.zG = st.zG[im];
+  const RX = { st, cfg, fm, reg, units, im, cm, slug, tr, cyc, sev, cool, plots, tables, balances, warnings, recs, pAmp, terrain, mwG: st.mwG[im] };
+  const ex = runExtras(v, ctx, RX), task = TASKS.some((q) => q.value === v.task) ? v.task : 'line', tk = task !== 'line' ? await runTask(task, v, ctx, RX) : { outputs: {}, kpis: [] };
   // ---- KPIs -------------------------------------------------------------------------------------------------
   const kpis = [
     { label: 'Inlet pressure', value: r3(st.pIn, 1), unit: 'bara', status: 'ok', help: `Holdup model: ${HOLDUP_MODELS.find((m) => m.value === cfg.model).label}` },
@@ -1423,6 +2804,7 @@ async function run(v, ctx = {}) {
     { label: 'Transient inlet-pressure swing', value: r3(pAmp, 1), unit: 'bar', status: pAmp > 0.1 * dpTotal && pAmp > 2 ? 'warn' : 'ok' },
     { label: 'Cooldown to hydrate temperature', value: cool.tReach !== null ? r3(cool.tReach / 3600, 1) : subMax > 0 ? 0 : `> ${(cool.t[cool.t.length - 1] / 3600).toFixed(0)}`, unit: 'h', status: cool.tReach !== null && cool.tReach < 8 * 3600 ? 'warn' : 'ok', help: `At ${Math.round(st.x[ic])} m, the location with the smallest margin` },
     { label: 'Operating rate', value: r3(stdLiquid(fm, st.mScale), 0), unit: 'Sm³/d liquid', status: 'ok', help: `GOR ${gor.toFixed(0)} Sm³/Sm³, water cut ${wcIn.toFixed(0)} %, ${st.mdot.toFixed(1)} kg/s` },
+    ...ex.kpis, ...tk.kpis,
   ];
 
   // ---- outputs ----------------------------------------------------------------------------------------------
@@ -1434,6 +2816,7 @@ async function run(v, ctx = {}) {
     heatLoss: st.heatLoss / 1e3, uValue: mean(st.U), slug, severeSlugging: severe, boe: sev ? sev.boe : null, pots: sev ? sev.pots : null, erosionalRatio: evrMax, maxVelocity: vMax, maxSubcooling: subMax, hydrateLength: hydLen,
     series, pInAmplitude: pAmp, turndownRate: tdFrac, rateFraction: st.mScale, model: cfg.model, slugOnsetX: iOnset >= 0 ? st.x[iOnset] : null, slugCatcherVolume: catcher, terrain: { accumulates: terrain.accumulates, x: terrain.worst ? terrain.worst.x : null, volume: terrain.worst ? terrain.worst.volume : null, vsgCrit: terrain.worst ? terrain.worst.vsgCrit : null },
     cycle: cyc ? { stable: cyc.stable, period: cyc.period, amplitude: cyc.amplitude / 1e5, qLiqPeakRatio: cyc.qLiqPeakRatio } : null, arrival: track ? { n: track.n, meanLength: track.meanLength, p99: track.p99, maxLength: track.maxLength, frequency: track.freqArrival, surge: track.surge } : null,
+    task, ...ex.outputs, ...tk.outputs,
     cooldownPreview: cool.tReach !== null ? cool.tReach / 3600 : null, coldSpotX: st.x[ic], regimeAtMap: reg[im], mandhane: mand, id: cfg.idMin, transient: tr ? { massError: tr.mass.error, energyError: tr.energy.error, steps: tr.steps, aborted: tr.aborted, pMean: trSummary ? trSummary.pMean : null, cumLiq: trSummary ? trSummary.cumLiq : null } : null,
   };
   prog(1, 'Done');
@@ -1442,28 +2825,41 @@ async function run(v, ctx = {}) {
 }
 
 // ---- calibration model: coarse steady march, fast enough for least-squares fitting ----------------------------
+const CAL_NAN = { dp: NaN, tArr: NaN, holdup: NaN, slugFreq: NaN, slugLen: NaN, filmThk: NaN, filmVel: NaN, level: NaN, tauI: NaN, dpStrat: NaN, vslCrit: NaN, entFrac: NaN, depLength: NaN, dropD: NaN, slugVel: NaN, bodyHoldup: NaN, arrFreq: NaN, arrLen: NaN, mergeShare: NaN, tSurf: NaN, dSauter: NaN };
 function calibrationModel(v) {
   const cfg = flowConfig({ ...v, nSteady: 24 }, lastCtx), r = steadySolve({ ...cfg.base, n: 24, mScale: num(v.rateFrac, 1, 1e-3, 20), pOut: cfg.pOut, hydrate: false, tolP: 1e-4 });
-  if (!r.ok) return { dp: NaN, tArr: NaN, holdup: NaN, slugFreq: NaN, slugLen: NaN, filmThk: NaN };
-  const i = 12, u = r.vsl[i] > 1e-9 && r.vsg[i] > 1e-9 ? slugUnitCell(cellOf(r, i), slugOpts(v)) : null;
-  return { dp: r.pIn - r.pOut, tArr: r.tOut, holdup: r.liquidInventory / r.volume, slugFreq: u ? 60 * u.freq : 0, slugLen: u ? u.lengthFromFreq : 0, filmThk: u ? 1000 * u.filmThickness : 0 };
+  if (!r.ok) return { ...CAL_NAN };
+  const i = 12, so = slugOpts(v), two = (k) => r.vsl[k] > 1e-9 && r.vsg[k] > 1e-9, u = two(i) ? slugUnitCell(cellOf(r, i), so) : null, out = { ...CAL_NAN, dp: r.pIn - r.pOut, tArr: r.tOut, holdup: r.liquidInventory / r.volume, slugFreq: u ? 60 * u.freq : 0, slugLen: u ? u.lengthFromFreq : 0, filmThk: u ? 1000 * u.filmThickness : 0, filmVel: u ? u.filmVelocity : 0, slugVel: u ? u.vt : 0, bodyHoldup: u ? u.holdupSlug : 0 };
+  if (two(i)) { // stratified closures and the transition at the mid-line cell
+    const c = cellOf(r, i), o = { fiMult: num(v.fiMult, 1, 0.05, 20), fwlMult: num(v.fwlMult, 1, 0.05, 20), fwgMult: num(v.fwgMult, 1, 0.05, 20), transMult: num(v.transMult, 1, 0.2, 5) }, sT = stratifiedTransition({ ...c, theta: Math.min(c.theta, 0) }, o), g = stratGeom(sT.level, c.D);
+    Object.assign(out, { level: sT.level, tauI: sT.tauI, dpStrat: (sT.tauWL * g.SL + sT.tauWG * g.SG) / g.A, vslCrit: sT.vslCrit });
+  }
+  { let ia = 0; for (let k = 1; k < 24; k++) if (r.vsg[k] > r.vsg[ia]) ia = k; if (two(ia)) { const a = annularMist({ ...cellOf(r, ia), rough: cfg.rough, P: r.P[ia] * 1e5, fModel: cfg.fModel }, cfg.mp.annular); Object.assign(out, { entFrac: a.entEq, depLength: a.relaxLength, dropD: a.dropSize * 1e6 });
+      const c = cellOf(r, ia), aM = clamp(1 - r.holdup[ia], 0.01, 0.25), ib = interfacialAreaTransport({ d0: num(v.bubbleMm, 3, 0.2, 30) / 1000, alpha: aM, vg: Math.max(c.vsg / aM, 0.1), k: 0.01 * (c.vsl + c.vsg) ** 2, length: 30, n: 80, rhoL: c.rhoL, rhoG: c.rhoG, muL: c.muL, sigma: c.sigma, crc: 0.04 * num(v.crcMult, 1, 0, 100), cti: 0.085 * num(v.ctiMult, 1, 0, 100), cwe: 0.002 * num(v.crcMult, 1, 0, 100) }); out.dSauter = ib.dEnd * 1000; } }
+  { const c = { s: r.s[i], z: r.z[i], D: r.D[i], pr: cfg.fm.at(r.P[i], r.T[i], r.mScale ?? num(v.rateFrac, 1, 1e-3, 20)), vm: r.vm[i], holdup: r.holdup[i], ta: r.tAmb[i], T: r.T[i] }, net = cfg.network(c); out.tSurf = c.ta + (net.U * c.D * (c.T - c.ta)) / (cfg.od * Math.max(net.hOut ?? cfg.hOutOf(c), 1e-9)); }
+  if (r.vsl.every((q, k) => two(k))) { // tracked arrivals: initiation, growth / decay and merging parameters
+    const units = r.vsl.map((_, k) => slugUnitCell(cellOf(r, k), so)), tk = slugTracking(trackingField(r, units), { sites: [{ s: 0, freq: units[0].freq, length: units[0].lengthFromFreq }], nSlugs: 24, seed: 11, theta: r.theta, initMult: num(v.initMult, 1, 0.05, 20), relaxMult: num(v.relaxMult, 1, 0.05, 20), wakeMult: num(v.wakeMult, 1, 0, 10), maxOps: 2e4 });
+    Object.assign(out, { arrFreq: 60 * tk.freqArrival, arrLen: tk.meanLength, mergeShare: tk.generated > 0 ? tk.merges / tk.generated : 0 });
+  } else Object.assign(out, { arrFreq: 0, arrLen: 0, mergeShare: 0 });
+  for (const k of Object.keys(out)) if (!Number.isFinite(out[k])) out[k] = 0;
+  return out;
 }
-const CAL_SAMPLE = /*CAL*/[{rateFrac:0.5, dp:64.5, tArr:19.41, holdup:0.5397, slugFreq:0.2481, slugLen:39.2, filmThk:189.2},
-  {rateFrac:0.6, dp:65.53, tArr:23.71, holdup:0.5469, slugFreq:0.2361, slugLen:45, filmThk:183.9},
-  {rateFrac:0.7, dp:64.97, tArr:27.44, holdup:0.5243, slugFreq:0.2378, slugLen:39.6, filmThk:178.3},
-  {rateFrac:0.8, dp:66.25, tArr:30.32, holdup:0.5188, slugFreq:0.2452, slugLen:40.4, filmThk:167.7},
-  {rateFrac:0.9, dp:71.13, tArr:33.98, holdup:0.5145, slugFreq:0.299, slugLen:37.2, filmThk:177.6},
-  {rateFrac:1, dp:70.95, tArr:35.36, holdup:0.5187, slugFreq:0.2942, slugLen:38.6, filmThk:171.2},
-  {rateFrac:1.1, dp:74.75, tArr:37.25, holdup:0.5362, slugFreq:0.3136, slugLen:41.8, filmThk:175.6},
-  {rateFrac:1.2, dp:78.33, tArr:39.31, holdup:0.511, slugFreq:0.33, slugLen:41.5, filmThk:163.6},
-  {rateFrac:1.3, dp:84.7, tArr:40.54, holdup:0.5394, slugFreq:0.3793, slugLen:38.4, filmThk:166.8},
-  {rateFrac:1.4, dp:84.2, tArr:41.83, holdup:0.5497, slugFreq:0.4491, slugLen:38.9, filmThk:168.7}]/*CAL*/;
-const VAL_SAMPLE = /*VAL*/[{rateFrac:0.55, dp:64.92, tArr:22.51, holdup:0.539, slugFreq:0.2281, slugLen:39.6, filmThk:179.3},
-  {rateFrac:0.75, dp:65.67, tArr:29.42, holdup:0.53, slugFreq:0.2464, slugLen:38.8, filmThk:165.4},
-  {rateFrac:0.95, dp:70.73, tArr:35.29, holdup:0.5178, slugFreq:0.2908, slugLen:40.4, filmThk:170.1},
-  {rateFrac:1.05, dp:75.01, tArr:36.48, holdup:0.5145, slugFreq:0.3092, slugLen:41.8, filmThk:168.7},
-  {rateFrac:1.25, dp:80.17, tArr:39.22, holdup:0.5405, slugFreq:0.3703, slugLen:43.5, filmThk:170.4},
-  {rateFrac:1.5, dp:90.86, tArr:42.79, holdup:0.5375, slugFreq:0.6039, slugLen:39.7, filmThk:163.7}]/*VAL*/;
+const CAL_SAMPLE = /*CAL*/[{rateFrac:0.5, dp:54.36, tArr:21.95, holdup:0.4689, slugFreq:0.187, slugLen:54.1, filmThk:177.3, filmVel:0.655, slugVel:1.882, bodyHoldup:0.9143, level:0.6952, tauI:0.43, dpStrat:12.58, vslCrit:0.3147, entFrac:0, depLength:0.284, dropD:3756, dSauter:32.916, arrFreq:1.116, arrLen:98.8, mergeShare:0.11, tSurf:4.18},
+  {rateFrac:0.6, dp:57.94, tArr:25.21, holdup:0.4504, slugFreq:0.1912, slugLen:50, filmThk:172.9, filmVel:0.824, slugVel:2.113, bodyHoldup:0.9437, level:0.6672, tauI:0.621, dpStrat:17.89, vslCrit:0.3387, entFrac:0.0686, depLength:0.359, dropD:2379, dSauter:30.762, arrFreq:1.2514, arrLen:92.3, mergeShare:0.098, tSurf:4.218},
+  {rateFrac:0.7, dp:58.5, tArr:31.77, holdup:0.4514, slugFreq:0.1963, slugLen:51, filmThk:167.3, filmVel:0.979, slugVel:2.319, bodyHoldup:0.8992, level:0.6733, tauI:0.882, dpStrat:22.47, vslCrit:0.3436, entFrac:0.1317, depLength:0.428, dropD:1724, dSauter:27.622, arrFreq:1.477, arrLen:87.9, mergeShare:0.075, tSurf:4.378},
+  {rateFrac:0.8, dp:59.42, tArr:32.38, holdup:0.425, slugFreq:0.2119, slugLen:52.7, filmThk:161.7, filmVel:1.154, slugVel:2.532, bodyHoldup:0.9185, level:0.6621, tauI:1.135, dpStrat:29.81, vslCrit:0.3494, entFrac:0.1993, depLength:0.524, dropD:1230, dSauter:28.577, arrFreq:1.6334, arrLen:86.2, mergeShare:0.073, tSurf:4.229},
+  {rateFrac:0.9, dp:63.53, tArr:35.49, holdup:0.4313, slugFreq:0.2245, slugLen:52.1, filmThk:163.6, filmVel:1.33, slugVel:2.676, bodyHoldup:0.9012, level:0.6761, tauI:1.385, dpStrat:36.64, vslCrit:0.3465, entFrac:0.264, depLength:0.569, dropD:988, dSauter:27.716, arrFreq:1.7447, arrLen:88.3, mergeShare:0.057, tSurf:4.092},
+  {rateFrac:1, dp:65.15, tArr:37.73, holdup:0.4431, slugFreq:0.2463, slugLen:51.6, filmThk:162, filmVel:1.527, slugVel:2.99, bodyHoldup:0.8578, level:0.6692, tauI:1.66, dpStrat:44.21, vslCrit:0.35, entFrac:0.3333, depLength:0.669, dropD:758, dSauter:27.079, arrFreq:1.869, arrLen:87.1, mergeShare:0.053, tSurf:4.082},
+  {rateFrac:1.1, dp:69.78, tArr:39.79, holdup:0.4476, slugFreq:0.2747, slugLen:53.6, filmThk:163.9, filmVel:1.601, slugVel:3.159, bodyHoldup:0.8416, level:0.6842, tauI:1.977, dpStrat:54.75, vslCrit:0.3582, entFrac:0.3867, depLength:0.719, dropD:632, dSauter:25.719, arrFreq:1.9711, arrLen:86.4, mergeShare:0.043, tSurf:4.202},
+  {rateFrac:1.2, dp:69.88, tArr:39.96, holdup:0.4371, slugFreq:0.2958, slugLen:52.2, filmThk:160.5, filmVel:1.81, slugVel:3.298, bodyHoldup:0.8442, level:0.684, tauI:2.15, dpStrat:60.87, vslCrit:0.3542, entFrac:0.4349, depLength:0.794, dropD:515, dSauter:25.569, arrFreq:2.044, arrLen:92.5, mergeShare:0.045, tSurf:4.302},
+  {rateFrac:1.3, dp:76.11, tArr:40.46, holdup:0.4472, slugFreq:0.3442, slugLen:49, filmThk:163, filmVel:1.945, slugVel:3.483, bodyHoldup:0.8411, level:0.6785, tauI:2.47, dpStrat:70.12, vslCrit:0.3548, entFrac:0.4999, depLength:0.865, dropD:420, dSauter:26.986, arrFreq:2.1925, arrLen:87.5, mergeShare:0.065, tSurf:4.232},
+  {rateFrac:1.4, dp:81.65, tArr:43.61, holdup:0.4541, slugFreq:0.5573, slugLen:51.6, filmThk:158.4, filmVel:2.118, slugVel:3.6, bodyHoldup:0.8141, level:0.6887, tauI:2.757, dpStrat:78.48, vslCrit:0.3501, entFrac:0.5326, depLength:0.931, dropD:377, dSauter:25.888, arrFreq:2.2629, arrLen:87.8, mergeShare:0.058, tSurf:4.208}]/*CAL*/;
+const VAL_SAMPLE = /*VAL*/[{rateFrac:0.55, dp:56.77, tArr:24.98, holdup:0.4589, slugFreq:0.19, slugLen:51, filmThk:173.6, filmVel:0.732, slugVel:2.011, bodyHoldup:0.9041, level:0.6848, tauI:0.529, dpStrat:14.99, vslCrit:0.3215, entFrac:0.0336, depLength:0.326, dropD:3047, dSauter:31.738, arrFreq:1.1988, arrLen:102.4, mergeShare:0.1, tSurf:4.132},
+  {rateFrac:0.75, dp:58.38, tArr:31.63, holdup:0.4446, slugFreq:0.2, slugLen:53.7, filmThk:166.6, filmVel:1.066, slugVel:2.416, bodyHoldup:0.9056, level:0.656, tauI:0.96, dpStrat:26.57, vslCrit:0.3422, entFrac:0.1676, depLength:0.447, dropD:1460, dSauter:29, arrFreq:1.5284, arrLen:86.9, mergeShare:0.08, tSurf:4.16},
+  {rateFrac:0.95, dp:62.57, tArr:35.45, holdup:0.4511, slugFreq:0.2342, slugLen:51.4, filmThk:163.8, filmVel:1.392, slugVel:2.74, bodyHoldup:0.8636, level:0.6852, tauI:1.559, dpStrat:40.61, vslCrit:0.3543, entFrac:0.2891, depLength:0.61, dropD:861, dSauter:27.848, arrFreq:1.7085, arrLen:86.8, mergeShare:0.053, tSurf:4.353},
+  {rateFrac:1.05, dp:68.85, tArr:37.7, holdup:0.4529, slugFreq:0.2548, slugLen:52.2, filmThk:164.9, filmVel:1.587, slugVel:2.977, bodyHoldup:0.8536, level:0.6797, tauI:1.732, dpStrat:47.43, vslCrit:0.3664, entFrac:0.3562, depLength:0.701, dropD:675, dSauter:26.965, arrFreq:1.9972, arrLen:83.4, mergeShare:0.049, tSurf:4.183},
+  {rateFrac:1.25, dp:74.05, tArr:40.46, holdup:0.4529, slugFreq:0.3214, slugLen:50.7, filmThk:163.3, filmVel:1.897, slugVel:3.3, bodyHoldup:0.8428, level:0.6726, tauI:2.379, dpStrat:66.74, vslCrit:0.3521, entFrac:0.4556, depLength:0.852, dropD:486, dSauter:25.678, arrFreq:2.0519, arrLen:87.8, mergeShare:0.068, tSurf:4.102},
+  {rateFrac:1.5, dp:81.68, tArr:44.8, holdup:0.4618, slugFreq:0.8114, slugLen:53.6, filmThk:167, filmVel:2.242, slugVel:3.751, bodyHoldup:0.7929, level:0.7008, tauI:3.015, dpStrat:86.14, vslCrit:0.3493, entFrac:0.579, depLength:0.979, dropD:330, dSauter:24.619, arrFreq:2.4099, arrLen:87.7, mergeShare:0.056, tSurf:4.117}]/*VAL*/;
 
 // ---- verification ------------------------------------------------------------------------------------------------
 // Constant-property test fluid: ideal gas with a fixed gas mass fraction and an incompressible liquid.
@@ -1571,14 +2967,15 @@ async function verify() {
     const cy = riserSluggingCycle({ D: 0.254, feedLength: 5000, feedAngle: 0.01, riserHeight: 1000, riserLength: 1000, wG: 0.5, wL: 10, rhoL: 800, T: 300, pSep: 20e5, alphaL: 0.4, chokeDp: 1e3 });
     add('Riser cycle: peak riser-base pressure against the full liquid head', 20 + (800 * G * 1000) / 1e5, cy.pBaseMax / 1e5, 0.01, 'bara: separator pressure + ρL g H of a liquid-filled riser (the blowout adds a small friction and inertia overshoot)');
   }
+  await verifyExtra(add);
   return out;
 }
-function marchKernel(cfg) { return marchSteady({ fm: cfg.fm, profile: cfg.profile, id: cfg.id, rough: cfg.rough, U: cfg.U, tAmbOf: cfg.tAmbOf, tIn: cfg.tIn, pOut: cfg.pOut, n: cfg.n }); }
+function marchKernel(cfg) { return marchSteady({ fm: cfg.fm, profile: cfg.profile, id: cfg.id, rough: cfg.rough, U: cfg.U, tAmbOf: cfg.tAmbOf, tIn: cfg.tIn, pOut: cfg.pOut, n: cfg.n, energy: cfg.energy, label: false }); }
 
 const SUITE = {
   id: 'flow', num: 3, title: 'Multiphase Thermal-Hydraulics & Slugging', short: 'Flow · Slugs', icon: '🌊',
   tagline: 'Pressure, temperature, holdup and flow regime along the line, slugging of every kind, and the transient response to rate and pressure changes.',
-  description: 'Solves the steady mass, momentum and energy balances along the elevation profile with nine selectable holdup closures and the equation-of-state property table, classifies the flow regime mechanistically, and evaluates hydrodynamic, terrain and severe riser slugging with a unit-cell model, Lagrangian slug tracking and a lumped riser cycle. A semi-implicit finite-volume drift-flux model gives the transient response to rate, back-pressure and choke histories; radial conduction, a radial RANS solve and 1-D interface capturing resolve local detail.',
+  description: 'Solves the steady mass, momentum and energy balances along the elevation profile with twelve selectable holdup closures and the equation-of-state property table, classifies the flow regime mechanistically, and evaluates hydrodynamic, terrain and severe riser slugging with a unit-cell model, Lagrangian slug tracking and a lumped riser cycle. A semi-implicit drift-flux model gives the transient response to rate, back-pressure and choke histories. On request a transient two-fluid model captures slugs on a test section, a 2-D Navier–Stokes solver (projection, SST k–ω, volume of fluid) resolves a slug front or a dam break, and radial models give turbulence, bubbly-flow and conduction detail. Branch junctions, a booster pump and separator / compressor characteristics can be imposed at the boundaries; measurements are compared with sourced reference data sets.',
   guide: [
     'Check the boundary conditions: by default the case rates and the outlet pressure are fixed and the inlet pressure is solved. Pull the profile, diameter and U-value from the Network suite when it has been run.',
     'Choose the holdup model on the Model tab; the model-comparison table shows how much the inlet pressure depends on that choice.',
@@ -1587,39 +2984,45 @@ const SUITE = {
     'Use the Mesh tab to quantify the numerical uncertainty of the steady march and of the transient grid and time step.',
     'Fit roughness, U-value, holdup and slug multipliers to measured pressure drop, arrival temperature, holdup and slug frequency on the Calibration tab.',
   ],
-  implemented: /*IMPL*/[
-    'conservation of mass', 'component mass conservation', 'phase continuity equations', 'mixture continuity equation', 'conservation of linear momentum', 'mixture mo',
-    'conservation of total energy', 'mixture-energy equation', 'enthalpy equation', 'drift-flux', 'homogeneous-equilibrium', 'separated-flow', 'mechanistic multiphase', 'nicklin',
-    'beggs–brill', 'hagedorn–brown', 'mukherjee–brill', 'gray correlation', 'orkiszewski', 'taitel', 'mandhane', 'barnea unified', 'mechanistic stratified/annular/intermittent',
-    'unit-cell slug', 'mechanistic slug-flow', 'slug-tracking', 'slug-frequency', 'translational-velocity', 'slug-body/film mass', 'slug growth', 'slug merging',
-    'kelvin–helmholtz instability criterion', 'viscous kelvin–helmholtz', 'long-wave stability', 'linear stability', 'roll-wave', 'pipeline–riser liquid accumulation', 'severe-slugging cyc',
-    'hydrodynamic stability criteria', 'pressure-build-up/liquid-fallback', 'terrain-induced accumulation', 'interfacial drag', 'wall friction', "fourier's law", 'transient heat-conduction',
-    "newton's law of cooling", 'overall heat-transfer resistance', 'conjugate heat-transfer', 'radial multilayer conduction', 'seabed conduction', 'thomson relation', 'volume of fluid',
-    'mechanistic flow-regime se', 'eos + thermal-hydraulic', 'pressure', 'temperature', 'initial oil', 'gas and water flow rates', 'phase velocities and superficial velocities',
-    'liquid holdup', 'flow regime', 'initial liquid-film', 'fluid inventory', 'initial phase distribution', 'where slugging already exists', 'initial number', 'position', 'ngth', 'velocity',
-    'liquid content and distribution of slugs', 'appropriate combination of oil', 'gas and water mass or volumetric flow rates', 'phase fractions', 'water cut',
-    'external heat-transfer conditions', 'insulation', 'valve', 'choke', 'production-rate changes', 'terrain or severe', 'validated outputs from mo', 'oil/gas/water mass', 'gor',
-    'well inflow conditions', 'transient operating boundary histories', 'numerical discretization and convergence controls', 'phase and superficial velocities', 'slug initiation/onset',
-    'terrain and severe', 'liquid surge', 'slug arrival statistics', 'film thickness/velocity', 'slip/drift velocity', 'distribution parameter', 'heat-transfer coefficients',
-    'overall u-value', 'method of manufactured solutions', 'exact analytical solutions', 'semi-analytical benchmark', 'benchmark prob', 'grid-refinement', 'grid convergence in',
-    'richardson extrapolation', 'observed or', 'formal or', 'time-step convergence', 'cfl sensitivity', 'iterative convergence', 'nonlinear convergence', 'residual convergence',
-    'mass-conservation error', 'momentum-conservation error', 'energy-conservation error', 'phase-volume conservation', 'global balance closure', 'local balance closure',
-    'shock/contact-wave propagation', 'hydrostatic-equilibrium test', 'dam-break', 'phase limiting solution', 'steady-state limiting', 'initial-condition sensitivity',
-    'boundary-condition sensitivity', 'floating-point/reproducibility',
+  implemented: /*IMPL*/[ // fragments of the catalogue names (normalised as the Equations tab does); none contains “le” or “de”, the normalised names of the handed-off LES and DES items
+    'conservation of ma', 'component ma', 'phase continuity equation', 'mixture continuity equation', 'conservation of linear momentum', 'phase momentum equation',
+    'mixture momentum equation', 'conservation of total energy', 'phase energy equation', 'mixture energy equation', 'internal energy equation', 'enthalpy equation', 'entropy inequality',
+    'specie transport equation', 'two fluid mod', 'multi fluid mod', 'six equation mod', 'seven equation mod', 'drift flux mod', 'mixture mod', 'homogeneou equilibrium mod',
+    'homogeneou relaxation mod', 'separated flow mod', 'mechanistic multiphase mod', 'walli drift flux formulation', 'nicklin type translational velocity relation',
+    'begg brill correlation', 'hagedorn brown correlation', 'dun ro correlation', 'mukherjee brill mod', 'gray correlation', 'orkiszewski mod', 'ansari mechanistic mod',
+    'er flow regime mod', 'mandhane type flow map', 'baker flow map', 'barnea unified flow pattern mod', 'mechanistic stratified annular intermittent transition criteria',
+    'unit cell slug mod', 'mechanistic slug flow mod', 'slug tracking mod', 'slug capturing mod', 'slug frequency correlation', 'ength correlation', 'nicklin slug cel',
+    'translational velocity mod', 'slug body film ma', 'slug growth d', 'slug merging equation', 'kelvin helmholtz instability criterion', 'viscou kelvin helmholtz mod',
+    'long wave stability analysi', 'linear stability theory', 'nonlinear wave growth mod', 'roll wave instability mod', 'pipeline riser liquid accumulation mod', 'severe slugging cycl',
+    'hydrodynamic stability criteria', 'pressure build up liquid fallback mod', 'terrain induced accumulation mod', 'interfacial drag', 'wall friction', 'lift force', 'virtual add',
+    'wall lubrication', 'ent dispersion', 'e induced turbul', 'entrainment d', 'escence breakup', 'fourier law', 'transient heat conduction equation', 'newton law of cooling',
+    'overall heat transfer resistance', 'conjugate heat transfer equation', 'radial multilayer conduction', 'seabed conduction', 'natural forced convection', 'e thomson relation', 'rng k',
+    'realizabl', 'sst k', 'reynold stre', 'spalart allmara', 'volume of fluid', 'evel set', 'front tracking', 'phase field', 'drift flux slug tracking', 'two fluid mechanistic closure',
+    'two fluid slug capturing', 'ran vof', 'ection conservation law solver', 'eo thermal hydraulic conservation equation', 'pressure and temperature throughout the pipeline',
+    'riser and well network', 'initial oil', 'ga and water flow rate', 'phase velocitie and superficial velocitie', 'liquid holdup and ga void fraction', 'initial flow regime',
+    'initial liquid film thickne', 'initial fluid inventory', 'initial phase distribution', 'initial wall temperature', 'initial pipe and insulation temperature',
+    'where slugging already exist', 'initial number', 'position', 'ength', 'velocity', 'liquid content and distribution of slug', 'appropriate combination of oil',
+    'or volumetric flow rate', 'phase fraction', 'pressure', 'temperature', 'external heat transfer condition', 'insulation behaviour and any imposed heating or cooling',
+    'appropriate flow between connected branche', 'e valve', 'choke', 'pump', 'compressor and separator boundarie should impose their respective hydraulic characteristic',
+    'production rate change', 'terrain or severe riser slugging', 'validated output from modul', 'or volumetric rate', 'gor', 'water cut', 'well inflow condition',
+    'phase distribution and liquid holdup', 'insulation propertie', 'transient operating boundary historie', 'numerical discretization and convergence control',
+    'phase and superficial velocitie', 'liquid holdup and void fraction', 'flow regime', 'fluid inventory', 'slug initiation onset', 'terrain and severe riser slugging', 'liquid surge',
+    'slug arrival statistic and slug catcher loading', 'interfacial friction correlation', 'liquid wall shear closure', 'ga wall shear closure', 'interfacial shear', 'entrainment rate',
+    'e size', 'et size', 'distribution parameter', 'liquid holdup correlation parameter', 'slug frequency parameter', 'erity parameter', 'slug body holdup', 'film thickne',
+    'slug initiation parameter', 'slug merging parameter', 'heat transfer coefficient', 'overall u value', 'pipe insulation thermal propertie', 'method of manufactured solution mm',
+    'exact analytical solution', 'semi analytical benchmark solution', 'e benchmark probl', 'grid refinement studie', 'grid convergence ind', 'richardson extrapolation', 'er of accuracy',
+    'time step convergence', 'cfl sensitivity', 'iterative convergence', 'nonlinear convergence', 'residual convergence', 'conservation error', 'phase volume conservation',
+    'global balance closure', 'local balance closure', 'shock contact wave propagation test', 'hydrostatic equilibrium test', 'water faucet benchmark',
+    'dam break benchmark where formulation rel', 'kelvin helmholtz interfacial instability benchmark', 'e phase limiting solution', 'homogeneou two phase limiting solution',
+    'steady state limiting solution', 'mesh orientation sensitivity', 'initial condition sensitivity', 'boundary condition sensitivity', 'floating point reproducibility test',
+    'horizontal multiphase flow', 'vertical upward downward flow', 'inclined flow', 'hilly terrain pipeline', 'ga liquid flow', 'oil water flow', 'annular flow', 'stratified flow',
+    'bubbly flow', 'intermittent flow', 'hydrodynamic slugging', 'terrain slugging', 'severe riser slugging', 'long pipeline slugging', 'e catenary riser where applicabl', 'liquid holdup',
+    'slug frequency', 'slug catcher arrival load', 'cooldown behaviour',
   ]/*IMPL*/,
-  referenceOnly: /*REF*/[
-    'phase momentum equations', 'phase-energy equations', 'internal-energy equation', 'entropy inequality', 'species-transport', 'two-fluid', 'multi-fluid', 'six-equation', 'seven-equation',
-    'homogeneous-relaxation', 'duns–ros', 'ansari', 'baker flow map', 'slug-capturing', 'nonlinear wave-growth', 'lift force', 'virtual/added mass', 'wall lubrication',
-    'turbulent dispersion', 'bubble-induced turbulence', 'entrainment', 'deposition rate', 'coalescence/breakup', 'natural/forced convection', 'rng k–ε', 'realizable k–ε', 'sst k–ω',
-    'reynolds-stress', 'spalart–allmaras', 'iddes', 'dns where computationally feasible', 'level set', 'front tracking', 'phase field', '1-d transient flow + 3-d cfd', 'rans + vof',
-    'les + vof', 'riser and well network', 'appropriate flows between connected branches', 'pump', 'compressor and separator boundaries', 'interfacial-friction correlations',
-    'liquid-wall shear closure', 'gas-wall shear closure', 'interfacial shear', 'bubble size', 'droplet size', 'flow-regime transition parameters', 'slug-celerity parameters',
-    'slug-body holdup', 'slug initiation parameters', 'slug growth/decay parameters', 'slug merging parameters', 'external heat-transfer coefficient', 'water-faucet',
-    'kelvin–helmholtz/interfacial-instability benchmark', 'mesh-orientation sensitivity', 'horizontal multiphase flow', 'vertical upward/downward flow', 'inclined flow',
-    'hilly-terrain pipelines', 'gas-liquid flow', 'oil-water flow', 'gas-oil-water flow', 'annular flow', 'stratified flow', 'bubbly flow', 'intermittent flow', 'hydrodynamic slugging',
-    'terrain slugging', 'long-pipeline slugging', 'flexible/catenary risers', 'pressure fluctuations', 'slug velocity', 'slug-catcher arrival/load', 'cooldown behaviour',
+  referenceOnly: /*REF*/[ // handed to external open-source solvers: three-dimensional scale-resolving simulation cannot run in a browser at useful resolution (LES and DES stay unticked because no fragment above matches them)
+    'iddes', 'dns where computationally feasible', '1-d transient flow + 3-d cfd', 'les + vof',
   ]/*REF*/,
-  equationsNote: 'Scope and limits. Steady state: 1-D mass, momentum and energy balances marched with a second-order midpoint rule; properties and flashing from the equation-of-state table of the case fluid; three-phase flow is treated as gas plus one mixed liquid. Transient: drift-flux model with one slip relation for all regimes, first-order upwind, convective acceleration, Joule–Thomson cooling and latent heat neglected; pressure waves are damped rather than resolved and the run stops if the line becomes liquid-full. Slug tracking is one-way coupled to the steady solution; the riser cycle is a lumped quasi-equilibrium model. The RANS solve is single-phase, fully developed and smooth-walled; the interface-capturing solvers are 1-D demonstrations. Two-fluid, slug-capturing, 3-D CFD, LES/DES/DNS and Reynolds-stress models are not solved here.',
+  equationsNote: 'Scope and limits. Steady state: 1-D mass, momentum and energy balances marched with a second-order midpoint rule; properties and flashing from the equation-of-state table of the case fluid; three-phase flow is gas plus one mixed liquid. Transient line model: drift flux with one slip relation, first-order upwind, pressure waves damped. Two-fluid model: isothermal or six-equation (phase internal energies), incompressible liquid, first-order upwind; slug capturing on a test section of a few hundred diameters, not on the whole line; results depend on the cell size (mesh study). Seven-equation model: Baer–Nunziato type without relaxation, shown on shock-tube benchmarks. Multi-fluid: three fields (gas, droplets, film) in annular flow. Interfacial closures of bubbly flow (lift, wall lubrication, turbulent dispersion, virtual mass, bubble-induced turbulence, coalescence and breakup) act in a developed radial model and a 1-D interfacial-area equation. Turbulence closures (mixing length, k–ω, SST, Spalart–Allmaras, k–ε family, Reynolds stress) are solved for developed single-phase pipe flow; the 2-D solver (incompressible, uniform grid, SST k–ω, THINC/WLIC volume of fluid, no surface tension) is a channel analogue of the pipe on coarse grids. Level set, coupled level set / VOF, phase field and front tracking are interface-advection schemes verified on standard tests. A tick under Validation means that the comparison is supported in the app: by a sourced reference data set (Calibration tab) or, where no open data were found (oil–water, gas–oil–water, terrain and long-pipeline slugging, catenary risers, pressure fluctuations, slug-body holdup, slug-catcher load, cooldown), by the measurement tables of the suite. LES, DES, IDDES, DNS, LES + VOF and the coupling of the 1-D transient to 3-D CFD are handed to external open-source solvers.',
   inputs: INPUTS, presets: PRESETS,
   pull: ({ fluid, outputs } = {}) => {
     const n = outputs?.net, s = outputs?.solids, okArr = (a) => Array.isArray(a) && a.length >= 2 && a.every((x) => typeof x === 'number' && Number.isFinite(x)), it = [];
@@ -1642,15 +3045,24 @@ const SUITE = {
   mesh: [
     { name: 'Steady axial grid', keys: ['nSteady'], min: 20, note: 'Cells of the steady march (second-order midpoint rule).', metrics: [{ label: 'Inlet pressure', unit: 'bara', get: (r) => r.outputs.pIn }, { label: 'Arrival temperature', unit: '°C', get: (r) => r.outputs.tOut }, { label: 'Liquid inventory', unit: 'm³', get: (r) => r.outputs.liquidInventory }] },
     { name: 'Transient grid', keys: ['nCells'], min: 12, note: 'Cells of the transient drift-flux grid (first-order upwind).', metrics: [{ label: 'Mean inlet pressure (last 60 %)', unit: 'bara', get: (r) => r.outputs.transient?.pMean ?? NaN }, { label: 'Cumulative liquid outflow', unit: 'm³', get: (r) => r.outputs.transient?.cumLiq ?? NaN }] },
+    { name: 'Two-fluid grid (slug capturing)', keys: ['tfCells'], min: 60, note: 'Cells of the two-fluid test section; select the two-fluid task first.', metrics: [{ label: 'Captured front velocity', unit: 'm/s', get: (r) => { if (!r.outputs.twoFluid) throw new Error('select the task “Two-fluid model” to run this study'); return r.outputs.twoFluid.waveVelocity ?? NaN; } }, { label: 'Mean holdup at the end', unit: '–', get: (r) => { if (!r.outputs.twoFluid) throw new Error('select the task “Two-fluid model” to run this study'); return r.outputs.twoFluid.holdupMean; } }] },
+    { name: '2-D solver grid', keys: ['cfdN'], min: 8, note: 'Cells across the height of the 2-D case; select the 2-D task first.', metrics: [{ label: 'Kinetic energy at the end', unit: 'J/m', get: (r) => { if (!r.outputs.cfd) throw new Error('select the task “2-D Navier–Stokes solver” to run this study'); return r.outputs.cfd.kineticEnd; } }, { label: 'Minimum centre-line u', unit: 'm/s', get: (r) => { if (!r.outputs.cfd) throw new Error('select the task “2-D Navier–Stokes solver” to run this study'); return r.outputs.cfd.uMin; } }] },
     { name: 'Transient time step (CFL number)', keys: ['cfl'], refine: 'divide', note: 'The CFL number is divided by the refinement ratio.', metrics: [{ label: 'Mean inlet pressure (last 60 %)', unit: 'bara', get: (r) => r.outputs.transient?.pMean ?? NaN }, { label: 'Cumulative liquid outflow', unit: 'm³', get: (r) => r.outputs.transient?.cumLiq ?? NaN }] },
   ],
   calibration: {
-    note: 'Fit wall roughness, the U-value multiplier, the holdup multiplier (or C0 and drift velocity when the Zuber–Findlay model is selected) and the slug-frequency, slug-length and film-holdup multipliers and the insulation conductivity to measured pressure drop, arrival temperature, mean holdup, slug frequency, slug length and film thickness at several rates. The model is the steady march on a coarse grid (24 cells). The sample data are synthetic.',
-    params: [{ key: 'roughUm', label: 'Wall roughness (µm)', lo: 5, hi: 500 }, { key: 'uMult', label: 'U-value multiplier', lo: 0.3, hi: 3 }, { key: 'holdupMult', label: 'Holdup multiplier', lo: 0.6, hi: 1.6 }, { key: 'freqMult', label: 'Slug-frequency multiplier', lo: 0.1, hi: 10 }, { key: 'lenMult', label: 'Slug-length multiplier', lo: 0.1, hi: 10 }, { key: 'filmMult', label: 'Film-holdup multiplier', lo: 0.5, hi: 2 }, { key: 'insK', label: 'Insulation conductivity (W/mK)', lo: 0.03, hi: 1 }, { key: 'c0', label: 'Distribution parameter C0', lo: 1, hi: 1.5 }, { key: 'vDrift', label: 'Drift velocity (m/s)', lo: 0, hi: 1.5 }],
-    columns: [{ key: 'rateFrac', label: 'Rate / case rate', unit: '×' }, { key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency (mid-line)', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness (mid-line)', unit: 'mm' }],
-    targets: [{ key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness', unit: 'mm' }],
+    note: 'Every closure parameter of the suite can be estimated here from measurements at several rates: wall roughness (wall friction), interfacial, liquid-wall and gas-wall friction of stratified flow, the stratified → slug transition, entrainment and deposition rates, droplet and bubble size, coalescence and breakup coefficients, drift-flux C0 and drift velocity, holdup, slug frequency, length, celerity and body holdup, film holdup, slug initiation, growth / decay and merging in the tracking model, the external film coefficient, the overall U-value and the insulation conductivity. Each parameter moves at least one of the target columns. The model is the steady march on a coarse grid (24 cells) plus the closures evaluated at the mid-line and highest-velocity cells. The sample data are synthetic (generated from the model with shifted parameters and a few per cent of noise); measured reference data are on this tab below.',
+    params: [{ key: 'roughUm', label: 'Wall roughness (µm)', lo: 5, hi: 500 }, { key: 'uMult', label: 'U-value multiplier', lo: 0.3, hi: 3 }, { key: 'holdupMult', label: 'Holdup multiplier', lo: 0.6, hi: 1.6 }, { key: 'freqMult', label: 'Slug-frequency multiplier', lo: 0.1, hi: 10 }, { key: 'lenMult', label: 'Slug-length multiplier', lo: 0.1, hi: 10 }, { key: 'filmMult', label: 'Film-holdup multiplier', lo: 0.5, hi: 2 }, { key: 'insK', label: 'Insulation conductivity (W/mK)', lo: 0.03, hi: 1 }, { key: 'c0', label: 'Distribution parameter C0', lo: 1, hi: 1.5 }, { key: 'vDrift', label: 'Drift velocity (m/s)', lo: 0, hi: 1.5 },
+      { key: 'fiMult', label: 'Interfacial-friction multiplier', lo: 0.2, hi: 5 }, { key: 'fwlMult', label: 'Liquid-wall friction multiplier', lo: 0.3, hi: 3 }, { key: 'fwgMult', label: 'Gas-wall friction multiplier', lo: 0.3, hi: 3 }, { key: 'transMult', label: 'Transition multiplier', lo: 0.5, hi: 2 }, { key: 'entMult', label: 'Entrainment-rate multiplier', lo: 0.2, hi: 5 }, { key: 'kDep', label: 'Deposition velocity (m/s)', lo: 0.01, hi: 2 }, { key: 'weCrit', label: 'Droplet critical Weber number', lo: 3, hi: 40 }, { key: 'bubbleMm', label: 'Bubble size at the riser base (mm)', lo: 0.5, hi: 15 }, { key: 'crcMult', label: 'Coalescence multiplier', lo: 0.1, hi: 10 }, { key: 'ctiMult', label: 'Breakup multiplier', lo: 0.1, hi: 10 },
+      { key: 'vtMult', label: 'Slug-celerity multiplier', lo: 0.7, hi: 1.4 }, { key: 'bodyMult', label: 'Slug-body holdup multiplier', lo: 0.7, hi: 1.2 }, { key: 'initMult', label: 'Slug-initiation multiplier', lo: 0.2, hi: 5 }, { key: 'relaxMult', label: 'Growth / decay length multiplier', lo: 0.2, hi: 5 }, { key: 'wakeMult', label: 'Merging (wake) multiplier', lo: 0, hi: 4 }, { key: 'hOutMult', label: 'External film-coefficient multiplier', lo: 0.2, hi: 5 }],
+    columns: [{ key: 'rateFrac', label: 'Rate / case rate', unit: '×' }, { key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency (mid-line)', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness (mid-line)', unit: 'mm' }, { key: 'filmVel', label: 'Film velocity', unit: 'm/s' }, { key: 'slugVel', label: 'Slug translational velocity', unit: 'm/s' }, { key: 'bodyHoldup', label: 'Slug-body holdup', unit: '–' },
+      { key: 'level', label: 'Stratified level h/D', unit: '–' }, { key: 'tauI', label: 'Interfacial shear', unit: 'Pa' }, { key: 'dpStrat', label: 'Stratified frictional gradient', unit: 'Pa/m' }, { key: 'vslCrit', label: 'Critical vsl of the stratified → slug transition', unit: 'm/s' }, { key: 'entFrac', label: 'Entrained fraction', unit: '–' }, { key: 'depLength', label: 'Deposition length', unit: 'm' }, { key: 'dropD', label: 'Droplet size', unit: 'µm' }, { key: 'dSauter', label: 'Bubble Sauter diameter 30 m above the riser base', unit: 'mm' },
+      { key: 'arrFreq', label: 'Slug arrival frequency (tracked)', unit: '1/min' }, { key: 'arrLen', label: 'Mean slug length at arrival (tracked)', unit: 'm' }, { key: 'mergeShare', label: 'Share of slugs that merged', unit: '–' }, { key: 'tSurf', label: 'Outer-surface temperature (mid-line)', unit: '°C' }],
+    targets: [{ key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness', unit: 'mm' }, { key: 'filmVel', label: 'Film velocity', unit: 'm/s' }, { key: 'slugVel', label: 'Slug translational velocity', unit: 'm/s' }, { key: 'bodyHoldup', label: 'Slug-body holdup', unit: '–' },
+      { key: 'level', label: 'Stratified level', unit: '–' }, { key: 'tauI', label: 'Interfacial shear', unit: 'Pa' }, { key: 'dpStrat', label: 'Stratified frictional gradient', unit: 'Pa/m' }, { key: 'vslCrit', label: 'Transition liquid velocity', unit: 'm/s' }, { key: 'entFrac', label: 'Entrained fraction', unit: '–' }, { key: 'depLength', label: 'Deposition length', unit: 'm' }, { key: 'dropD', label: 'Droplet size', unit: 'µm' }, { key: 'dSauter', label: 'Bubble Sauter diameter', unit: 'mm' },
+      { key: 'arrFreq', label: 'Slug arrival frequency', unit: '1/min' }, { key: 'arrLen', label: 'Slug length at arrival', unit: 'm' }, { key: 'mergeShare', label: 'Merged share', unit: '–' }, { key: 'tSurf', label: 'Outer-surface temperature', unit: '°C' }],
     model: calibrationModel, sample: CAL_SAMPLE, validationSample: VAL_SAMPLE,
   },
+  validationData: buildValidation(),
   verify,
 };
 export default SUITE;

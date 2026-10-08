@@ -5,7 +5,7 @@
   "type": "module",
   "description": "HydraSlug — integrated multiphase flow-assurance, integrity and techno-economic simulation suite (installable, offline-capable web app)",
   "scripts": {
-    "test": "node tests/run.mjs && node tests/geom.test.mjs && node tests/route.test.mjs",
+    "test": "node tests/run.mjs && node tests/geom.test.mjs && node tests/route.test.mjs && node tests/bridge.test.mjs",
     "build": "node tools/build.mjs",
     "serve": "python3 -m http.server 8080"
   }

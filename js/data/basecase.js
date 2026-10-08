@@ -19,7 +19,7 @@ export const BASE = Object.freeze({
   pRes: 300, tRes: 90, pi: 25, // bara, °C, productivity index Sm³/d/bar (stock-tank liquid)
   wellTVD: 2600, wellMD: 3400, tubingIdMm: 114.3, // below mudline
   // steel: API 5L X65
-  smys: 448, smts: 531, E: 207000, poisson: 0.3, alphaT: 1.17e-5, rhoSteel: 7850, corrosionAllowanceMm: 3, designPressure: 345, designTemp: 110, // MPa, MPa, MPa, -, 1/K, kg/m³, mm, bara, °C
+  smys: 450, smts: 535, E: 207000, poisson: 0.3, alphaT: 1.17e-5, rhoSteel: 7850, corrosionAllowanceMm: 3, designPressure: 345, designTemp: 110, // MPa, MPa, MPa, -, 1/K, kg/m³, mm, bara, °C
   // topsides
   separatorP: 25, slugCatcherVol: 60, // bara, m³
   // economics

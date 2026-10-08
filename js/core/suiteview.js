@@ -15,6 +15,10 @@ import { changesFor } from '../data/changelog.js';
 import { buildId, buildIdNow } from './build.js';
 import { readTable } from './io.js';
 
+// External-solver hand-off (js/core/bridge.js): loaded lazily so the workspace opens even before that module is cached.
+let bridge = null;
+import('./bridge.js').then((m) => { bridge = m; }).catch(() => { bridge = null; });
+
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
 const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geometry) kept out of localStorage
 
@@ -236,10 +240,38 @@ export function renderSuite(suite, root, app) {
     return box;
   };
 
+  // -- published reference data bundled with the suite: blind comparison of the engine with sourced measurements
+  const referencePanel = () => {
+    const sets = suite.validationData || [];
+    if (!sets.length) return null;
+    const out = h('div');
+    const compare = (only) => {
+      const rows = [], cards = [];
+      for (const ds of only ? [only] : sets) {
+        try {
+          const meas = [], pred = [];
+          for (const r of ds.rows) { const m = +r[ds.target], q = +ds.model(r); if (Number.isFinite(m) && Number.isFinite(q)) { meas.push(m); pred.push(q); } }
+          if (!meas.length) continue;
+          const mt = metrics(meas, pred), t = ds.tolerance || {}, worst = Math.max(...mt.residuals.map(Math.abs));
+          const okT = (t.mape === undefined || mt.mape <= t.mape) && (t.rmse === undefined || mt.rmse <= t.rmse) && (t.bias === undefined || Math.abs(mt.bias) <= t.bias) && (t.maxAbs === undefined || worst <= t.maxAbs);
+          const tolText = Object.entries(t).map(([k, v]) => `${k === 'mape' ? 'MAPE ≤ ' + v + ' %' : k === 'rmse' ? 'RMSE ≤ ' + v : k === 'bias' ? '|bias| ≤ ' + v : 'max error ≤ ' + v}`).join(', ') || 'none stated';
+          rows.push([ds.title, ds.kind || '', mt.n, mt.bias, mt.rmse, mt.mape, worst, mt.r2, tolText, okT ? '✓ within' : '✗ outside']);
+          if (only || sets.length <= 4) { const lo = Math.min(...meas, ...pred), hi = Math.max(...meas, ...pred); cards.push(plotCard({ type: 'line', title: `${ds.title} — predicted vs published`, xlabel: `Published ${ds.unit || ''}`, ylabel: `Predicted ${ds.unit || ''}`, height: 260, series: [{ name: 'Data', x: meas, y: pred, mode: 'points' }, { name: 'Perfect agreement', x: [lo, hi], y: [lo, hi], dash: true }], note: ds.note }, { onDownload: download })); }
+        } catch (e) { rows.push([ds.title, ds.kind || '', 0, '–', '–', '–', '–', '–', '–', 'failed: ' + e.message]); }
+      }
+      fill(out, dataTable({ title: 'Engine against published reference data (blind: nothing is fitted to these data)', columns: ['Data set', 'Kind', 'n', 'Bias', 'RMSE', 'MAPE %', 'Largest error', 'R²', 'Stated tolerance', 'Result'], rows }), cards.length ? h('div', { class: 'plots' }, cards) : null);
+    };
+    return h('fieldset', { class: 'group' }, h('legend', null, `Published reference data — ${sets.length} data set${sets.length > 1 ? 's' : ''}, ${sets.reduce((a, d) => a + d.rows.length, 0)} points`, help('Measurements, reference-fluid tables and benchmarks taken from the cited publications and databases. The engine predicts each point without any fitting, so the errors shown are a genuine validation within the stated range.')),
+      h('div', { class: 'row-tools' }, btn('Compare the engine with all reference data', () => compare(null), 'primary')),
+      h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' }, h('thead', null, h('tr', null, ['Data set', 'Points', 'Source', 'Licence', 'Read on', ''].map((x) => h('th', null, x)))),
+        h('tbody', null, sets.map((ds) => h('tr', null, h('td', { class: 'lead wrap' }, ds.title), h('td', { class: 'num' }, ds.rows.length), h('td', { class: 'lead wrap' }, ds.source?.citation || '', ds.source?.url ? h('span', null, ' ', h('a', { href: ds.source.url, target: '_blank', rel: 'noopener noreferrer' }, 'source')) : null), h('td', null, ds.source?.licence || ''), h('td', null, ds.source?.retrieved || ''),
+          h('td', null, btn('Compare', () => compare(ds), 'mini'), ' ', btn('CSV', () => download(toCSV(ds.columns.map((c) => c.label + (c.unit ? ` (${c.unit})` : '')), ds.rows.map((r) => ds.columns.map((c) => r[c.key]))), `${suite.id}_${ds.id}.csv`, 'text/csv'), 'mini ghost'))))))), out);
+  };
+
   // -- calibration and validation
   const calTab = () => {
     const c = suite.calibration;
-    if (!c) return emptyState('Calibration', 'This suite has no adjustable calibration parameters exposed.');
+    if (!c) return suite.validationData?.length ? h('div', { class: 'groups' }, referencePanel()) : emptyState('Calibration', 'This suite has no adjustable calibration parameters exposed.');
     const stored = store.inputs(suite.id);
     const out = h('div'), vout = h('div');
     const checks = c.params.map((p) => ({ p, on: h('input', { type: 'checkbox', checked: true, 'aria-label': 'Fit ' + p.label }), lo: h('input', { type: 'number', step: 'any', value: p.lo, 'aria-label': 'Lower bound' }), hi: h('input', { type: 'number', step: 'any', value: p.hi, 'aria-label': 'Upper bound' }) }));
@@ -295,8 +327,10 @@ export function renderSuite(suite, root, app) {
       } catch (e) { toast('Validation failed: ' + e.message, 'bad'); }
     };
     const setT = (k, v) => store.setInput(suite.id, k, v);
+    const refBox = referencePanel();
     return h('div', { class: 'groups' },
       h('p', { class: 'summary' }, c.note || 'Estimate uncertain model parameters from measured data, then confirm the model on separate data that were not used for fitting.'),
+      refBox,
       h('fieldset', { class: 'group' }, h('legend', null, '1 · Parameters to estimate'),
         h('table', { class: 'tbl' }, h('thead', null, h('tr', null, ['Fit', 'Parameter', 'Current value', 'Lower bound', 'Upper bound'].map((x) => h('th', null, x)))),
           h('tbody', null, checks.map((x) => h('tr', null, h('td', null, x.on), h('td', { class: 'lead' }, x.p.label), h('td', { class: 'num' }, fmt(values(suite)[x.p.key])), h('td', null, x.lo), h('td', null, x.hi)))))),
@@ -328,12 +362,15 @@ export function renderSuite(suite, root, app) {
       h('p', { class: 'note' }, `Validation against measured data and calibration live on the “${L.cal}” tab. Numerical uncertainty lives on the “${L.mesh}” tab.`));
   };
 
-  const chipList = (items) => h('div', { class: 'chips' }, (items || []).map((it) => h('span', { class: 'chip ' + (isImpl(it) ? 'on' : ''), title: isImpl(it) ? 'Covered by this suite' : 'Listed for reference — not covered by the built-in engine' }, isImpl(it) ? '✓ ' : '', it)));
-  const countOf = (items) => `${(items || []).filter(isImpl).length} of ${(items || []).length} covered`;
+  const via = (it) => (isImpl(it) ? null : (() => { try { return bridge?.handoffFor?.(suite.id, it) || null; } catch { return null; } })());
+  const chipList = (items) => h('div', { class: 'chips' }, (items || []).map((it) => { const on = isImpl(it), hv = on ? null : via(it);
+    return hv ? h('a', { class: 'chip via', href: '#/bridge', title: `Solved through an external open-source solver (${hv.solver}): the External solvers page writes the ready-to-run case from this study and reads the results back.` }, '↗ ', it)
+      : h('span', { class: 'chip ' + (on ? 'on' : ''), title: on ? 'Solved by this suite on this device' : 'Not yet covered' }, on ? '✓ ' : '', it); }));
+  const countOf = (items) => { const a = (items || []).filter(isImpl).length, b = (items || []).filter((it) => !isImpl(it) && via(it)).length, n = (items || []).length; return `${a}${b ? ' + ' + b + ' via external solver' : ''} of ${n}`; };
   const theoryTab = () => {
     const all = [...(cat.classical || []), ...(cat.hybrid || [])];
     return h('div', { class: 'groups' },
-      h('p', { class: 'summary' }, `Ticked items are solved by the built-in engine of this suite (${all.filter(isImpl).length} of ${all.length} equation families and coupled formulations). Unticked items are established formulations listed for reference; they are not solved here and no result of this suite depends on them.`),
+      h('p', { class: 'summary' }, (() => { const a = all.filter(isImpl).length, b = all.filter((it) => !isImpl(it) && via(it)).length, rest = all.length - a - b; return `✓ items are solved by the built-in engine of this suite on this device (${a} of ${all.length} equation families and coupled formulations).${b ? ` ↗ items (${b}) need three-dimensional or reference-grade solvers that cannot run in a browser: for those the app writes a complete case for an established open-source solver and reads its results back.` : ''}${rest ? ` ${rest} item${rest > 1 ? 's are' : ' is'} not covered yet.` : ''}`; })()),
       suite.equationsNote ? h('p', { class: 'note' }, suite.equationsNote) : null,
       (cat.groups || []).filter((g) => !/hybrid/i.test(g.title)).map((g) => h('fieldset', { class: 'group' }, h('legend', null, g.title + ' ', h('small', null, countOf(g.items))), chipList(g.items))),
       h('fieldset', { class: 'group' }, h('legend', null, 'Hybrid and coupled formulations ', h('small', null, countOf(cat.hybrid))), chipList(cat.hybrid)),
@@ -341,6 +378,9 @@ export function renderSuite(suite, root, app) {
       h('fieldset', { class: 'group' }, h('legend', null, 'Boundary conditions ', h('small', null, countOf(cat.boundary))), chipList(cat.boundary), h('p', { class: 'note' }, cat.boundaryText || '')),
       h('fieldset', { class: 'group' }, h('legend', null, 'Input data accepted ', h('small', null, countOf(cat.inputs))), chipList(cat.inputs)),
       h('fieldset', { class: 'group' }, h('legend', null, 'Output data and artefacts ', h('small', null, countOf(cat.outputs))), chipList(cat.outputs)),
+      suite.provenance?.length ? h('fieldset', { class: 'group' }, h('legend', null, 'Where the numbers come from ', h('small', null, `${suite.provenance.filter((q) => q.status === 'verified' || q.status === 'corrected').length} of ${suite.provenance.length} constant sets checked against a source`)),
+        h('p', { class: 'note' }, 'Every set of literature constants this engine relies on, the source it was compared with and the outcome. “Corrected” means the comparison found a difference and the value now follows the source; “unverified” means no openly readable source was found and the value should be treated with care.'),
+        dataTable({ title: 'Provenance of constants and correlations', columns: ['Constant set', 'Used by', 'Source', 'Checked on', 'Status', 'What was compared'], rows: suite.provenance.map((q) => [q.item, q.used || '', (q.source || '') + (q.url ? ' — ' + q.url : ''), q.retrieved || '', q.status || '', q.note || '']) })) : null,
       (() => { const ch = changesFor(suite.id); return h('fieldset', { class: 'group' }, h('legend', null, 'Model change log ', h('small', null, ch.length ? `${ch.length} change${ch.length > 1 ? 's' : ''} that moved results` : 'no recorded changes')),
         h('p', { class: 'note' }, 'Every change to this engine that moves results is recorded here with its size and reason. Results, reports and case files carry the build that produced them, so an earlier number can always be traced to its version.'),
         ch.length ? h('div', { class: 'changes' }, ch.map((c) => h('article', { class: 'change' }, h('header', null, h('span', { class: 'badge' }, c.date), h('b', null, ' ' + c.title)), h('dl', null, h('dt', null, 'What changed'), h('dd', null, c.what), h('dt', null, 'Effect on results'), h('dd', null, c.effect), h('dt', null, 'Earlier behaviour'), h('dd', null, c.revert))))) : null); })());

@@ -14,19 +14,23 @@ export const MW_AIR = 28.9647;
 const KEL = 273.15;
 
 // id, name, Tc (K), Pc (bar), acentric, MW (g/mol), Vc (cm³/mol), parachor, ideal-gas Cp = a + bT + cT² + dT³ (J/mol/K), PR volume shift s = c/b
+// Tc, Pc, acentric factor, molar mass and Vc (= 1/critical molar density): CoolProp fluid files (dev/fluids/*.json, the reference
+// equations of state of each fluid), read 2026-10-08. Ideal-gas Cp: cubic least-squares fit (180–560 K, within 0.11 %) of the
+// quartic Cp/R polynomials of Poling, Prausnitz & O'Connell (5th ed.) as tabulated in the open `chemicals` library
+// (PolingDatabank.tsv). Parachors: Weinaug–Katz set (within 1.1 % of the open NeqSim component database). 'Hexanes' is n-hexane.
 const C = (id, name, Tc, Pc, w, MW, Vc, par, cp, s, hyd) => ({ id, name, Tc, Pc, w, MW, Vc, par, cp, s, hyd });
 export const COMPONENTS = Object.freeze({
-  N2: C('N2', 'Nitrogen', 126.2, 33.98, 0.0377, 28.014, 90.1, 41, [31.15, -1.357e-2, 2.68e-5, -1.168e-8], -0.1927),
-  CO2: C('CO2', 'Carbon dioxide', 304.13, 73.77, 0.2239, 44.01, 94.1, 78, [19.8, 7.344e-2, -5.602e-5, 1.715e-8], -0.0817),
-  H2S: C('H2S', 'Hydrogen sulphide', 373.4, 89.63, 0.0942, 34.082, 98.5, 80, [31.94, 1.436e-3, 2.432e-5, -1.176e-8], -0.1288),
-  C1: C('C1', 'Methane', 190.56, 45.99, 0.0115, 16.043, 98.6, 77, [19.25, 5.213e-2, 1.197e-5, -1.132e-8], -0.1595),
-  C2: C('C2', 'Ethane', 305.32, 48.72, 0.0995, 30.07, 145.5, 108, [5.409, 1.781e-1, -6.938e-5, 8.713e-9], -0.1134),
-  C3: C('C3', 'Propane', 369.83, 42.48, 0.1523, 44.097, 200, 150.3, [-4.224, 3.063e-1, -1.586e-4, 3.215e-8], -0.0863),
-  iC4: C('iC4', 'i-Butane', 407.8, 36.4, 0.1808, 58.123, 262.7, 181.5, [-1.39, 3.847e-1, -1.846e-4, 2.895e-8], -0.0844),
-  nC4: C('nC4', 'n-Butane', 425.12, 37.96, 0.2002, 58.123, 255, 189.9, [9.487, 3.313e-1, -1.108e-4, -2.822e-9], -0.0675),
-  iC5: C('iC5', 'i-Pentane', 460.4, 33.81, 0.2275, 72.15, 306, 225, [-9.525, 5.066e-1, -2.729e-4, 5.723e-8], -0.0608),
-  nC5: C('nC5', 'n-Pentane', 469.7, 33.7, 0.2515, 72.15, 311, 231.5, [-3.626, 4.873e-1, -2.58e-4, 5.305e-8], -0.039),
-  C6: C('C6', 'Hexanes', 507.6, 30.25, 0.3013, 86.177, 370, 271, [-4.413, 5.82e-1, -3.119e-4, 6.494e-8], -0.008),
+  N2: C('N2', 'Nitrogen', 126.192, 33.958, 0.0372, 28.01348, 89.41, 41, [29.544, -3.6408e-3, 7.0708e-6, 8.8174e-10], -0.1927),
+  CO2: C('CO2', 'Carbon dioxide', 304.1282, 73.773, 0.22394, 44.0098, 94.12, 78, [25.891, 2.6372e-2, 5.7351e-5, -6.9062e-8], -0.0817),
+  H2S: C('H2S', 'Hydrogen sulphide', 373.1, 90, 0.1005, 34.08088, 98.14, 80, [34.893, -2.1429e-2, 7.7953e-5, -5.0913e-8], -0.1288),
+  C1: C('C1', 'Methane', 190.564, 45.992, 0.01142, 16.0428, 98.63, 77, [36.743, -5.9109e-2, 2.3241e-4, -1.5099e-7], -0.1595),
+  C2: C('C2', 'Ethane', 305.322, 48.722, 0.099, 30.06904, 145.84, 108, [32.051, -2.6839e-3, 3.1575e-4, -2.5465e-7], -0.1134),
+  C3: C('C3', 'Propane', 369.89, 42.512, 0.1521, 44.09562, 200, 150.3, [28.711, 8.4428e-2, 3.0944e-4, -2.8812e-7], -0.0863),
+  iC4: C('iC4', 'i-Butane', 407.817, 36.29, 0.18353, 58.1222, 257.75, 181.5, [24.439, 1.9245e-1, 2.5556e-4, -2.8631e-7], -0.0844),
+  nC4: C('nC4', 'n-Butane', 425.125, 37.96, 0.20081, 58.1222, 254.92, 189.9, [41.701, 1.0232e-1, 4.1372e-4, -3.8408e-7], -0.0675),
+  iC5: C('iC5', 'i-Pentane', 460.35, 33.78, 0.2274, 72.14878, 305.72, 225, [14.016, 3.4664e-1, 6.9297e-5, -1.7209e-7], -0.0608),
+  nC5: C('nC5', 'n-Pentane', 469.7, 33.675, 0.25103, 72.14878, 310.99, 231.5, [56.664, 7.5215e-2, 6.2863e-4, -5.5366e-7], -0.039),
+  C6: C('C6', 'Hexanes', 507.82, 30.441, 0.30032, 86.17536, 369.55, 271, [65.823, 9.5497e-2, 7.4806e-4, -6.7033e-7], -0.008),
 });
 export const LIGHT_IDS = Object.freeze(Object.keys(COMPONENTS));
 export const COMP_IDS = Object.freeze([...LIGHT_IDS, 'C7p']);
@@ -75,7 +79,17 @@ function splitC7(z7, M7, SG7, n) {
     return { id: n === 1 ? 'C7+' : `C7+_${i + 1}`, name: n === 1 ? 'C7+' : `C7+ pseudo ${i + 1}`, pseudo: true, z: z7 * ws[i], MW: M, SG, Tb: p.Tb, Tc: p.Tc, Pc: p.Pc, w: p.w, Vc: p.Vc, par: 59.3 + 2.34 * M, cp: [0.39 * M, 0.0042 * M, 0, 0], s: clamp(1 - 2.258 / M ** 0.1823, -0.05, 0.35) };
   });
 }
-const KIJ = { 'N2-CO2': -0.017, 'N2-H2S': 0.13, 'N2-C1': 0.025, 'N2-C2': 0.01, 'N2-C3': 0.09, 'N2-*': 0.1, 'CO2-H2S': 0.097, 'CO2-C1': 0.105, 'CO2-C2': 0.13, 'CO2-C3': 0.125, 'CO2-*': 0.115, 'H2S-C1': 0.07, 'H2S-C2': 0.085, 'H2S-C3': 0.08, 'H2S-*': 0.06 };
+// Peng–Robinson binary interaction parameters: ChemSep table distributed with the open `thermo` library (Interaction Parameters/
+// ChemSep/pr.json, regressed to the DECHEMA vapour–liquid data collection), read 2026-10-08. H2S–methane is absent from that table
+// (0.07 kept); the 'X-*' entries are the defaults for pairs it does not list and for the C7+ pseudo-components.
+const KIJ = {
+  'N2-CO2': -0.0122, 'N2-H2S': 0.1652, 'N2-C1': 0.0289, 'N2-C2': 0.0533, 'N2-C3': 0.0878, 'N2-iC4': 0.1033, 'N2-nC4': 0.0711, 'N2-iC5': 0.0922, 'N2-nC5': 0.1, 'N2-C6': 0.1496, 'N2-*': 0.1,
+  'CO2-H2S': 0.0967, 'CO2-C1': 0.0978, 'CO2-C2': 0.13, 'CO2-C3': 0.1315, 'CO2-iC4': 0.13, 'CO2-nC4': 0.1352, 'CO2-iC5': 0.1219, 'CO2-nC5': 0.1252, 'CO2-C6': 0.11, 'CO2-*': 0.115,
+  'H2S-C1': 0.07, 'H2S-C2': 0.0952, 'H2S-C3': 0.0878, 'H2S-iC4': 0.0474, 'H2S-nC5': 0.063, 'H2S-*': 0.06,
+  'C1-C2': -0.0059, 'C1-C3': 0.0119, 'C1-iC4': 0.0256, 'C1-nC4': 0.0185, 'C1-iC5': -0.0056, 'C1-nC5': 0.023, 'C1-C6': 0.04,
+  'C2-C3': 0.0011, 'C2-iC4': -0.0067, 'C2-nC4': 0.0089, 'C2-nC5': 0.0078, 'C2-C6': -0.04, 'C3-iC4': -0.0078, 'C3-nC4': 0.0033, 'C3-iC5': 0.0111, 'C3-nC5': 0.0267, 'C3-C6': 0.0007,
+  'iC4-nC4': -0.0004, 'nC4-nC5': 0.0174, 'nC4-C6': -0.0056,
+};
 function kijOf(a, b) {
   if (a.id === b.id) return 0;
   const k = KIJ[`${a.id}-${b.id}`] ?? KIJ[`${b.id}-${a.id}`];

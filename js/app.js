@@ -8,6 +8,7 @@ import { home, casePage, sitePage, portalPage, chainPage, appPage } from './page
 import { fetchSite, mergeSiteData } from './core/live.js';
 import { APP, ARCHIVE_SOURCE } from './data/app.js';
 import { advisorPage } from './core/advisorview.js';
+import { bridgePage } from './pages/bridge.js';
 import { buildId } from './core/build.js';
 
 const PAGES = [
@@ -17,6 +18,7 @@ const PAGES = [
   { path: 'portal', label: 'Data portal', icon: '📥', full: 'Data portal — geometry and input data', render: portalPage },
   ...SUITES.map((s) => ({ path: 'suite/' + s.id, label: `${s.num}. ${s.short}`, full: s.title, icon: s.icon, suite: s.id })),
   { path: 'chain', label: 'Integrated run', icon: '🔗', full: 'Integrated run — all suites, coupled', render: chainPage },
+  { path: 'bridge', label: 'External solvers', icon: '🧩', full: 'External solvers — hand-off and results import', render: bridgePage },
   { path: 'advisor', label: 'Decision support', icon: '🧭', full: 'Decision support & sustainability', render: advisorPage },
   { path: 'app', label: 'Install & offline', icon: '📲', render: appPage },
 ];
@@ -55,7 +57,7 @@ function offerReload() {
 const current = () => { const p = location.hash.replace(/^#\/?/, '') || 'home'; return PAGES.find((x) => x.path === p) ? p : 'home'; };
 function buildNav() {
   const group = (title, items) => h('div', { class: 'nav-group' }, h('div', { class: 'nav-title' }, title), items.map((p) => h('a', { href: '#/' + p.path, class: 'nav-link', dataset: { path: p.path }, title: p.full || p.label }, h('span', { class: 'nav-ico', 'aria-hidden': 'true' }, p.icon), h('span', { class: 'nav-label' }, p.label), p.suite ? h('span', { class: 'nav-dot', dataset: { suite: p.suite }, title: 'Solved in this case' }) : null)));
-  fill(nav, group('Start', PAGES.slice(0, 4)), group('Simulation suites', PAGES.filter((p) => p.suite)), group('Whole case', PAGES.slice(-3)));
+  fill(nav, group('Start', PAGES.slice(0, 4)), group('Simulation suites', PAGES.filter((p) => p.suite)), group('Whole case', PAGES.slice(-4)));
   markSolved();
 }
 function markSolved() { for (const d of nav.querySelectorAll('.nav-dot')) d.classList.toggle('on', !!store.case.outputs[d.dataset.suite]); }

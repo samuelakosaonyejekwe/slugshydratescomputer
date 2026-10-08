@@ -8,6 +8,8 @@ import { fluidModel, inhibitorFor, INHIBITORS } from '../core/thermo.js';
 import { uValue, slugUnit } from '../core/pipe.js';
 import { caseLine, steadyCase } from '../core/caseflow.js';
 import { BASE } from '../data/basecase.js';
+import { BASIS_YEAR, COST_INDEX, STEEL_INDEX, CPI_INDEX, COST_ENTRIES, FISCAL, FISCAL_NOTE, EMISSION_FACTORS, UNIT_DEFS, megEmbodied, FAILURE_RECORDS, FISCAL_HISTORY, FISCAL_HISTORY_SOURCE, costDefault, bundledFactor, abandonmentEstimate } from '../data/costbasis.js';
+import { PRICE_HISTORY, FIELD_PRODUCTION, PARKER_TABLE, KAISER_PROJECTS, NCS_PROJECTS, UKCS_DECOM, DALLAS_BREAKEVEN, UPSTREAM_CI, UKCS_INTENSITY, FINANCE_CASES, REF_SETS } from '../data/ref/econ.js';
 
 export const BBL_PER_M3 = 6.28981077, GJ_PER_MMBTU = 1.05505585, MMBTU_PER_BOE = 5.8;
 const MM = 1e6, Z90 = 1.2815515655446004;
@@ -175,6 +177,7 @@ export function betaInc(x, a, b) {
   const bt = Math.exp(lgamma(a + b) - lgamma(a) - lgamma(b) + a * Math.log(x) + b * Math.log(1 - x));
   return x < (a + 1) / (a + b + 2) ? (bt * cf(x, a, b)) / a : 1 - (bt * cf(1 - x, b, a)) / b;
 }
+const PERT_TABLES = new Map();
 /**
  * Build a distribution object from a table row { dist, lo, mode, hi }.
  * triangular / PERT: minimum, most likely, maximum. uniform: minimum, maximum. normal and lognormal: lo and hi are the
@@ -193,8 +196,8 @@ export function makeDist(d = {}) {
   if (m < a || m > b) bad('the most likely value must lie between low and high');
   if (kind === 'pert') {
     const al = 1 + (4 * (m - a)) / (b - a), be = 1 + (4 * (b - m)) / (b - a), mu = (a + 4 * m + b) / 6;
-    let tab = null; // quantile table built on first use (400 intervals, linear in between)
-    const nT = 400, inv = (u) => { if (!tab) tab = Array.from({ length: nT + 1 }, (_, i) => (i === 0 ? 0 : i === nT ? 1 : brent((x) => betaInc(x, al, be) - i / nT, 0, 1, 1e-12))); const s = clamp(u, 0, 1) * nT, i = Math.min(nT - 1, Math.floor(s)); return a + (b - a) * (tab[i] + (tab[i + 1] - tab[i]) * (s - i)); };
+    let tab = PERT_TABLES.get(`${al}|${be}`) || null; // quantile table built on first use (240 intervals, linear in between) and kept for later runs
+    const nT = 240, inv = (u) => { if (!tab) { tab = Array.from({ length: nT + 1 }, (_, i) => (i === 0 ? 0 : i === nT ? 1 : brent((x) => betaInc(x, al, be) - i / nT, 0, 1, 1e-10))); if (PERT_TABLES.size < 50) PERT_TABLES.set(`${al}|${be}`, tab); } const s = clamp(u, 0, 1) * nT, i = Math.min(nT - 1, Math.floor(s)); return a + (b - a) * (tab[i] + (tab[i + 1] - tab[i]) * (s - i)); };
     return { kind, inv, mean: mu, variance: ((mu - a) * (b - mu)) / 7 };
   }
   if (kind !== 'triangular') bad(`unknown distribution type "${d.dist}" (use triangular, PERT, uniform, normal or lognormal)`);
@@ -575,11 +578,258 @@ export function twoStage({ c, q, scenarios }) {
 }
 
 // ================================================================================================================
+// 5b. Estimation and calibration: price processes, time series, regression, Bayesian updating, screening, surrogate optimisation
+// ================================================================================================================
+/**
+ * Maximum-likelihood fit of geometric Brownian motion to a price series sampled every dt years.
+ * Log returns are N((μ − σ²/2)·dt, σ²·dt): σ² is the (biased, maximum-likelihood) variance of the returns over dt.
+ * Returns { mu, sigma, drift (mean log return per year), n (returns), logLik, seSigma, seDrift }.
+ */
+export function fitGBM(prices, dt = 1) {
+  const p = prices.filter((x) => x > 0), r = [];
+  for (let i = 1; i < p.length; i++) r.push(Math.log(p[i] / p[i - 1]));
+  const n = r.length;
+  if (n < 2) return { mu: 0, sigma: 0, drift: 0, n, logLik: 0, seSigma: 0, seDrift: 0 };
+  const m = mean(r), s2 = sum(r.map((x) => (x - m) ** 2)) / n, sigma = Math.sqrt(s2 / dt);
+  return { mu: m / dt + 0.5 * sigma * sigma, sigma, drift: m / dt, n, logLik: s2 > 0 ? -0.5 * n * (Math.log(2 * Math.PI * s2) + 1) : 0, seSigma: sigma / Math.sqrt(2 * n), seDrift: sigma / Math.sqrt(n * dt) };
+}
+/**
+ * First-order autoregression x[t+1] = a + b·x[t] + ε, ε ~ N(0, s²), by conditional maximum likelihood (= least squares).
+ * Returns { a, b, s2, mean (a/(1 − b) when |b| < 1, else null), n, logLik, seB, r2 }.
+ */
+export function fitAR1(x) {
+  const n = x.length - 1;
+  if (n < 2) return { a: 0, b: 1, s2: 0, mean: null, n: Math.max(n, 0), logLik: 0, seB: 0, r2: 0 };
+  const u = x.slice(0, n), w = x.slice(1), mu = mean(u), mw = mean(w);
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) { sxx += (u[i] - mu) ** 2; sxy += (u[i] - mu) * (w[i] - mw); syy += (w[i] - mw) ** 2; }
+  const b = sxx > 0 ? sxy / sxx : 1, a = mw - b * mu, sse = Math.max(syy - b * sxy, 0), s2 = sse / n;
+  return { a, b, s2, mean: Math.abs(b) < 1 ? a / (1 - b) : null, n, logLik: s2 > 0 ? -0.5 * n * (Math.log(2 * Math.PI * s2) + 1) : 0, seB: sxx > 0 && n > 2 ? Math.sqrt(sse / (n - 2) / sxx) : 0, r2: syy > 0 ? 1 - sse / syy : 0 };
+}
+/**
+ * Exact-discretisation maximum-likelihood fit of a mean-reverting (Ornstein–Uhlenbeck) log price, dx = κ(θ − x)dt + σ dW:
+ * the sampled series is AR(1) with b = e^(−κ·dt) and innovation variance σ²(1 − b²)/(2κ).
+ * Returns { kappa, theta (long-run mean of ln P), sigma, level (exp θ), halfLife (y), b, n, logLik, stationary }. `stationary` is false when
+ * b ≤ 0 or b ≥ 1, or when the implied long-run level is below half the lowest or above twice the highest observed price.
+ */
+export function fitOU(prices, dt = 1) {
+  const pz = prices.filter((x) => x > 0), ar = fitAR1(pz.map(Math.log)), lvl = ar.mean === null ? null : Math.exp(ar.mean);
+  // a root so close to one that the implied long-run level lies far outside the observed prices is not evidence of mean reversion
+  const ok = ar.b > 0 && ar.b < 1 && ar.n >= 3 && lvl >= 0.5 * Math.min(...pz) && lvl <= 2 * Math.max(...pz);
+  if (!ok) return { kappa: 0, theta: null, sigma: Math.sqrt(ar.s2 / dt), level: null, halfLife: null, b: ar.b, n: ar.n, logLik: ar.logLik, stationary: false };
+  const kappa = -Math.log(ar.b) / dt;
+  return { kappa, theta: ar.mean, sigma: Math.sqrt((ar.s2 * 2 * kappa) / (1 - ar.b * ar.b)), level: Math.exp(ar.mean), halfLife: Math.LN2 / kappa, b: ar.b, n: ar.n, logLik: ar.logLik, stationary: true };
+}
+/** Forecast distribution of ln P at horizon h (years) from the last log price x0: { mean, sd } for 'gbm' (fitGBM result) or 'ou' (fitOU result). */
+export function priceForecast(model, fit, x0, h) {
+  if (model === 'ou' && fit.stationary) { const e = Math.exp(-fit.kappa * h); return { mean: fit.theta + (x0 - fit.theta) * e, sd: fit.sigma * Math.sqrt((1 - e * e) / (2 * fit.kappa)) }; }
+  return { mean: x0 + (fit.drift ?? 0) * h, sd: fit.sigma * Math.sqrt(h) };
+}
+/**
+ * Hindcast of a price model. The information is frozen at each decision index i0 (history up to and including it), the
+ * model is fitted to that history only and its forecast band is compared with the prices that followed.
+ * { years[], prices[], model: 'gbm' | 'ou', horizon, minHistory, drift (false = driftless GBM, the usual planning assumption) }.
+ * Returns { rows: [{ t0, year, h, actual, p10, p50, p90, inside }], coverage (share of realised prices inside P10–P90),
+ * bias (mean of ln P50 − ln actual), mape (of P50), n, origins }.
+ */
+export function priceHindcast({ years, prices, model = 'ou', horizon = 5, minHistory = 10, drift = false, origins = null }) {
+  const rows = [], N = prices.length, list = origins || Array.from({ length: Math.max(0, N - minHistory - 1) }, (_, i) => i + minHistory);
+  for (const i0 of list) {
+    if (i0 < 2 || i0 >= N - 1) continue;
+    const hist = prices.slice(0, i0 + 1), g = fitGBM(hist), ou = model === 'ou' ? fitOU(hist) : null, use = ou && ou.stationary ? 'ou' : 'gbm', fit = use === 'ou' ? ou : { ...g, drift: drift ? g.drift : 0 }, x0 = Math.log(prices[i0]);
+    for (let h = 1; h <= horizon && i0 + h < N; h++) {
+      const f = priceForecast(use, fit, x0, h), p10 = Math.exp(f.mean - Z90 * f.sd), p50 = Math.exp(f.mean), p90 = Math.exp(f.mean + Z90 * f.sd), actual = prices[i0 + h];
+      if (actual > 0) rows.push({ t0: years[i0], year: years[i0 + h], h, actual, p10, p50, p90, inside: actual >= p10 && actual <= p90, model: use });
+    }
+  }
+  const n = rows.length;
+  return { rows, n, origins: new Set(rows.map((r) => r.t0)).size, coverage: n ? rows.filter((r) => r.inside).length / n : 0, bias: n ? mean(rows.map((r) => Math.log(r.p50 / r.actual))) : 0, mape: n ? 100 * mean(rows.map((r) => Math.abs(r.p50 - r.actual) / r.actual)) : 0 };
+}
+/** Regularised lower incomplete gamma function P(a, x) (series for x < a + 1, continued fraction otherwise). */
+export function gammaP(a, x) {
+  if (!(x > 0)) return 0;
+  const lg = lgamma(a);
+  if (x < a + 1) { let ap = a, del = 1 / a, s = del; for (let i = 0; i < 500; i++) { ap += 1; del *= x / ap; s += del; if (Math.abs(del) < Math.abs(s) * 1e-16) break; } return Math.min(1, s * Math.exp(-x + a * Math.log(x) - lg)); }
+  const tiny = 1e-300; let b = x + 1 - a, c = 1 / tiny, d = 1 / b, hh = d;
+  for (let i = 1; i < 500; i++) { const an = -i * (i - a); b += 2; d = an * d + b; if (Math.abs(d) < tiny) d = tiny; c = b + an / c; if (Math.abs(c) < tiny) c = tiny; d = 1 / d; const del = d * c; hh *= del; if (Math.abs(del - 1) < 1e-16) break; }
+  return Math.max(0, 1 - Math.exp(-x + a * Math.log(x) - lg) * hh);
+}
+/** Quantile of a Gamma(shape, rate) distribution. */
+export const gammaQuantile = (p, shape, rate) => { const m = shape / rate, hi = m + 40 * Math.sqrt(shape) / rate + 40 / rate; return brent((x) => gammaP(shape, rate * x) - p, 0, hi, 1e-14); };
+/**
+ * Conjugate gamma–Poisson update of a failure frequency. prior: { mean (1/y), strength (pseudo-events α; ½ is the Jeffreys-type weak prior) },
+ * evidence: events n observed over an exposure T (asset-years). Posterior Gamma(α + n, β + T).
+ * Returns { alpha, beta, mean, sd, p05, p50, p95, priorMean, mle (n/T or null), weight (share of the posterior mean that comes from the data) }.
+ */
+export function gammaPoisson({ priorMean, strength = 0.5, events = 0, exposure = 0 }) {
+  const a0 = Math.max(strength, 1e-6), b0 = a0 / Math.max(priorMean, 1e-12), alpha = a0 + Math.max(events, 0), beta = b0 + Math.max(exposure, 0);
+  return { alpha, beta, mean: alpha / beta, sd: Math.sqrt(alpha) / beta, p05: gammaQuantile(0.05, alpha, beta), p50: gammaQuantile(0.5, alpha, beta), p95: gammaQuantile(0.95, alpha, beta), priorMean, mle: exposure > 0 ? events / exposure : null, weight: exposure / beta };
+}
+/**
+ * Ordinary least squares with inference. X: rows of regressors (a constant column is added when intercept = true).
+ * Returns { coef, se, t, r2, adjR2, s (residual standard error), n, k, residuals }.
+ */
+export function olsRegression(X, y, { intercept = true } = {}) {
+  const A = X.map((r) => (intercept ? [1, ...r] : r.slice())), n = A.length, k = A[0].length, AtA = Array.from({ length: k }, (_, i) => Array.from({ length: k }, (__, j) => sum(A.map((r) => r[i] * r[j])))), Aty = Array.from({ length: k }, (_, i) => sum(A.map((r, m) => r[i] * y[m])));
+  const coef = solveSym(AtA, Aty), res = A.map((r, m) => y[m] - sum(r.map((x, j) => x * coef[j]))), sse = sum(res.map((e) => e * e)), my = mean(y), sst = sum(y.map((v) => (v - my) ** 2)), dof = Math.max(n - k, 1), s2 = sse / dof;
+  const se = coef.map((_, j) => { const e = zeros(k); e[j] = 1; return Math.sqrt(Math.max(s2 * solveSym(AtA, e)[j], 0)); });
+  return { coef, se, t: coef.map((c, j) => (se[j] > 0 ? c / se[j] : null)), r2: sst > 0 ? 1 - sse / sst : 1, adjR2: sst > 0 && n > k ? 1 - (sse / dof) / (sst / Math.max(n - 1, 1)) : 1, s: Math.sqrt(s2), n, k, residuals: res };
+}
+// Gaussian elimination with partial pivoting for the small normal-equation systems above
+function solveSym(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let i = c + 1; i < n; i++) if (Math.abs(M[i][c]) > Math.abs(M[p][c])) p = i;
+    if (Math.abs(M[p][c]) < 1e-300) throw new Error('The regression is singular: two regressors carry the same information or there are too few records.');
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let i = c + 1; i < n; i++) { const f = M[i][c] / M[c][c]; if (f !== 0) for (let j = c; j <= n; j++) M[i][j] -= f * M[c][j]; }
+  }
+  const x = zeros(n);
+  for (let i = n - 1; i >= 0; i--) { let s = M[i][n]; for (let j = i + 1; j < n; j++) s -= M[i][j] * x[j]; x[i] = s / M[i][i]; }
+  return x;
+}
+/** Power-law (parametric) cost regression cost = a·size^b fitted in logarithms: { a, b, seB, r2, n }. */
+export function powerLawFit(size, cost) {
+  const ok = size.map((s, i) => s > 0 && cost[i] > 0), xs = size.filter((_, i) => ok[i]).map(Math.log), ys = cost.filter((_, i) => ok[i]).map(Math.log);
+  if (xs.length < 2 || Math.max(...xs) - Math.min(...xs) < 1e-9) return { a: xs.length ? Math.exp(mean(ys) - mean(xs)) : null, b: 1, seB: null, r2: 0, n: xs.length };
+  const r = olsRegression(xs.map((x) => [x]), ys);
+  return { a: Math.exp(r.coef[0]), b: r.coef[1], seB: xs.length > 2 ? r.se[1] : null, r2: r.r2, n: xs.length };
+}
+/** Learning-curve fit: unit cost of the n-th unit = first·n^log₂(rate). Returns { rate, first, r2, n }. */
+export function learningFit(unitNo, unitCost) {
+  const f = powerLawFit(unitNo, unitCost);
+  return { rate: 2 ** f.b, first: f.a, r2: f.r2, n: f.n };
+}
+/** Cost index at a (fractional) year from a series { years[], values[] } (ascending): linear inside, extrapolated at `growth` per year outside. */
+export function indexAt(series, year, growth = 0.025) {
+  const ys = series.years, vs = series.values, n = ys.length;
+  if (!n) return 1;
+  if (year <= ys[0]) return vs[0] / (1 + growth) ** (ys[0] - year);
+  if (year >= ys[n - 1]) return vs[n - 1] * (1 + growth) ** (year - ys[n - 1]);
+  return interp1(ys, vs, year);
+}
+/** Cost-index normalisation factor that moves money of `from` to money of `to`. */
+export const indexFactor = (series, from, to, growth = 0.025) => indexAt(series, to, growth) / indexAt(series, from, growth);
+/**
+ * Location-factor calibration: geometric mean of (actual cost normalised to the basis year) ÷ (model cost at the base location).
+ * Returns { factor, logSd, n, lo, hi (approximate 80 % interval of the mean) }.
+ */
+export function locationFactor(ratios) {
+  const l = ratios.filter((r) => r > 0).map(Math.log), n = l.length;
+  if (!n) return { factor: 1, logSd: 0, n: 0, lo: 1, hi: 1 };
+  const m = mean(l), sd = n > 1 ? Math.sqrt(variance(l)) : 0, hw = n > 1 ? (Z90 * sd) / Math.sqrt(n) : 0;
+  return { factor: Math.exp(m), logSd: sd, n, lo: Math.exp(m - hw), hi: Math.exp(m + hw) };
+}
+/**
+ * Bayesian calibration of a multiplicative model factor from actual ÷ predicted ratios (normal–normal conjugate model in logarithms).
+ * Prior ln f ~ N(0, priorSd²); each record ln ratio ~ N(ln f, obsSd²) (obsSd from the records when there are three or more, else the default).
+ * Returns { factor (posterior median), logSd, weight (data share), n, mle (geometric mean ratio), obsSd }.
+ */
+export function bayesFactor(ratios, { priorSd = 0.3, obsSd = 0.25 } = {}) {
+  const l = ratios.filter((r) => r > 0).map(Math.log), n = l.length;
+  if (!n) return { factor: 1, logSd: priorSd, weight: 0, n: 0, mle: null, obsSd };
+  const m = mean(l), s = n >= 3 ? Math.max(Math.sqrt(variance(l)), 0.02) : obsSd, prec = n / (s * s) + 1 / (priorSd * priorSd), w = n / (s * s) / prec;
+  return { factor: Math.exp(w * m), logSd: Math.sqrt(1 / prec), weight: w, n, mle: Math.exp(m), obsSd: s };
+}
+/** Least-squares fit of the Arps decline (qi, Di, b) to rates q at times t (years from the start of decline), in logarithms of the rate. fixB fixes the exponent. */
+export function fitArps(t, q, { fixB = null } = {}) {
+  const memo = `${fixB}|${t.join(',')}|${q.join(',')}`, hit = ARPS_MEMO.get(memo);
+  if (hit) return { ...hit };
+  const out = fitArpsRaw(t, q, fixB);
+  if (ARPS_MEMO.size > 40) ARPS_MEMO.clear();
+  ARPS_MEMO.set(memo, out);
+  return { ...out };
+}
+const ARPS_MEMO = new Map();
+function fitArpsRaw(t, q, fixB) {
+  const pts = t.map((x, i) => [x, q[i]]).filter((p) => p[1] > 0 && Number.isFinite(p[0])), n = pts.length;
+  if (n < 2) return { qi: n ? pts[0][1] : 0, Di: 0, b: fixB ?? 0, rmse: 0, n, r2: 0 };
+  const ls = linfitXY(pts.map((p) => p[0]), pts.map((p) => Math.log(p[1]))), q0 = Math.exp(ls.a), D0 = clamp(-ls.b, 1e-4, 5);
+  const sse = (z) => { const qi = Math.exp(z[0]), Di = Math.exp(z[1]), b = fixB ?? z[2]; let s = 0; for (const [x, y] of pts) s += (Math.log(Math.max(arps(qi, Di, b, x).q, 1e-300)) - Math.log(y)) ** 2; return s; };
+  let best = null;
+  for (const b0 of fixB === null ? [0.1, 0.7] : [fixB]) {
+    const z0 = fixB === null ? [Math.log(q0), Math.log(D0), b0] : [Math.log(q0), Math.log(D0)], r = nelderMead(sse, z0, { lo: fixB === null ? [-50, Math.log(1e-4), 0] : [-50, Math.log(1e-4)], hi: fixB === null ? [50, Math.log(10), 1] : [50, Math.log(10)], tol: 1e-13, maxIter: 260, scale: 0.2 });
+    if (!best || r.f < best.f) best = r;
+  }
+  const my = mean(pts.map((p) => Math.log(p[1]))), sst = sum(pts.map((p) => (Math.log(p[1]) - my) ** 2));
+  return { qi: Math.exp(best.x[0]), Di: Math.exp(best.x[1]), b: fixB ?? best.x[2], rmse: Math.sqrt(best.f / n), n, r2: sst > 0 ? 1 - best.f / sst : 1 };
+}
+const linfitXY = (x, y) => { const mx = mean(x), my = mean(y); let sxx = 0, sxy = 0; for (let i = 0; i < x.length; i++) { sxx += (x[i] - mx) ** 2; sxy += (x[i] - mx) * (y[i] - my); } const b = sxx > 0 ? sxy / sxx : 0; return { a: my - b * mx, b }; };
+/**
+ * Morris elementary-effects screening on the unit cube. r trajectories on a p-level grid (step Δ = p / (2(p − 1))).
+ * Returns { muStar: [], mu: [], sigma: [], evals } — μ* ranks the inputs, σ flags non-linearity and interaction.
+ */
+export function morrisScreening(f, d, { r = 10, levels = 4, seed = 21 } = {}) {
+  const R = rng(seed), delta = levels / (2 * (levels - 1)), ee = Array.from({ length: d }, () => []);
+  let evals = 0;
+  for (let k = 0; k < r; k++) {
+    const x = Array.from({ length: d }, () => R.int(levels / 2) / (levels - 1)), order = Array.from({ length: d }, (_, i) => i);
+    for (let i = d - 1; i > 0; i--) { const j = R.int(i + 1); [order[i], order[j]] = [order[j], order[i]]; }
+    let y = f(x.slice()); evals++;
+    for (const i of order) { const up = x[i] + delta <= 1 + 1e-12, step = up ? delta : -delta; x[i] += step; const y2 = f(x.slice()); evals++; ee[i].push((y2 - y) / step); y = y2; }
+  }
+  return { muStar: ee.map((e) => mean(e.map(Math.abs))), mu: ee.map(mean), sigma: ee.map((e) => (e.length > 1 ? Math.sqrt(variance(e)) : 0)), evals };
+}
+/**
+ * Gaussian-process regression on the unit cube with an anisotropic squared-exponential kernel. The length scales and the
+ * noise level are fitted by maximising the log marginal likelihood (multi-start Nelder–Mead on their logarithms) unless given.
+ * Returns { predict(x) → { mean, sd }, len: [], noise, logML, n }.
+ */
+export function gaussianProcess(X, y, { len = null, noise = null } = {}) {
+  const n = X.length, d = X[0].length, my = mean(y), sy = Math.sqrt(variance(y) || 1) || 1, yn = y.map((v) => (v - my) / sy);
+  const build = (ls, nz) => {
+    const kf = (a, b) => { let s = 0; for (let i = 0; i < d; i++) s += ((a[i] - b[i]) / ls[i]) ** 2; return Math.exp(-0.5 * s); };
+    const K = X.map((a, i) => X.map((b, j) => kf(a, b) + (i === j ? nz + 1e-10 : 0))), L = cholesky(K);
+    if (!L) return null;
+    const fwd = (bv) => { const z = new Array(n); for (let i = 0; i < n; i++) { let s = bv[i]; for (let k = 0; k < i; k++) s -= L[i][k] * z[k]; z[i] = s / L[i][i]; } return z; }, bwd = (z) => { const x = new Array(n); for (let i = n - 1; i >= 0; i--) { let s = z[i]; for (let k = i + 1; k < n; k++) s -= L[k][i] * x[k]; x[i] = s / L[i][i]; } return x; };
+    const alpha = bwd(fwd(yn));
+    let logML = -0.5 * n * Math.log(2 * Math.PI); for (let i = 0; i < n; i++) logML -= Math.log(L[i][i]) + 0.5 * yn[i] * alpha[i];
+    return { kf, fwd, alpha, logML };
+  };
+  let ls = len ? (Array.isArray(len) ? len.slice() : zeros(d).map(() => len)) : null, nz = noise ?? 1e-6, m = ls ? build(ls, nz) : null;
+  if (!ls) {
+    const obj = (z) => { const b = build(z.slice(0, d).map(Math.exp), noise ?? Math.exp(z[d])); return b ? -b.logML : 1e12; }, lo = [...zeros(d).map(() => Math.log(0.03)), Math.log(1e-8)], hi = [...zeros(d).map(() => Math.log(5)), Math.log(0.3)];
+    let best = null;
+    for (const l0 of [0.2, 0.7]) { const r = nelderMead(obj, [...zeros(d).map(() => Math.log(l0)), Math.log(1e-4)], { lo, hi, tol: 1e-6, maxIter: 35 * (d + 1), scale: 0.5 }); if (!best || r.f < best.f) best = r; }
+    ls = best.x.slice(0, d).map(Math.exp); nz = noise ?? Math.exp(best.x[d]); m = build(ls, nz);
+  }
+  if (!m) { ls = zeros(d).map(() => 0.3); nz = 1e-4; m = build(ls, nz); }
+  const predict = (x) => { const ks = X.map((a) => m.kf(a, x)), v = m.fwd(ks); let mu = 0, vv = 0; for (let i = 0; i < n; i++) { mu += ks[i] * m.alpha[i]; vv += v[i] * v[i]; } return { mean: my + sy * mu, sd: sy * Math.sqrt(Math.max(1 + nz - vv, 1e-14)) }; };
+  return { predict, len: ls, noise: nz, logML: m.logML, n };
+}
+/** Expected improvement (minimisation) of a prediction N(mean, sd²) over the best value seen. */
+export const expectedImprovement = (mu, sd, best) => { if (!(sd > 0)) return Math.max(best - mu, 0); const z = (best - mu) / sd; return (best - mu) * normCdf(z) + sd * normPdf(z); };
+/**
+ * Bayesian optimisation (minimisation) inside a box: a Latin-hypercube start, then at each step a Gaussian process with
+ * fitted kernel is conditioned on every evaluation and the next point maximises the expected improvement over a random
+ * candidate set refined around the incumbent. x0 adds known designs (for example the present one) to the starting set. Returns { x, f, history: [best so far], evals, len (final length scales), X, Y }.
+ */
+export function bayesOpt(f, lo, hi, { n0 = 6, iters = 12, seed = 9, cand = 240, refit = 4, x0 = null } = {}) {
+  const R = rng(seed), d = lo.length, toX = (u) => u.map((v, i) => lo[i] + v * (hi[i] - lo[i])), U = [...lhs(n0, d, seed), ...(x0 || []).map((x) => x.map((v, i) => clamp((v - lo[i]) / (hi[i] - lo[i] || 1), 0, 1)))], Y = U.map((u) => f(toX(u))), hist = [];
+  let gpLen = null, gpNoise = null, gp = null;
+  for (let it = 0; it < iters; it++) {
+    if (it % refit === 0) { gp = gaussianProcess(U, Y); gpLen = gp.len; gpNoise = gp.noise; } else gp = gaussianProcess(U, Y, { len: gpLen, noise: gpNoise });
+    const best = Math.min(...Y), ub = U[Y.indexOf(best)];
+    let bu = null, bEI = -1;
+    for (let k = 0; k < cand; k++) {
+      const u = k % 3 === 0 ? ub.map((v) => clamp(v + R.normal(0, 0.08), 0, 1)) : lo.map(() => R.uniform());
+      if (U.some((w) => w.every((v, i) => Math.abs(v - u[i]) < 1e-6))) continue;
+      const p = gp.predict(u), ei = expectedImprovement(p.mean, p.sd, best);
+      if (ei > bEI) { bEI = ei; bu = u; }
+    }
+    if (!bu) break;
+    U.push(bu); Y.push(f(toX(bu))); hist.push(Math.min(...Y));
+  }
+  const bi = Y.indexOf(Math.min(...Y));
+  return { x: toX(U[bi]), f: Y[bi], history: hist, evals: Y.length, len: gpLen, X: U.map(toX), Y: Y.slice() };
+}
+
+// ================================================================================================================
 // 6. CAPEX: parametric and bottom-up cost models
 // ================================================================================================================
-/** Default cost basis (2023 US$, cost index 800). ref = purchased cost in M$ at capacity cap; cost = ref·(capacity/cap)^exp; fac = installation (bare-module) factor. */
+/** Default equipment cost basis in basis-year money (see js/data/costbasis.js for the source or status of every number). ref = purchased cost in M$ at capacity cap; cost = ref·(capacity/cap)^exp; fac = installation (bare-module) factor. */
 export const COST_BASIS = Object.freeze([
-  { id: 'tree', item: 'Subsea tree, wellhead and controls (per well)', ref: 9, cap: 1, unit: 'well', exp: 1, fac: 1.25 },
+  { id: 'tree', item: 'Subsea tree, wellhead and controls (per well)', ref: costDefault('treeRef', 9), cap: 1, unit: 'well', exp: 1, fac: 1.25 },
   { id: 'manifold', item: 'Production manifold with foundation', ref: 16, cap: 4, unit: 'slots', exp: 0.6, fac: 1.3 },
   { id: 'jumper', item: 'Rigid jumper with connectors (each)', ref: 1.4, cap: 1, unit: 'each', exp: 1, fac: 1.4 },
   { id: 'plet', item: 'Pipeline end termination (each)', ref: 3, cap: 1, unit: 'each', exp: 1, fac: 1.3 },
@@ -601,6 +851,7 @@ export function pipelineCER({ dIn = 10, lengthKm = 20, depth = 1000, unitNo = 1,
   const material = cerCoef * (dIn / 10) ** cerExp * lengthKm, days = lengthKm / (layRate * (10 / dIn) ** 0.5), lay = (layFactor * vesselRate * (1 + (depthCoef * depth) / 1000) * days) / 1000;
   return (material + lay + mobCost) * Math.max(unitNo, 1) ** Math.log2(learnRate);
 }
+const SUBSEA_SCOPE = Object.freeze({ Pipeline: true, Riser: true, Installation: true, Subsea: true });
 /**
  * Capital cost build-up. c: geometry (flowLen, riserLen, id, wt in m, depth), strategy ('none' | 'bare' | 'wet' | 'pip' | 'deh' | 'ldhi' | 'risk'),
  * insT (m), material ('cs' | 'cra'), caExtra (m extra wall), nWells, slugVol (m³), megRate, chemRate (m³/d), pumpKW, compKW, heatKW and the cost basis.
@@ -608,7 +859,8 @@ export function pipelineCER({ dIn = 10, lengthKm = 20, depth = 1000, unitNo = 1,
  */
 export function capexEstimate(c) {
   const B = c.basis || basisMap(c.costBasis), items = [], esc = (c.costIndexEval / c.costIndexBase) * c.locFactor, st = c.strategy || 'wet';
-  const add = (group, item, cost, basis) => { if (cost > 0) items.push({ group, item, basis: c.brief || !basis ? '' : basis(), cost: cost * esc }); }; // basis text is built only for the reported estimate
+  const calF = c.calF || null, exist = c.exist || null; // back-fitted factors by scope and the share of each scope that is already installed
+  const add = (group, item, cost, basis) => { if (!(cost > 0)) return; let f = esc; if (c.subseaCal > 0 && SUBSEA_SCOPE[group]) f *= c.subseaCal; if (calF) f *= calF.all * (group === 'Installation' ? calF.install : group === 'Wells' ? 1 : calF.proc); if (exist && exist[group] > 0) f *= 1 - exist[group]; items.push({ group, item, basis: c.brief || !basis ? '' : basis(), cost: cost * f }); }; // basis text is built only for the reported estimate
   const purchased = (id, cap) => B[id].ref * MM * (Math.max(cap, 0) / B[id].cap) ** B[id].exp;
   // --- line pipe, coatings and thermal system (per metre)
   const wt = c.wt + (c.caExtra || 0), od = c.id + 2 * wt, dIn = c.id / 0.0254, L = c.flowLen + c.riserLen, tCoat = 0.003;
@@ -621,6 +873,8 @@ export function capexEstimate(c) {
   add('Pipeline', 'Wet insulation', insPerM * c.flowLen, () => `${(insVolM * c.flowLen).toFixed(0)} m³ at ${(insT * 1000).toFixed(0)} mm`);
   add('Pipeline', 'Pipe-in-pipe carrier pipe, annulus insulation, bulkheads', pipPerM * c.flowLen, () => 'outer pipe steel + premium per metre');
   add('Pipeline', 'Direct electrical heating cable and anodes', st === 'deh' ? c.dehCable * c.flowLen : 0, () => `${c.dehCable} $/m`);
+  add('Pipeline', 'Buckle arrestors', (c.nArrestors || 0) * (c.arrestorCost || 0) * 1000, () => `${c.nArrestors} at ${c.arrestorCost} k$ each (forged ring, two extra girth welds)`);
+  add('Pipeline', 'Lateral-buckling management: sleepers, buckle initiators and span supports', (c.nSleepers || 0) * (c.sleeperCost || 0) * 1000, () => `${c.nSleepers} at ${c.sleeperCost} k$ each, installed`);
   add('Riser', 'Steel catenary riser (pipe, insulation, strakes, fatigue-class welds)', (steelPerM + insPerM + (st === 'pip' ? 0.5 * pipPerM : 0)) * c.riserFactor * c.riserLen, () => `flowline unit cost × ${c.riserFactor}`);
   // --- installation by vessel day rate
   const trees = Math.max(1, Math.round(c.nWells)), jumpers = trees + 2, umbKm = (1.05 * L) / 1000, nLines = { none: 0, bare: 2, wet: 1, pip: 1, deh: 1, ldhi: 2, risk: 0 }[st] ?? 1;
@@ -641,6 +895,7 @@ export function capexEstimate(c) {
   add('Subsea', 'Chemical lines in the umbilical', nLines * purchased('chemline', umbKm) * B.chemline.fac, () => `${nLines} line(s)`);
   add('Wells', 'Drilling and completion', c.wellCost * MM * lc, () => `${trees} well(s), learning curve`);
   // --- topsides by capacity scaling; bare-module factors or one Lang factor
+  add('Subsea', 'Artificial-lift equipment (gas-lift or boosting package)', c.liftKW > 0 ? purchased('pump', c.liftKW) * B.pump.fac * (c.liftFactor || 1) : 0, () => `${+(+c.liftKW).toPrecision(3)} kW on the pump relationship × ${c.liftFactor || 1} for subsea or down-hole service`);
   const eq = [['slugcatcher', c.slugVol], ['megregen', st === 'bare' ? c.megRate : 0], ['cheminj', c.chemRate], ['pump', c.pumpKW], ['compressor', c.compKW], ['dehpower', st === 'deh' ? c.heatKW : 0], ['pigtrap', dIn]].filter((e) => e[1] > 0).map(([id, cap]) => ({ id, cap, E: purchased(id, cap) }));
   const pE = sum(eq.map((e) => e.E)), moduleCost = sum(eq.map((e) => e.E * B[e.id].fac)), langCost = pE * c.langFactor, useLang = c.costMethod === 'lang';
   for (const e of eq) add('Topsides', B[e.id].item, e.E * (useLang ? c.langFactor : B[e.id].fac), () => `${+e.cap.toPrecision(3)} ${B[e.id].unit}, exponent ${B[e.id].exp}, factor ${useLang ? c.langFactor : B[e.id].fac}`);
@@ -650,6 +905,33 @@ export function capexEstimate(c) {
   for (const it of items) groups[it.group] = (groups[it.group] || 0) + it.cost;
   return { items, groups, direct, contingency, owners, total: direct + contingency + owners, steelT, layDays, purchased: pE * esc, moduleCost: moduleCost * esc, langCost: langCost * esc, od, escalation: esc, pipeInstalled: (groups.Pipeline || 0) + (groups.Riser || 0) + (groups.Installation || 0) };
 }
+
+/** Arguments of capexEstimate built from the cost-basis defaults (basis-year money, no calibration factor). */
+export function basisArgs(over = {}) {
+  const D = (k, fb) => costDefault(k, fb);
+  return { costIndexEval: 1, costIndexBase: 1, locFactor: 1, flowLen: 18800, riserLen: 1500, id: BASE.idMm / 1000, wt: BASE.wtMm / 1000, depth: BASE.waterDepth, insT: 0.08, material: 'cs', nWells: 2, slugVol: 60, megRate: 0, chemRate: 0.5, pumpKW: 0, compKW: 0, heatKW: 0,
+    steelPrice: D('steelPrice', 1800), coatPrice: D('coatPrice', 60), fabPerM: D('fabPerM', 120), insPrice: D('insPrice', 5000), pipPremium: D('pipPremium', 650), dehCable: D('dehCable', 450), riserFactor: D('riserFactor', 2.5), vesselRate: D('vesselRate', 350), layRate: D('layRate', 2.5), mobCost: D('mobCost', 6), layFactor: D('spreadFactor', 1), depthCoef: D('depthUplift', 0.2),
+    wellCost: D('wellCost', 70), learnRate: D('learnRate', 90) / 100, langFactor: 3.6, costMethod: 'module', contingency: 0.15, owners: 0.08, craFactor: D('craFactor', 4.5), strategy: 'wet', brief: true, ...over };
+}
+/**
+ * Calibration of the subsea scope (flowline, riser, installation, subsea equipment) to the published cost of a two-well
+ * tie-back against distance: one factor, least squares on the logarithm of cost at the published end points.
+ * Returns { factor, points: [{ miles, published, model, calibrated, error }], rms (of the calibrated log error), year }.
+ */
+export function fitSubseaScope() {
+  const e = Object.fromEntries(COST_ENTRIES.map((x) => [x.key, x])), pts = [[5, e.subseaSystem5], [65, e.subseaSystem65]].filter((p) => p[1]);
+  if (!pts.length) return { factor: 1, points: [], rms: 0, year: BASIS_YEAR };
+  const year = pts[0][1].basisYear, defl = bundledFactor('machinery', BASIS_YEAR, year);
+  const model = (miles) => { const c = capexEstimate(basisArgs({ costIndexEval: defl, strategy: 'none', insT: 0, depth: 1119, flowLen: Math.max(miles * 1609.344 - 1250, 100), riserLen: 1250 })), g = c.groups; return (((g.Pipeline || 0) + (g.Riser || 0) + (g.Installation || 0) + (g.Subsea || 0)) * (1 + 0.15 + 0.08)) / MM; };
+  const rows = pts.map(([miles, en]) => ({ miles, published: en.value, model: model(miles) })), factor = Math.exp(mean(rows.map((r) => Math.log(r.published / r.model))));
+  rows.forEach((r) => { r.calibrated = r.model * factor; r.error = r.calibrated / r.published - 1; });
+  return { factor, points: rows, rms: Math.sqrt(mean(rows.map((r) => Math.log(r.calibrated / r.published) ** 2))), year };
+}
+export const SUBSEA_FIT = fitSubseaScope();
+/** Parametric regression of the published pipeline cost against diameter: material cost and total cost per mile = a·D^b. */
+export const DIAMETER_FIT = Object.freeze({ materials: powerLawFit(PARKER_TABLE.rows.map((r) => r.d), PARKER_TABLE.rows.map((r) => r.materials)), total: powerLawFit(PARKER_TABLE.rows.map((r) => r.d), PARKER_TABLE.rows.map((r) => r.total)) });
+/** Line pipe, coating and welding of the reference 10-inch line by the bottom-up build (M$ per km, basis-year money): the coefficient of the parametric relationship. */
+const CER_COEF_10 = (() => { const a = basisArgs(), od = a.id + 2 * a.wt; return +(((BASE.rhoSteel * Math.PI * (od * od - a.id * a.id)) / 4 / 1000) * a.steelPrice + Math.PI * od * a.coatPrice + a.fabPerM).toPrecision(3) / 1000; })();
 
 // ================================================================================================================
 // 7. Fiscal cash-flow engine
@@ -666,30 +948,36 @@ export function capexEstimate(c) {
  */
 export function cashflow(p, m = {}, detail = true) {
   // every project field is read once into a local: the year loop then runs on plain variables
-  const { phase, life: lifeP, lifeCut, discount, regime, uptime, infl, costEsc, priceEsc, carbonEsc, abandon: abandonC, abandonProvision, capexSunk, residual, capex: capexT, mid, gearing, loanRate, oil: oilA, gas: gasA, deferFrac, water: waterA, oilPrice, gasPrice, royalty, opexFixed, opexVarBoe, waterCost, opexDown, opexBlock, carbonT, carbonPrice, includeRisk, haz, consequence, deprFrac, loanTenor, costOilCap, profitSplit, taxRate, wcDays } = p;
-  const mPrice = m.price ?? 1, mProd = m.prod ?? 1, mCapex = m.capex ?? 1, mOpex = m.opex ?? 1, mDown = m.downtime ?? 1, mFail = m.failFreq ?? 1, mRep = m.repair ?? 1;
+  const { phase, life: lifeP, lifeCut, discount, regime, uptime, infl, costEsc, priceEsc, carbonEsc, abandon: abandonC, abandonProvision, capexSunk, residual, capex: capexT, mid, gearing, loanRate, oil: oilA, gas: gasA, deferFrac, water: waterA, oilPrice, gasPrice, royalty, opexFixed, opexVarBoe, waterCost, opexDown, opexBlock, carbonT, carbonPrice, includeRisk, haz, consequence, deprFrac, loanTenor, costOilCap, profitSplit, taxRate, wcDays, downExtra, opexExtra, oilCap, gasCap, wcInitial, salvageEnd, pscScale } = p;
+  const mPrice = m.price ?? 1, mGasPath = m.gasPath, mProd = m.prod ?? 1, mCapex = m.capex ?? 1, mOpex = m.opex ?? 1, mDown = m.downtime ?? 1, mFail = m.failFreq ?? 1, mRep = m.repair ?? 1;
   const nCon = phase.length, life = Math.max(1, Math.min(lifeP, lifeCut ?? lifeP)), K = nCon + life + 1, r = discount, psc = regime === 'psc', mPath = m.path, mEv = m.events;
   const down = clamp((1 - uptime) * mDown, 0, 0.95), avail = 1 - down, cg = (1 + infl) * (1 + costEsc), pg = (1 + infl) * (1 + priceEsc), kg = (1 + infl) * (1 + carbonEsc);
   const abNom = abandonC * cg ** (nCon + life), accr = abandonProvision ? abNom / life : 0;
   let deprBase = (capexSunk || 0) + (residual || 0);
   for (let k = 0; k < nCon; k++) deprBase += capexT * mCapex * phase[k] * cg ** k;
-  let book = deprBase, pool = 0, poolL = 0, rec = 0, wcPrev = 0, defOil = 0, defGas = 0, npvSum = 0, cum = 0, cumD = 0, debt = 0, pay = 0;
-  const D = detail ? Object.fromEntries(['year', 'oil', 'gas', 'boe', 'potBoe', 'lostBoe', 'defBoe', 'water', 'revenue', 'royalty', 'govShare', 'opex', 'carbon', 'risk', 'ocf', 'depreciation', 'taxable', 'tax', 'atcf', 'capex', 'dwc', 'abandon', 'fcf', 'cum', 'df', 'dcf', 'cumDcf', 'real', 'interest', 'debtService', 'equity', 'price'].map((k) => [k, zeros(K)])) : null;
+  let book = deprBase, pool = 0, poolL = 0, rec = 0, wcPrev = 0, defOil = 0, defGas = 0, npvSum = 0, cum = 0, cumD = 0, debt = 0, pay = 0, cumIn = 0, cumOut = 0;
+  const D = detail ? Object.fromEntries(['year', 'oil', 'gas', 'boe', 'potBoe', 'lostBoe', 'defBoe', 'water', 'revenue', 'royalty', 'govShare', 'opex', 'carbon', 'risk', 'ocf', 'depreciation', 'taxable', 'tax', 'atcf', 'capex', 'dwc', 'abandon', 'fcf', 'cum', 'df', 'dcf', 'cumDcf', 'real', 'interest', 'debtService', 'equity', 'price', 'salvage', 'rFactor', 'contractorShare', 'unsoldBoe'].map((k) => [k, zeros(K)])) : null;
+  const d1 = 1 / (1 + r), sq = Math.sqrt(1 + r);
+  let cgk = 1 / cg, pgk = 1 / pg, kgk = 1 / kg, dfe = 1 + r;
   for (let k = 0; k < K; k++) {
-    const j = k - nCon, cgk = cg ** k, df = (1 + r) ** -(mid && k > 0 ? k - 0.5 : k), capex = k < nCon ? capexT * mCapex * phase[k] * cgk : 0;
-    let rev = 0, roy = 0, gov = 0, opex = 0, carbon = 0, risk = 0, ocf = 0, dep = 0, taxable = 0, tax = 0, taxL = 0, dwc = 0, ab = 0, oil = 0, gas = 0, boe = 0, pot = 0, lost = 0, defd = 0, water = 0, interest = 0, service = 0, draw = 0, priceF = 0;
+    cgk *= cg; pgk *= pg; kgk *= kg; dfe *= d1; // running powers: cg^k, pg^k, kg^k, (1 + r)^−k
+    const j = k - nCon, df = mid && k > 0 ? dfe * sq : dfe, capex = k < nCon ? capexT * mCapex * phase[k] * cgk : 0;
+    let rev = 0, roy = 0, gov = 0, opex = 0, carbon = 0, risk = 0, ocf = 0, dep = 0, taxable = 0, tax = 0, taxL = 0, dwc = 0, ab = 0, oil = 0, gas = 0, boe = 0, pot = 0, lost = 0, defd = 0, water = 0, interest = 0, service = 0, draw = 0, priceF = 0, sal = 0, rFac = 0, share = profitSplit, unsold = 0;
     if (psc && capex > 0) rec += capex;
     if (gearing > 0 && k < nCon) { draw = gearing * capex; debt = debt * (1 + loanRate) + draw; }
     if (j >= 0 && j < life) {
-      const pOil = oilA[j] * mProd, pGas = gasA[j] * mProd;
-      oil = pOil * avail; gas = pGas * avail; defOil += pOil * down * deferFrac; defGas += pGas * down * deferFrac;
-      pot = pOil + pGas / MMBTU_PER_BOE; defd = pot * down * deferFrac; lost = pot * down * (1 - deferFrac);
+      const pOil = oilA[j] * mProd, pGas = gasA[j] * mProd, dn = downExtra ? Math.min(down + downExtra[j], 0.98) : down, av = 1 - dn; // planned turnarounds add to the downtime of their year
+      oil = pOil * av; gas = pGas * av; defOil += pOil * dn * deferFrac; defGas += pGas * dn * deferFrac;
+      pot = pOil + pGas / MMBTU_PER_BOE; defd = pot * dn * deferFrac; lost = pot * dn * (1 - deferFrac);
       if (j === life - 1) { oil += defOil; gas += defGas; defd -= (defOil + defGas / MMBTU_PER_BOE); } // deferred barrels come back in the last year
-      boe = oil + gas / MMBTU_PER_BOE; water = waterA[j] * mProd * avail;
-      priceF = pg ** k * mPrice * (mPath ? mPath[k] : 1);
-      rev = (oil * oilPrice + gas * gasPrice) * priceF; roy = royalty * rev;
-      opex = ((opexFixed + opexVarBoe * boe + waterCost * water) * mOpex + opexDown * mDown * mOpex + opexBlock * mFail * mRep) * cgk;
-      carbon = carbonT * carbonPrice * kg ** k;
+      if (oilCap > 0 && oil > oilCap) { unsold += oil - oilCap; oil = oilCap; } // contractual sales limits: volume above the contract quantity finds no buyer
+      if (gasCap > 0 && gas > gasCap) { unsold += (gas - gasCap) / MMBTU_PER_BOE; gas = gasCap; }
+      lost += unsold;
+      boe = oil + gas / MMBTU_PER_BOE; water = waterA[j] * mProd * av;
+      priceF = pgk * mPrice * (mPath ? mPath[k] : 1);
+      rev = oil * oilPrice * priceF + gas * gasPrice * (mGasPath ? pgk * mPrice * mGasPath[k] : priceF); roy = royalty * rev;
+      opex = ((opexFixed + opexVarBoe * boe + waterCost * water + (opexExtra ? opexExtra[j] : 0)) * mOpex + opexDown * mDown * mOpex + opexBlock * mFail * mRep) * cgk;
+      carbon = carbonT * carbonPrice * kgk;
       if (includeRisk) risk = (mEv ? (mEv[j] < haz[j] * mFail ? 1 : 0) : haz[j] * mFail) * consequence * mRep * cgk;
       dep = j === life - 1 ? book : Math.min(book, deprBase * deprFrac[j]); book -= dep;
       if (j === 0 && debt > 0) pay = debt * capitalRecovery(loanRate, Math.max(1, Math.min(loanTenor, life)));
@@ -697,8 +985,10 @@ export function cashflow(p, m = {}, detail = true) {
       if (psc) {
         const net = rev - roy; rec += opex + carbon + risk;
         const costOil = Math.min(rec, costOilCap * net), profit = net - costOil; rec -= costOil;
-        gov = (1 - profitSplit) * profit; ocf = rev - roy - gov - opex - carbon - risk;
-        taxable = profitSplit * profit; tax = taxL = taxRate * Math.max(taxable, 0);
+        if (pscScale) { rFac = cumOut > 0 ? cumIn / cumOut : 0; for (let i = 0; i < pscScale.length; i++) if (rFac >= pscScale[i].r) share = pscScale[i].share; } // sliding scale on the R-factor at the start of the year
+        gov = (1 - share) * profit; ocf = rev - roy - gov - opex - carbon - risk;
+        taxable = share * profit; tax = taxL = taxRate * Math.max(taxable, 0);
+        cumIn += costOil + share * profit - tax; cumOut += opex + carbon + risk;
       } else {
         ocf = rev - roy - opex - carbon - risk; taxable = ocf - dep - accr;
         if (taxable < 0) pool -= taxable; else { const use = Math.min(pool, taxable); pool -= use; tax = taxRate * (taxable - use); }
@@ -706,15 +996,17 @@ export function cashflow(p, m = {}, detail = true) {
         if (tl < 0) poolL -= tl; else { const use = Math.min(poolL, tl); poolL -= use; taxL = taxRate * (tl - use); }
       }
       const wc = (wcDays / 365) * rev; dwc = wc - wcPrev; wcPrev = wc;
-    } else if (k === K - 1) { ab = abNom; dwc = -wcPrev; wcPrev = 0; }
-    const fcf = ocf - tax - capex - dwc - ab;
+    } else if (k === K - 1) { ab = abNom; dwc = -wcPrev; wcPrev = 0; if (salvageEnd > 0) sal = salvageEnd * cgk; }
+    if (wcInitial > 0) { if (k === 0) dwc += wcInitial; else if (k === K - 1) dwc -= wcInitial; } // opening working capital (stocks, spares, cash float) is tied up at the start and released at the end
+    if (pscScale) cumOut += capex;
+    const fcf = ocf - tax - capex - dwc - ab + sal;
     npvSum += fcf * df;
     if (detail) {
       cum += fcf; cumD += fcf * df;
       const set = (key, val) => (D[key][k] = val);
       set('year', k); set('oil', oil); set('gas', gas); set('boe', boe); set('potBoe', pot); set('lostBoe', lost); set('defBoe', defd); set('water', water); set('revenue', rev); set('royalty', roy); set('govShare', gov); set('opex', opex); set('carbon', carbon); set('risk', risk);
       set('ocf', ocf); set('depreciation', dep); set('taxable', taxable); set('tax', tax); set('atcf', ocf - tax); set('capex', capex); set('dwc', dwc); set('abandon', ab); set('fcf', fcf); set('cum', cum); set('df', df); set('dcf', fcf * df); set('cumDcf', cumD);
-      set('real', fcf / (1 + infl) ** (mid && k > 0 ? k - 0.5 : k)); set('interest', interest); set('debtService', service); set('equity', ocf - taxL - capex - dwc - ab + draw - service); set('price', oilPrice * priceF);
+      set('real', fcf / (1 + infl) ** (mid && k > 0 ? k - 0.5 : k)); set('interest', interest); set('debtService', service); set('equity', ocf - taxL - capex - dwc - ab + sal + draw - service); set('price', oilPrice * priceF); set('salvage', sal); set('rFactor', rFac); set('contractorShare', psc ? share : 0); set('unsoldBoe', unsold);
     }
   }
   if (!detail) return npvSum;
@@ -788,7 +1080,10 @@ export const STRATEGIES = Object.freeze({
   ldhi: { name: 'Low-dosage hydrate inhibitor', operability: 6 },
   risk: { name: 'Accept controlled risk', operability: 4 },
 });
-const EF = Object.freeze({ gasTurbine: 0.6, fuelGJ: 0.0561, flareSm3: 2.3e-3, MeOH: 0.7, MEG: 1.6, LDHI: 3, vesselDay: 96, steel: 1.9 }); // kgCO₂/kWh, t/GJ, t/Sm³, t/t chemicals, t per vessel day, t/t steel
+// emission factors from the official tables in js/data/costbasis.js: kgCO₂/kWh (gas turbine), t/GJ fuel (net), t per MJ of gross heating value flared, t/t chemicals, t per vessel day, t/t steel
+const EF = Object.freeze({ fuelGJ: EMISSION_FACTORS.naturalGas.value / 1e6, gasTurbine: ((EMISSION_FACTORS.naturalGas.value / 1e6) * 3.6) / EMISSION_FACTORS.turbineEfficiency.value, flareMJ: (EMISSION_FACTORS.netToGross.value * EMISSION_FACTORS.naturalGas.value) / 1e9, MeOH: EMISSION_FACTORS.methanol.value, MEG: megEmbodied().value, LDHI: EMISSION_FACTORS.ldhi.value, vesselDay: (EMISSION_FACTORS.vesselFuel.value * EMISSION_FACTORS.marineGasOil.value) / 1000, steel: EMISSION_FACTORS.steel.value });
+const MAINT_STATE = Object.freeze({ good: { cost: 1, hazard: 1 }, fair: { cost: 1.15, hazard: 1.5 }, poor: { cost: 1.4, hazard: 2.5 } }); // engineering estimates
+const GJ_PER_BOE = MMBTU_PER_BOE * GJ_PER_MMBTU, CI_GLOBAL = UPSTREAM_CI.globalMean * GJ_PER_BOE; // g/MJ × GJ/boe = kg/boe
 const rd = (x, d = 2) => (x === null || x === undefined || !Number.isFinite(+x) ? '—' : +(+x).toFixed(d));
 const mUSD = (x, d = 1) => rd(x / MM, d);
 const lin = (xs, ys, x) => { // linear interpolation with linear extrapolation on an ascending table
@@ -878,19 +1173,22 @@ function context(q, S) {
   let pvf = 0;
   for (let j = 0; j < life; j++) pvf += cg ** (nCon + j) * discountFactor(r, nCon + j, { mid: q.mid });
   const up = q.uptime / 100, revPot = prof.oil.map((o, j) => o * q.oilPrice + prof.gas[j] * q.gasPrice), marginH = (mean(revPot) * (1 - q.royalty / 100)) / 8760, lossFrac = 1 - (q.deferFrac / 100) * (1 + rr) ** -(life / 2);
-  const gasPower = q.powerSource === 'gas', enPrice = gasPower ? (q.gasPrice / GJ_PER_MMBTU) * 0.011 : q.elecPrice, enCarbon = gasPower ? EF.gasTurbine : q.gridCarbon, heatPrice = q.gasPrice / GJ_PER_MMBTU / 0.85;
+  const gasPower = q.powerSource === 'gas', enPrice = gasPower ? ((q.gasPrice / GJ_PER_MMBTU) * 0.0036) / EMISSION_FACTORS.turbineEfficiency.value : q.elecPrice, enCarbon = gasPower ? EF.gasTurbine : q.gridCarbon, heatPrice = q.gasPrice / GJ_PER_MMBTU / 0.85;
   const capexArgs = {
-    basis: basisMap(q.costBasis), costIndexEval: q.costIndexEval, costIndexBase: q.costIndexBase, locFactor: q.locFactor, flowLen: Math.max(q.lineLen - q.riserLen, 0), riserLen: q.riserLen, id: S.id, wt: S.wt, depth: q.depth, material: 'cs', caExtra: 0,
+    basis: basisMap(q.costBasis), costIndexEval: q.escFactor ?? q.costIndexEval / q.costIndexBase, costIndexBase: 1, locFactor: q.locFactor * (q.m0?.capex ?? 1), calF: q.calF || null, exist: q.existTopsides > 0 || q.existSubsea > 0 ? { Topsides: q.existTopsides / 100, Subsea: q.existSubsea / 100 } : null,
+    subseaCal: q.subseaCal, nArrestors: q.nArrestors, arrestorCost: q.arrestorCost, nSleepers: q.nSleepers, sleeperCost: q.sleeperCost, liftKW: q.liftKW, liftFactor: q.liftFactor, flowLen: Math.max(q.lineLen - q.riserLen, 0), riserLen: q.riserLen, id: S.id, wt: S.wt, depth: q.depth, material: 'cs', caExtra: 0,
     nWells: q.nWells, slugVol: q.slugVol, pumpKW: q.pumpKW, compKW: q.compKW, steelPrice: q.steelPrice, coatPrice: q.coatPrice, fabPerM: q.fabPerM, insPrice: q.insPrice, pipPremium: q.pipPremium, dehCable: q.dehCable, riserFactor: q.riserFactor,
     vesselRate: q.vesselRate, layRate: q.layRate, mobCost: q.mobCost, layFactor: q.layFactor, depthCoef: q.depthCoef, wellCost: q.wellCost, learnRate: q.learnRate / 100, langFactor: q.langFactor, costMethod: q.costMethod, pipeMethod: q.pipeMethod,
     cerCoef: q.cerCoef, cerExp: q.cerExp, contingency: q.contingency / 100, owners: q.owners / 100, craFactor: q.craFactor,
   };
   const qLiq0 = q.qOil + (q.qOil * (q.wc0 / 100)) / (1 - Math.min(q.wc0, 98) / 100), pAvail = (x) => S.base.pIn + q.chokeDp + ((1 - x) * qLiq0) / q.pi;
   const X = { life, nCon, infl, r, rr, cg, pvf, up, prof, marginH, lossFrac, enPrice, enCarbon, heatPrice, capexArgs, qLiq0, pAvail, waterMean: mean(prof.water) / 365, waterPeak: Math.max(...prof.water) / 365, wcMean: prof.wcAt(life / 2) };
-  const h0 = q.ealOverride > 0 && q.consequence > 0 ? q.ealOverride / q.consequence : q.pof;
-  X.h0 = h0; X.haz = hazardSchedule({ interval: q.inspInterval, life, h0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100, pod: q.pod / 100 }).haz; // failure probability with the current inspection programme
+  const stateF = MAINT_STATE[q.maintState] || MAINT_STATE.good, h0 = (q.ealOverride > 0 && q.consequence > 0 && !q.pofManaged ? q.ealOverride / q.consequence : q.pof) * stateF.hazard, avail = q.vesselAvail / 100;
+  X.stateF = stateF; X.h0 = h0;
+  // a managed probability from the integrity study already contains degradation and its inspection plan: it is used as it stands
+  X.haz = q.pofManaged ? new Array(life).fill(Math.min(1, h0)) : hazardSchedule({ interval: q.inspInterval, life, h0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100, pod: q.pod / 100 }).haz; // else: base rate + wear-out with the current inspection programme
   X.deprFrac = q.deprMethod === 'uop' ? null : depreciation(q.deprMethod, 1, q.deprLife, { years: life, rate: q.dbRate / 100 });
-  X.blockCost = q.remedDays * q.spreadRate * 1000 + (q.blockDays + q.vesselWait) * 24 * marginH * lossFrac; // remediation spread + outage, including the wait for a vessel
+  X.blockCost = (q.remedDays * q.spreadRate * 1000 + (q.blockDays + q.vesselWait / avail) * 24 * marginH * lossFrac) * (q.calBlock ?? 1); // remediation spread + outage, including the wait for a vessel
   X.capexNone = capexEstimate({ ...capexArgs, brief: true, strategy: 'none', insT: 0, megRate: 0, chemRate: 0, heatKW: 0 }).total;
   X.rMin = q.qMinFrac; X.rMax = Math.max(q.capacityFrac, q.qMinFrac + 0.05);
   // operating constraints g(r) <= 0: erosion, deliverability, turndown (slugging), capacity
@@ -907,7 +1205,7 @@ function strategyModel(key, q, S, X, over = {}) {
   const st = STRATEGIES[key], pip = key === 'pip', insT = key === 'bare' || pip ? 0 : over.insT ?? q.insMm / 1000, r = over.rate ?? 1, treat = clamp(over.treat ?? 1, 0, 1), up = X.up;
   const U = pip ? S.uPip : S.uOf(insT), th = over.thermal || S.thermal(U, r), need = th.sub + q.hydMargin, water = X.waterMean * r, waterPeak = X.waterPeak * r;
   const wtFor = (dT, inh) => (dT > 0 ? inhibitorFor(S.dep + dT, inh, S.sal) : 0), cdH = S.cooldown(U, th.tArr, insT, pip), pLong = cdH >= 1e4 ? 0 : Math.exp(-Math.max(cdH - q.reactH, 0) / q.shutdownMean), nLong = q.shutdowns * pLong;
-  const o = { key, name: st.name, insT, U, tArr: th.tArr, sub: th.sub, cooldownH: cdH, pLong, nLong, inhWt: 0, megRate: 0, chemRate: 0.5, heatKW: 0, chem: 0, energy: 0, shutdown: 0, extraDownH: 0, events: 0, kWh: 0, heatGJ: 0, chemT: 0, contRate: 0, feasible: true, note: '' };
+  const o = { key, name: st.name, insT, U, tArr: th.tArr, sub: th.sub, cooldownH: cdH, pLong, nLong, inhWt: 0, megRate: 0, chemRate: 0.5, heatKW: 0, chem: 0, energy: 0, shutdown: 0, extraDownH: 0, events: 0, kWh: 0, heatGJ: 0, chemT: 0, chemVol: 0, contRate: 0, feasible: true, note: '' };
   const shutNeed = S.base.tHydShut - S.Ta + q.hydMargin, perKgW = (w) => w / Math.max(100 - w, 1), av = q.inhibAvail / 100;
   if (!S.shut) { const w = wtFor(shutNeed, 'MeOH'); S.shut = { w, megW: wtFor(shutNeed, 'MEG'), vol: (S.base.waterInv * 1000 * perKgW(w)) / INHIBITORS.MeOH.rho }; } // m³ methanol to protect the line contents
   const volShut = S.shut.vol;
@@ -917,12 +1215,12 @@ function strategyModel(key, q, S, X, over = {}) {
     const x = o.inhWt / Math.max(90 - o.inhWt, 5), lean = (m3) => (m3 * 1000 * x) / 1100; // m³/d of 90 wt % lean MEG
     o.megRate = lean(waterPeak); o.chemRate = o.megRate;
     const makeup = lean(water) * 0.9 * (q.megLoss / 100) * 365 * up; // m³/y of MEG lost
-    o.chem = makeup * q.megPrice; o.chemT = makeup * 1.113 * EF.MEG;
+    o.chem = makeup * q.megPrice; o.chemT = makeup * 1.113 * EF.MEG; o.chemVol = makeup;
     o.heatGJ = water * 3.0 * 365 * up; o.energy = o.heatGJ * X.heatPrice; // regeneration boils the produced water off: about 3 MJ per kg
     o.events = (q.shutdowns + (need > 0 ? 12 : 0)) * q.plugProb * (1 - av); o.note = o.note || `${o.inhWt.toFixed(0)} wt % MEG in the water phase, ${o.megRate.toFixed(0)} m³/d lean MEG`;
   } else if (key === 'ldhi') {
     const rate = (q.ldhiDose / 100) * water; o.chemRate = (q.ldhiDose / 100) * waterPeak + 0.5;
-    o.chem = rate * q.ldhiPrice * 365 * up; o.chemT = rate * 365 * up * 0.95 * EF.LDHI; o.contRate = o.chemRate;
+    o.chem = rate * q.ldhiPrice * 365 * up; o.chemT = rate * 365 * up * 0.95 * EF.LDHI; o.contRate = o.chemRate; o.chemVol = rate * 365 * up;
     const eff = clamp(0.9 - 1.5 * Math.max(X.wcMean - 0.5, 0), 0, 0.9) * av;
     o.events = (need > 0 ? 12 : nLong) * q.plugProb * (1 - eff); o.note = `${rate.toFixed(1)} m³/d anti-agglomerant, effectiveness ${(eff * 100).toFixed(0)} % at ${(X.wcMean * 100).toFixed(0)} % water cut`;
   } else if (key === 'risk') {
@@ -930,7 +1228,7 @@ function strategyModel(key, q, S, X, over = {}) {
   } else {
     if (need > 0) { // steady flow inside the hydrate region: continuous once-through methanol
       o.inhWt = wtFor(need, 'MeOH'); const rate = (water * 1000 * perKgW(o.inhWt)) / INHIBITORS.MeOH.rho;
-      o.chemRate = (waterPeak * 1000 * perKgW(o.inhWt)) / INHIBITORS.MeOH.rho; o.contRate = o.chemRate; o.chem = rate * q.meohPrice * 365 * up; o.chemT = rate * 365 * up * 0.792 * EF.MeOH;
+      o.chemRate = (waterPeak * 1000 * perKgW(o.inhWt)) / INHIBITORS.MeOH.rho; o.contRate = o.chemRate; o.chem = rate * q.meohPrice * 365 * up; o.chemT = rate * 365 * up * 0.792 * EF.MeOH; o.chemVol = rate * 365 * up;
       o.note = `continuous methanol ${rate.toFixed(1)} m³/d (${o.inhWt.toFixed(0)} wt %) because steady flow is ${need.toFixed(1)} °C inside the hydrate margin`;
     }
     if (key === 'deh') {
@@ -938,14 +1236,15 @@ function strategyModel(key, q, S, X, over = {}) {
       o.kWh = nLong * q.shutdownMean * o.heatKW; o.energy = o.kWh * q.elecPrice; o.events = (nLong * 0.03 + (need > 0 ? 12 * (1 - av) : 0)) * q.plugProb; o.note = o.note || `${o.heatKW.toFixed(0)} kW of heating holds the line above the hydrate temperature`;
     } else {
       const vol = nLong * volShut * treat; o.chemRate = Math.max(o.chemRate, Math.min(volShut, 100)); // skid sized to dose the line contents within a day
-      o.shutdown = vol * q.meohPrice; o.chemT += vol * 0.792 * EF.MeOH; o.extraDownH = nLong * q.restartH * treat; o.events = (nLong * (1 - 0.97 * av * treat) + (need > 0 ? 12 * (1 - av) : 0)) * q.plugProb;
+      o.shutdown = vol * q.meohPrice; o.chemT += vol * 0.792 * EF.MeOH; o.chemVol += vol; o.extraDownH = nLong * q.restartH * treat; o.events = (nLong * (1 - 0.97 * av * treat) + (need > 0 ? 12 * (1 - av) : 0)) * q.plugProb;
       o.note = o.note || `cooldown ${cdH >= 1e4 ? 'never reaches hydrate conditions' : cdH.toFixed(0) + ' h'}, ${nLong.toFixed(1)} long shutdowns a year, ${volShut.toFixed(0)} m³ methanol each`;
     }
   }
   if (over.inhibRate > 0) { // continuous inhibitor rate reported by operations replaces the modelled demand
     const meg = q.inhibitor === 'MEG', price = meg ? q.megPrice * (q.megLoss / 100) : q.inhibitor === 'LDHI' ? q.ldhiPrice : q.meohPrice;
-    o.chem = over.inhibRate * price * 365 * up; o.chemT = over.inhibRate * 365 * up * (meg ? (1.113 * EF.MEG * q.megLoss) / 100 : q.inhibitor === 'LDHI' ? 0.95 * EF.LDHI : 0.792 * EF.MeOH); o.chemRate = Math.max(o.chemRate, over.inhibRate);
+    o.chem = over.inhibRate * price * 365 * up; o.chemT = over.inhibRate * 365 * up * (meg ? (1.113 * EF.MEG * q.megLoss) / 100 : q.inhibitor === 'LDHI' ? 0.95 * EF.LDHI : 0.792 * EF.MeOH); o.chemRate = Math.max(o.chemRate, over.inhibRate); o.chemVol = over.inhibRate * 365 * up * (meg ? q.megLoss / 100 : 1);
   }
+  if (q.calChemUse > 0 && q.calChemUse !== 1) { o.chem *= q.calChemUse; o.shutdown *= q.calChemUse; o.chemT *= q.calChemUse; o.chemVol *= q.calChemUse; } // back-fitted chemical consumption
   o.pigRuns = q.pigRuns * (1 + Math.max(q.wat - th.tArr, 0) / 10); o.pig = o.pigRuns * q.pigCost * 1000;
   o.block = o.events * X.blockCost; o.deferral = o.extraDownH * X.marginH * X.lossFrac;
   o.carbonT = o.chemT + (o.kWh * X.enCarbon) / 1000 + (o.heatGJ * EF.fuelGJ) / 0.85 + o.events * q.remedDays * EF.vesselDay;
@@ -964,13 +1263,13 @@ function strategyModel(key, q, S, X, over = {}) {
 
 /** Emission inventory (tCO₂e per year) for a strategy at rate multiplier r. */
 function emissions(q, S, X, sm, r = 1) {
-  const up = X.up, kWh = (q.pumpKW + q.compKW) * 8760 * up * r, gasY = mean(X.prof.gasSm3) * r;
+  const up = X.up, kWh = (q.pumpKW + q.compKW + q.liftKW) * 8760 * up * r * (q.calEnergyUse ?? 1), gasY = mean(X.prof.gasSm3) * r;
   const items = [
-    { source: 'Power for pumping and compression', t: (kWh * X.enCarbon) / 1000 },
+    { source: 'Power for pumping, compression and artificial lift', t: (kWh * X.enCarbon) / 1000 },
     { source: 'Heating and electrical tracing', t: (sm.kWh * X.enCarbon) / 1000 },
     { source: 'Glycol regeneration heat (fuel gas)', t: (sm.heatGJ * EF.fuelGJ) / 0.85 },
-    { source: 'Routine flaring', t: (q.flareFrac / 100) * gasY * EF.flareSm3 },
-    { source: 'Blowdown flaring', t: q.blowdowns * S.base.gasInvStd * EF.flareSm3 },
+    { source: 'Routine flaring', t: (q.flareFrac / 100) * gasY * EF.flareMJ * q.gasHV },
+    { source: 'Blowdown flaring', t: q.blowdowns * S.base.gasInvStd * EF.flareMJ * q.gasHV },
     { source: 'Chemicals (embodied)', t: sm.chemT },
     { source: 'Intervention and inspection vessels', t: (sm.events * q.remedDays + 4 / q.inspInterval) * EF.vesselDay },
   ];
@@ -979,25 +1278,209 @@ function emissions(q, S, X, sm, r = 1) {
 
 /** Assemble the cash-flow model of the project for one strategy result and CAPEX estimate. */
 function buildProject(q, S, X, sm, capex, over = {}) {
-  const prof = over.profile || X.prof, life = q.life, cap = capex.total, r = over.rate ?? 1;
-  const fixedItems = [
-    ['Operations, labour and logistics', q.opsFixed * MM], ['Maintenance', (q.maintPct / 100) * cap], ['Insurance', (q.insurPct / 100) * cap], ['Inspection', (q.inspCost * MM) / q.inspInterval], ['Corrosion management', q.corrMgmt * MM],
-    ['Hydrate inhibitor and flow-assurance chemicals', sm.chem], ['Energy (pumping, compression, heating)', (q.pumpKW + q.compKW) * 8760 * X.up * r * X.enPrice + sm.energy], ['Pigging', sm.pig],
+  const prof = over.profile || X.prof, life = q.life, cap = capex.total, r = over.rate ?? 1, fO = (q.m0?.opex ?? 1) * (q.calOpex ?? 1), en = over.enMult || null, gasPower = q.powerSource === 'gas';
+  const kW = q.pumpKW + q.compKW + q.liftKW, kWh = kW * 8760 * X.up * r * (q.calEnergyUse ?? 1), eBase = kWh * X.enPrice * (en ? (gasPower ? en.fuel : en.elec) : 1), eStrat = sm.energy * (en ? (sm.key === 'bare' ? en.fuel : en.elec) : 1);
+  const B = !!over.brief, fixedItems = [ // driver texts are built only for the reported case
+    ['Operations support and logistics', q.opsFixed * MM * fO, 'fixed'], ['Maintenance', (q.maintPct / 100) * cap * X.stateF.cost * (q.calMaint ?? 1) * fO, B ? '' : `${q.maintPct} % of CAPEX${X.stateF.cost !== 1 ? ` × ${X.stateF.cost} for the ${q.maintState} maintenance state` : ''}`], ['Insurance', (q.insurPct / 100) * cap * fO, B ? '' : `${q.insurPct} % of CAPEX`], ['Inspection', ((q.inspCost * MM) / q.inspInterval) * fO, B ? '' : `${rd(q.inspCost, 2)} M$ every ${q.inspInterval} y`], ['Corrosion management', q.corrMgmt * MM * fO, 'monitoring and chemicals'],
+    ['Hydrate inhibitor and flow-assurance chemicals', sm.chem * fO, sm.note], ['Energy (pumping, compression, lift, heating)', (eBase + eStrat) * fO, B ? '' : `${rd(kW, 0)} kW at ${rd(X.enPrice, 3)} $/kWh`], ['Pigging', sm.pig * fO, B ? '' : `${rd(sm.pigRuns, 1)} runs at ${q.pigCost} k$`],
+    ['Labour', q.labourFte * q.labourRate * 1000 * fO, B ? '' : `${q.labourFte} positions at ${rd(q.labourRate, 0)} k$/y`], ['Decommissioning security', (q.decomSecurity / 100) * q.abandon * MM * fO, B ? '' : `${q.decomSecurity} %/y of ${rd(q.abandon, 1)} M$`],
   ];
   const em = over.carbonT ?? emissions(q, S, X, sm, r).total, dFrac = X.deprFrac || depreciation('uop', 1, q.deprLife, { years: life, units: prof.boe });
+  // year-by-year extras: planned turnarounds, the maintenance backlog and the chemical stock on hand
+  let downExtra = null, opexExtra = null;
+  const chemY = sm.chem + sm.shutdown, stock = q.chemInventory * (q.inhibitor === 'MEG' ? q.megPrice : q.inhibitor === 'LDHI' ? q.ldhiPrice : q.meohPrice);
+  if (q.taDays > 0 || q.taCost > 0 || q.maintBacklog > 0 || (stock > 0 && chemY > 0)) {
+    downExtra = new Array(life).fill(0); opexExtra = new Array(life).fill(0);
+    for (let j = q.taInterval - 1; j < life - 1; j += q.taInterval) { downExtra[j] = q.taDays / 365; opexExtra[j] += q.taCost * MM; }
+    opexExtra[0] += q.maintBacklog * MM;
+    for (let j = 0, left = stock; j < life && left > 0 && chemY > 0; j++) { const use = Math.min(left, chemY); opexExtra[j] -= use; left -= use; }
+    if (!downExtra.some((x) => x > 0)) downExtra = null;
+  }
   return {
     phase: q.phase, capex: cap, capexSunk: q.capexSunk * MM, residual: q.residual * MM, life, lifeCut: over.lifeCut ?? life, oil: prof.oil, gas: prof.gas, water: prof.water,
     uptime: clamp(X.up - sm.extraDownH / 8760, 0.05, 1), deferFrac: q.deferFrac / 100, oilPrice: q.oilPrice, gasPrice: q.gasPrice, infl: X.infl, costEsc: q.costEsc / 100, priceEsc: q.priceEsc / 100, carbonEsc: q.carbonEsc / 100,
-    discount: X.r, mid: q.mid, reinvest: q.reinvest / 100, opexFixed: sum(fixedItems.map((i) => i[1])), opexVarBoe: q.tariff + q.chemOther, waterCost: q.waterCost, opexDown: sm.shutdown, opexBlock: sm.block,
+    discount: X.r, mid: q.mid, reinvest: q.reinvest / 100, opexFixed: sum(fixedItems.map((i) => i[1])), opexVarBoe: (q.tariff + q.chemOther) * fO, waterCost: q.waterCost * fO, opexDown: sm.shutdown * fO, opexBlock: sm.block,
     carbonT: em, carbonPrice: q.carbonPrice, includeRisk: over.includeRisk ?? false, consequence: q.consequence * MM, haz: X.haz,
     royalty: q.royalty / 100, taxRate: q.taxRate / 100, regime: q.regime, costOilCap: q.costOilCap / 100, profitSplit: q.profitSplit / 100, deprFrac: dFrac, wcDays: q.wcDays, abandon: q.abandon * MM, abandonProvision: q.abandonProvision,
-    gearing: q.gearing / 100, loanRate: q.loanRate / 100, loanTenor: q.loanTenor, fixedItems,
+    gearing: q.gearing / 100, loanRate: q.loanRate / 100, loanTenor: q.loanTenor, fixedItems, downExtra, opexExtra, oilCap: q.oilSalesCap * 365, gasCap: q.gasSalesCap * 365, wcInitial: q.wcInitial * MM, salvageEnd: q.salvageEnd * MM,
+    pscScale: q.regime === 'psc' && q.pscMode === 'rfactor' && q.pscScale.length ? q.pscScale : null,
   };
 }
 /** Strategy → CAPEX → project in one call (used by every option study). */
 function optionProject(key, q, S, X, over = {}) {
   const sm = strategyModel(key, q, S, X, over), capex = capexEstimate(Object.assign(Object.create(X.capexArgs), { brief: !!over.brief, strategy: key, insT: sm.insT, megRate: sm.megRate, chemRate: sm.chemRate, heatKW: sm.heatKW }, over.capex));
   return { sm, capex, p: buildProject(q, S, X, sm, capex, over) };
+}
+
+// ================================================================================================================
+// 8b. Histories, calibration and hindcast of the case
+// ================================================================================================================
+/** Record types of the predicted-against-actual table: unit, whether the value is money (normalised with the cost index) and the model quantity it is compared with. */
+export const REC_TYPES = Object.freeze({
+  capex: { label: 'Historical CAPEX (total)', unit: 'M$', money: true, feeds: 'CAPEX, all scopes' },
+  procurement: { label: 'Procurement cost of equipment and materials', unit: 'M$', money: true, feeds: 'pipeline, subsea and topsides scopes' },
+  epc: { label: 'EPC contract cost (direct cost)', unit: 'M$', money: true, feeds: 'CAPEX, all scopes' },
+  installation: { label: 'Installation campaign cost', unit: 'M$', money: true, feeds: 'installation scope' },
+  opex: { label: 'Operating expenditure', unit: 'M$/y', money: true, feeds: 'all operating cost' },
+  chemUse: { label: 'Chemical consumption', unit: 'm³/y', feeds: 'inhibitor volume' },
+  chemPrice: { label: 'Chemical price', unit: '$/m³', money: true, feeds: 'inhibitor prices' },
+  energyUse: { label: 'Electricity or fuel consumption', unit: 'MWh/y', feeds: 'energy use' },
+  energyTariff: { label: 'Energy tariff', unit: '$/kWh', money: true, feeds: 'energy price' },
+  maintenance: { label: 'Maintenance expenditure', unit: 'M$/y', money: true, feeds: 'maintenance cost' },
+  inspection: { label: 'Cost of an inspection campaign', unit: 'M$', money: true, feeds: 'inspection cost' },
+  repair: { label: 'Cost of a repair', unit: 'M$', money: true, feeds: 'consequence of a failure' },
+  vesselRate: { label: 'Vessel day rate', unit: 'k$/d', money: true, feeds: 'installation and intervention day rates' },
+  intervention: { label: 'Cost of an intervention', unit: 'M$', money: true, feeds: 'cost of a blockage' },
+  interventionFreq: { label: 'Intervention frequency', unit: '1/y', feeds: 'plug probability' },
+  downtime: { label: 'Downtime', unit: 'h/y', feeds: 'downtime' },
+  deferment: { label: 'Production deferment', unit: 'boe/y', feeds: 'downtime' },
+  productionLoss: { label: 'Production loss', unit: 'boe/y', feeds: 'downtime' },
+  availability: { label: 'Equipment availability', unit: '%', feeds: 'uptime' },
+  production: { label: 'Production (first year)', unit: 'boe/y', feeds: 'initial rates' },
+  cashflow: { label: 'Project free cash flow (first production year)', unit: 'M$/y', money: true, feeds: 'comparison only' },
+  abandonment: { label: 'Decommissioning cost', unit: 'M$', money: true, feeds: 'abandonment cost' },
+});
+/** A time series handed over by the site page in any of its shapes → { t: [fractional years], v: [] } or null. */
+function seriesOf(x) {
+  if (!x) return null;
+  const toYear = (t) => { if (typeof t === 'number') return t > 3000 ? 1970 + t / 31557600000 : t; const m = /^(\d{4})(?:-(\d\d))?(?:-(\d\d))?/.exec(String(t)); return m ? +m[1] + (m[2] ? (+m[2] - 1) / 12 : 0) + (m[3] ? (+m[3] - 1) / 365 : 0) : NaN; };
+  let pairs = [];
+  if (Array.isArray(x)) pairs = x.map((r) => (Array.isArray(r) ? [r[0], r[1]] : [r?.t ?? r?.date ?? r?.year, r?.v ?? r?.value]));
+  else if (Array.isArray(x.t) && Array.isArray(x.v)) pairs = x.t.map((t, i) => [t, x.v[i]]);
+  else if (Array.isArray(x.years) && Array.isArray(x.values)) pairs = x.years.map((t, i) => [t, x.values[i]]);
+  pairs = pairs.map(([t, v]) => [toYear(t), +v]).filter(([t, v]) => Number.isFinite(t) && v > 0).sort((a, b) => a[0] - b[0]);
+  return pairs.length >= 2 ? { t: pairs.map((r) => r[0]), v: pairs.map((r) => r[1]) } : null;
+}
+/**
+ * Fits that need no model run: cost-index escalation, price process, failure-rate update, decline fit, fiscal regime.
+ * Changes q in place where the matching switch asks for it and returns everything for the report.
+ */
+function calibrateInputs(q, ctx) {
+  const d = ctx?.site?.data || {}, C = { used: [] };
+  { // inflation index: mean growth of the consumer-price column and the real escalation of the cost index (last ten annual changes)
+    const rows = q.indexHist.filter((r) => r.cpi > 0), gi = [], gc = [];
+    for (let i = 1; i < rows.length; i++) if (rows[i].year - rows[i - 1].year === 1) { gc.push(Math.log(rows[i].cpi / rows[i - 1].cpi)); gi.push(Math.log(rows[i].index / rows[i - 1].index)); }
+    const n = Math.min(10, gc.length), cpi = n ? Math.exp(mean(gc.slice(-n))) - 1 : null, real = n ? Math.exp(mean(gi.slice(-n)) - mean(gc.slice(-n))) - 1 : null, ar = gc.length >= 4 ? fitAR1(gc) : null;
+    C.infl = { n, cpi, real, ar, all: gc.length ? Math.exp(mean(gc)) - 1 : null, last: rows.length ? rows[rows.length - 1].year : null, applied: q.escCal === 'fit' && n >= 3, manualInfl: q.inflation, manualEsc: q.costEsc };
+    if (C.infl.applied) { q.inflation = clamp(100 * cpi, -2, 30); q.costEsc = clamp(100 * real, -5, 15); }
+  }
+  const infl = q.inflation / 100;
+  // ---- cost index: table on the setup tab, replaced or extended by the live series (annual means) when it is the same index
+  const tab = { years: q.indexHist.map((r) => r.year), values: q.indexHist.map((r) => r.index) }, live = seriesOf(d.costIndexSeries);
+  let ix = tab, ixSrc = tab.years.length ? `index table (${tab.years[0]}–${tab.years[tab.years.length - 1]})` : 'none';
+  if (live) {
+    const by = new Map(); live.t.forEach((t, i) => { const y = Math.floor(t + 1e-9); by.set(y, [...(by.get(y) || []), live.v[i]]); });
+    const ly = [...by.keys()].sort((a, b) => a - b), lv = ly.map((y) => mean(by.get(y))), i0 = tab.years.indexOf(ly[0]), same = i0 < 0 || Math.abs(lv[0] / tab.values[i0] - 1) < 0.08;
+    if (same) { const keep = tab.years.map((y, i) => [y, tab.values[i]]).filter(([y]) => y < ly[0]); ix = { years: [...keep.map((r) => r[0]), ...ly], values: [...keep.map((r) => r[1]), ...lv] }; ixSrc = `live series from the site page (${ly[0]}–${ly[ly.length - 1]})${keep.length ? ' joined to the index table' : ''}`; C.used.push('site.data.costIndexSeries'); }
+  } else if (isNum(d.costIndex) && tab.years.length && Math.abs(d.costIndex / tab.values[tab.values.length - 1] - 1) < 0.3 && q.evalYear >= tab.years[tab.years.length - 1]) {
+    ix = { years: [...tab.years.filter((y) => y < q.evalYear), q.evalYear], values: [...tab.values.filter((_, i) => tab.years[i] < q.evalYear), d.costIndex] }; ixSrc = `index table with the live value ${d.costIndex} for ${q.evalYear}`; C.used.push('site.data.costIndex');
+  }
+  const manual = q.escalCal === 'manual' || ix.years.length < 2;
+  C.index = { series: ix, source: manual ? 'the two index values entered' : ixSrc, base: manual ? q.costIndexBase : indexAt(ix, q.costBasisYear, infl), evalV: manual ? q.costIndexEval : indexAt(ix, q.evalYear, infl), extrapolated: !manual && q.evalYear > ix.years[ix.years.length - 1] };
+  C.index.factor = C.index.evalV / C.index.base; q.escFactor = C.index.factor;
+  C.index.of = (year) => (ix.years.length >= 2 ? indexFactor(ix, year, q.evalYear, infl) : (1 + infl) ** (q.evalYear - year));
+  { const g = []; for (let i = 1; i < ix.years.length; i++) if (ix.years[i] - ix.years[i - 1] === 1) g.push(Math.log(ix.values[i] / ix.values[i - 1])); const ar = g.length >= 4 ? fitAR1(g) : null; C.index.ar = ar; C.index.growth = g.length ? Math.exp(ar && ar.mean !== null ? ar.mean : mean(g)) - 1 : null; C.index.growthMean = g.length ? Math.exp(mean(g)) - 1 : null; C.index.nGrowth = g.length; }
+  // ---- commodity-price process: maximum likelihood on the annual history, volatility from the live daily series
+  const pr = q.priceHist.map((r) => r.oil), gbm = fitGBM(pr), ou = fitOU(pr), daily = seriesOf(d.oilPriceSeries), gasFit = fitGBM(q.priceHist.filter((r) => r.gas > 0).map((r) => r.gas));
+  C.price = { n: pr.length, first: q.priceHist[0]?.year ?? null, last: q.priceHist[pr.length - 1]?.year ?? null, gbm, ou, gasSigma: gasFit.sigma, daily: null, source: 'none', manualVol: q.priceVol, manualKappa: q.priceKappa };
+  if (daily && daily.v.length >= 30) { const span = daily.t[daily.t.length - 1] - daily.t[0], dt = span > 0 ? span / (daily.v.length - 1) : 1 / 252, f = fitGBM(daily.v, dt), half = Math.floor(daily.v.length / 2), f1 = fitGBM(daily.v.slice(0, half + 1), dt), x0 = Math.log(daily.v[half]); let inside = 0, nn = 0; for (let i = half + 1; i < daily.v.length; i++) { const sdv = f1.sigma * Math.sqrt((i - half) * dt); nn++; if (Math.abs(Math.log(daily.v[i]) - x0) <= Z90 * sdv) inside++; } C.price.daily = { n: daily.v.length, sigma: f.sigma, dt, coverage: nn ? inside / nn : null, nFore: nn, last: daily.v[daily.v.length - 1] }; C.used.push('site.data.oilPriceSeries'); }
+  { const gd = seriesOf(d.gasPriceSeries); if (gd && gd.v.length >= 30) { const span = gd.t[gd.t.length - 1] - gd.t[0]; C.price.gasDaily = { n: gd.v.length, sigma: fitGBM(gd.v, span > 0 ? span / (gd.v.length - 1) : 1 / 252).sigma }; C.used.push('site.data.gasPriceSeries'); } }
+  if (q.priceCal !== 'manual' && pr.length >= 6) {
+    const liveVol = q.priceCal === 'live' ? (C.price.daily?.sigma ?? (isNum(d.oilPriceVolatility) && d.oilPriceVolatility > 0 ? d.oilPriceVolatility : null)) : null;
+    if (q.priceCal === 'live' && liveVol === null) C.price.note = 'no live daily series: the annual history is used for the volatility as well';
+    if (liveVol !== null && !C.price.daily) C.used.push('site.data.oilPriceVolatility');
+    q.priceVol = clamp(100 * (liveVol ?? (q.priceModel === 'ou' && ou.stationary ? ou.sigma : gbm.sigma)), 0, 150);
+    if (ou.stationary) q.priceKappa = clamp(ou.kappa, 0.01, 5);
+    C.price.source = liveVol !== null ? 'live daily series (volatility) and annual history (mean reversion)' : 'maximum-likelihood fit to the annual history';
+  } else C.price.source = 'entered by hand';
+  // ---- random failure rate: gamma–Poisson update with the failure records
+  { const ev = sum(q.failHist.map((r) => r.events)), ex = sum(q.failHist.map((r) => r.exposure)); C.pof = gammaPoisson({ priorMean: Math.max(q.pof, 1e-9), strength: q.priorStrength, events: ev, exposure: ex }); C.pof.events = ev; C.pof.exposure = ex; C.pof.applied = q.pofCal === 'bayes'; if (C.pof.applied) q.pof = clamp(C.pof.mean, 0, 0.5); }
+  // ---- decline: Arps fit to the production history, with a blind check on the last third of the record
+  if (q.prodHist.length >= 4) {
+    const t = q.prodHist.map((r) => r.year - q.prodHist[0].year), y = q.prodHist.map((r) => r.rate), fit = fitArps(t, y), nFit = Math.max(3, Math.ceil((2 * t.length) / 3)), part = fitArps(t.slice(0, nFit), y.slice(0, nFit)), hold = t.slice(nFit).map((x, i) => ({ t: x, actual: y[nFit + i], pred: arps(part.qi, part.Di, part.b, x).q }));
+    C.decline = { ...fit, nHold: hold.length, holdMape: hold.length ? 100 * mean(hold.map((h) => Math.abs(h.pred - h.actual) / h.actual)) : null, holdBias: hold.length ? 100 * (sum(hold.map((h) => h.pred)) / sum(hold.map((h) => h.actual)) - 1) : null, t, y, part, nFit, year0: q.prodHist[0].year, applied: q.declineCal === 'fit' };
+    if (C.decline.applied) { q.Di = clamp(100 * fit.Di, 0, 90); q.bHyp = clamp(fit.b, 0.05, 0.95); q.declineType = fit.b < 0.05 ? 'exp' : fit.b > 0.95 ? 'har' : 'hyp'; }
+  } else C.decline = null;
+  // ---- fiscal regime of the selected country
+  const F = q.fiscalCountry !== 'manual' ? FISCAL[q.fiscalCountry] : null;
+  C.fiscal = F ? { code: q.fiscalCountry, ...F } : null;
+  if (F) { const m = F.model; q.regime = m.regime; q.royalty = m.royalty; q.taxRate = m.taxRate; if (m.regime === 'psc') { q.costOilCap = m.costOilCap ?? q.costOilCap; q.profitSplit = m.profitSplit ?? q.profitSplit; if (m.scale) { q.pscMode = 'rfactor'; q.pscScale = m.scale.map((r) => ({ r: r.r, share: r.share / 100 })); } else q.pscMode = 'fixed'; } }
+  // ---- starting scenario
+  const sc = q.startScenario === 'base' ? null : q.scenarios.slice().sort((a, b) => a.price - b.price)[q.startScenario === 'low' ? 0 : q.scenarios.length - 1];
+  q.m0 = sc ? { name: sc.name, price: sc.price, prod: sc.prod, capex: sc.capex, opex: sc.opex } : { name: 'Base', price: 1, prod: 1, capex: 1, opex: 1 };
+  if (sc) { q.oilPrice *= sc.price; q.gasPrice *= sc.price; q.qOil *= sc.prod; q.qGas *= sc.prod; }
+  return C;
+}
+/** Model quantities that the predicted-against-actual records are compared with (same units as REC_TYPES). */
+function engineSnapshot(q, X, base, cf) {
+  const y1 = X.nCon, sm = base.sm, g = base.capex.groups, up = cf.uptime, kWh = (q.pumpKW + q.compKW + q.liftKW) * 8760 * X.up + sm.kWh, chemVol = sm.chemVol ?? 0;
+  return {
+    capex: base.capex.total / MM, procurement: ((g.Pipeline || 0) + (g.Riser || 0) + (g.Subsea || 0) + (g.Topsides || 0)) / MM, epc: base.capex.direct / MM, installation: (g.Installation || 0) / MM, opex: cf.opex[y1] / X.cg ** y1 / MM,
+    chemUse: chemVol, chemPrice: q.inhibitor === 'MEG' ? q.megPrice : q.inhibitor === 'LDHI' ? q.ldhiPrice : q.meohPrice, energyUse: kWh / 1000, energyTariff: X.enPrice, maintenance: base.p.fixedItems[1][1] / MM, inspection: q.inspCost, repair: q.consequence,
+    vesselRate: q.vesselRate, intervention: X.blockCost / MM, interventionFreq: sm.events, downtime: (1 - up) * 8760, deferment: cf.potBoe[y1] * (1 - up) * base.p.deferFrac, productionLoss: cf.lostBoe[y1], availability: 100 * up, production: cf.boe[y1], cashflow: cf.fcf[y1] / X.cg ** y1 / MM, abandonment: q.abandon,
+  };
+}
+/**
+ * Back-fitting of the model to historical records: cost-index normalisation of money values, Bayesian factor for each record
+ * type (actual ÷ predicted), location factors by region, parametric and learning-curve regressions of the cost records.
+ * Returns { rows, types: { type: { n, bias, mape, factor, … } }, regions, F (factors to apply), regression }.
+ */
+function backfit(q, C, E) {
+  const rows = q.calRecords.map((r) => { const T = REC_TYPES[r.type], k = T.money ? C.index.of(r.year) : 1, own = r.predicted > 0, pred = own ? r.predicted * k : E[r.type], act = r.actual * k; return { ...r, norm: k, act, pred, own, ratio: pred > 0 ? act / pred : null }; }).filter((r) => r.ratio > 0 && Number.isFinite(r.ratio));
+  const types = {}, prior = { priorSd: q.calPriorSd };
+  for (const t of Object.keys(REC_TYPES)) {
+    const rs = rows.filter((r) => r.type === t && !r.region);
+    if (!rs.length) continue;
+    const b = bayesFactor(rs.map((r) => r.ratio), prior), a = rs.map((r) => r.act), pv = rs.map((r) => r.pred);
+    types[t] = { n: rs.length, bias: mean(a.map((x, i) => pv[i] - x)), mape: 100 * mean(a.map((x, i) => Math.abs(pv[i] - x) / x)), rmse: Math.sqrt(mean(a.map((x, i) => (pv[i] - x) ** 2))), ...b };
+  }
+  const regions = {};
+  for (const reg of [...new Set(rows.filter((r) => r.region && REC_TYPES[r.type].money).map((r) => r.region))]) regions[reg] = locationFactor(rows.filter((r) => r.region === reg && REC_TYPES[r.type].money).map((r) => r.ratio));
+  const pooled = (...ts) => { const rs = rows.filter((r) => ts.includes(r.type) && !r.region); return rs.length ? bayesFactor(rs.map((r) => r.ratio), prior).factor : 1; }, one = (t) => types[t]?.factor ?? 1;
+  const F = { all: pooled('capex', 'epc'), proc: one('procurement'), install: one('installation'), opex: one('opex'), chemUse: one('chemUse'), chemPrice: one('chemPrice'), energyUse: one('energyUse'), energyTariff: one('energyTariff'), maintenance: one('maintenance'), inspection: one('inspection'), repair: one('repair'), vesselRate: one('vesselRate'), intervention: one('intervention'), interventionFreq: one('interventionFreq'), downtime: pooled('downtime', 'deferment', 'productionLoss'), availability: one('availability'), production: one('production'), abandonment: one('abandonment'), region: regions[q.calRegion]?.factor ?? 1 };
+  // econometric view of the capital-cost records that carry their own estimate: ln(actual) = a + b·ln(estimate) + c·(year − mean year)
+  const cr = rows.filter((r) => ['capex', 'epc', 'procurement', 'installation', 'abandonment'].includes(r.type) && r.own), regression = { n: cr.length };
+  if (cr.length >= 5) { try { const my = mean(cr.map((r) => r.year)), trend = cr.some((r) => r.year !== cr[0].year), o = olsRegression(cr.map((r) => (trend ? [Math.log(r.pred), r.year - my] : [Math.log(r.pred)])), cr.map((r) => Math.log(r.act))); Object.assign(regression, { intercept: o.coef[0], elasticity: o.coef[1], seElasticity: o.se[1], trend: trend ? o.coef[2] : null, seTrend: trend ? o.se[2] : null, r2: o.r2, s: o.s }); } catch { /* collinear records: no regression */ } }
+  // learning curve of repeated capital scopes: normalised actual cost against the unit number
+  const lr = rows.filter((r) => ['capex', 'epc', 'procurement', 'installation'].includes(r.type) && r.seq > 0), learning = lr.length >= 3 && new Set(lr.map((r) => r.seq)).size >= 2 ? learningFit(lr.map((r) => r.seq), lr.map((r) => r.act)) : null;
+  if (learning) F.learnRate = clamp(100 * learning.rate, 60, 100);
+  return { rows, types, regions, F, regression, learning };
+}
+/** Write the back-fitted factors into the inputs (called only when the user asks for it). */
+function applyBackfit(q, F) {
+  const up = (key, f, lo, hi) => { q[key] = clamp(q[key] * f, lo, hi); };
+  q.calF = { all: F.all, proc: F.proc, install: F.install }; q.calOpex = F.opex; q.calChemUse = F.chemUse; q.calEnergyUse = F.energyUse; q.calMaint = F.maintenance; q.calBlock = F.intervention;
+  for (const k of ['meohPrice', 'megPrice', 'ldhiPrice']) up(k, F.chemPrice, 0, 1e6);
+  up('elecPrice', F.energyTariff, 0, 10); q.calTariff = F.energyTariff; up('inspCost', F.inspection, 0, 1e4); up('consequence', F.repair, 0, 1e5); up('vesselRate', F.vesselRate, 1, 1e5); up('spreadRate', F.vesselRate, 1, 1e5); up('plugProb', F.interventionFreq, 0, 1);
+  q.uptime = clamp((100 - (100 - q.uptime) * F.downtime) * F.availability, 5, 100); up('qOil', F.production, 0, 1e7); up('qGas', F.production, 0, 1e10); up('abandon', F.abandonment, 0, 1e5); q.locFactor = clamp(q.locFactor * F.region, 0.05, 20); if (F.learnRate) q.learnRate = F.learnRate;
+}
+/** A nominal price path from a fitted process, started at the log price x0: returns K prices (index 0 = x0 itself). */
+function pathFrom(model, fit, x0, K, R) {
+  const out = new Array(K); out[0] = Math.exp(x0);
+  let x = x0;
+  if (model === 'ou' && fit.stationary) { const e = Math.exp(-fit.kappa), sd = fit.sigma * Math.sqrt((1 - e * e) / (2 * fit.kappa)); for (let k = 1; k < K; k++) { x = fit.theta + (x - fit.theta) * e + sd * R.normal(); out[k] = Math.exp(x); } }
+  else for (let k = 1; k < K; k++) { x += (fit.drift ?? 0) + fit.sigma * R.normal(); out[k] = Math.exp(x); }
+  return out;
+}
+/**
+ * Hindcast of the project economics. The decision is moved to t0: prices and the price model are those known at the end of
+ * t0, costs are deflated to t0 with the cost index, and the forecast NPV distribution is compared with the NPV obtained on
+ * the prices that were realised afterwards (held flat in real terms beyond the last recorded year).
+ */
+function hindcastProject(q, C, p, K, seed) {
+  const H = q.priceHist, i0 = H.findIndex((r) => r.year === q.hindcastYear);
+  if (i0 < 5 || i0 >= H.length - 1) return null;
+  const hist = H.slice(0, i0 + 1).map((r) => r.oil), g = fitGBM(hist), ou = fitOU(hist), model = q.priceModel === 'ou' && ou.stationary ? 'ou' : 'gbm', fit = model === 'ou' ? ou : { ...g, drift: 0 }, x0 = Math.log(H[i0].oil), R = rng(seed);
+  const kDefl = 1 / C.index.of(q.hindcastYear), gas0 = H[i0].gas > 0 ? H[i0].gas : (p.gasPrice * H[i0].oil) / Math.max(p.oilPrice, 1e-9), pg = (1 + p.infl) * (1 + p.priceEsc);
+  const pH = { ...p, oilPrice: H[i0].oil, gasPrice: gas0, capex: p.capex * kDefl, opexFixed: p.opexFixed * kDefl, opexVarBoe: p.opexVarBoe * kDefl, waterCost: p.waterCost * kDefl, opexDown: p.opexDown * kDefl, opexBlock: p.opexBlock * kDefl, abandon: p.abandon * kDefl, consequence: p.consequence * kDefl, opexExtra: p.opexExtra ? p.opexExtra.map((x) => x * kDefl) : null, includeRisk: true };
+  const rel = (path) => path.map((P, k) => P / (H[i0].oil * pg ** k)), nS = 300, npvs = new Array(nS);
+  for (let i = 0; i < nS; i++) npvs[i] = cashflow(pH, { path: rel(pathFrom(model, fit, x0, K, R)) }, false);
+  const st = riskStats(npvs), nReal = Math.min(K - 1, H.length - 1 - i0), oilP = [H[i0].oil], gasP = [gas0];
+  for (let k = 1; k < K; k++) { const r = H[i0 + k]; oilP.push(r ? r.oil : oilP[k - 1] * (1 + p.infl)); gasP.push(r ? (r.gas > 0 ? r.gas : gasP[k - 1]) : gasP[k - 1] * (1 + p.infl)); }
+  const realised = cashflow(pH, { path: rel(oilP), gasPath: gasP.map((P, k) => P / (gas0 * pg ** k)) }, false), flat = cashflow(pH, {}, false), pct = npvs.filter((x) => x <= realised).length / nS;
+  const band = Array.from({ length: Math.min(K, nReal + 1) }, (_, k) => { const f = priceForecast(model, fit, x0, k); return { year: H[i0].year + k, p10: Math.exp(f.mean - Z90 * f.sd), p50: Math.exp(f.mean), p90: Math.exp(f.mean + Z90 * f.sd), actual: oilP[k] }; });
+  const inB = band.slice(1).filter((b) => b.actual >= b.p10 && b.actual <= b.p90).length;
+  return { t0: q.hindcastYear, model, fit, sigma: fit.sigma, kappa: model === 'ou' ? fit.kappa : null, deflator: kDefl, price0: H[i0].oil, gas0, p10: st.p10, p50: st.p50, p90: st.p90, mean: st.mean, realised, flat, percentile: pct, inside: realised >= st.p10 && realised <= st.p90, nReal, band, bandCoverage: band.length > 1 ? inB / (band.length - 1) : null, nSamples: nS };
 }
 
 // ================================================================================================================
@@ -1011,8 +1494,13 @@ async function run(v, ctx = {}) {
   const q = readInputs(v), prog = (f, m) => { try { ctx.progress?.(f, m); } catch { /* progress is optional */ } }, tick = async () => { if (typeof ctx.tick === 'function') await ctx.tick(); };
   const warnings = [], recs = [], tables = [], plots = [], balances = [], warn = (level, msg) => warnings.push({ level, msg });
   prog(0.01, 'Solving the case line on the flow kernel');
-  const S = await physics(q, ctx, prog, tick), X = context(q, S), sel = q.strategy, keys = Object.keys(STRATEGIES), nCon = X.nCon, rf = X.r, dOpt = { mid: q.mid };
+  const C = calibrateInputs(q, ctx), S = await physics(q, ctx, prog, tick), sel = q.strategy, keys = Object.keys(STRATEGIES);
+  let X = context(q, S);
   S.warn.forEach((m) => warn('warn', m));
+  // back-fitting: the uncalibrated model gives the predictions that the historical records are compared with
+  const pre = optionProject(sel, q, S, X, { inhibRate: q.inhibRate, brief: true }), BF = backfit(q, C, engineSnapshot(q, X, pre, cashflow(pre.p)));
+  if (q.applyCal && BF.rows.length) { applyBackfit(q, BF.F); X = context(q, S); }
+  const nCon = X.nCon, rf = X.r, dOpt = { mid: q.mid };
 
   // ---------------------------------------------------------------- base project, cash flow, metrics
   prog(0.42, 'Cash flow and investment metrics');
@@ -1063,21 +1551,21 @@ async function run(v, ctx = {}) {
 
   // ---------------------------------------------------------------- hybrid 6: NPV-optimal operating point (rate, preservation fraction)
   const pen = (x) => sum(X.constraints(x).map((c) => Math.max(0, c.g) ** 2)), opProj = (x, t, key = sel) => optionProject(key, q, S, X, { rate: x, treat: t, profile: profileOf(q, x), inhibRate: key === sel ? q.inhibRate : 0, brief: true });
-  const evalOp = (x, t, key) => { const o = opProj(x, t, key); return { npv: cashflow(cut(o.p), {}, false), vio: o.sm.vio }; }, npvOp = (x, t, key) => evalOp(x, t, key).npv, vio0 = selOpt.sm.vio;
+  const memoOp = new Map(), evalOp = (x, t, key) => { const id = `${key || ''}|${x}|${t}`; let e = memoOp.get(id); if (!e) { const o = opProj(x, t, key); e = { npv: cashflow(cut(o.p), {}, false), vio: o.sm.vio }; memoOp.set(id, e); } return e; }, npvOp = (x, t, key) => evalOp(x, t, key).npv, vio0 = selOpt.sm.vio;
   const penAll = (x, t, key) => pen(x) + Math.max(0, evalOp(x, t, key).vio - (key && key !== sel ? 0 : vio0)), W = 1e8, fOp = (z) => { const e = evalOp(z[0], z[1]); return -e.npv / MM + W * (pen(z[0]) + Math.max(0, e.vio - vio0)); }, lo = [Math.max(0.2, X.rMin - 0.2), 0], hi = [X.rMax + 0.2, 1], z0 = [1, 1];
   const solvers = [
-    ['Nelder–Mead simplex', () => { const r = nelderMead(fOp, z0, { lo, hi, tol: 1e-9, maxIter: 70, scale: 0.15 }); return { x: r.x, f: r.f, evals: r.evals }; }],
-    ['Projected gradient (finite differences)', () => gradientDescent(fOp, z0, { lo, hi, maxIter: 20 })],
-    ['Differential evolution', () => { const r = diffEvolution(fOp, lo, hi, { pop: 10, gens: 14, seed: q.seed }); return { x: r.x, f: r.f, evals: r.evals ?? 10 * 15 }; }],
-    ['Genetic algorithm', () => geneticAlgorithm(fOp, lo, hi, { pop: 14, gens: 11, seed: q.seed })],
-    ['Particle swarm', () => particleSwarm(fOp, lo, hi, { n: 10, iters: 14, seed: q.seed })],
+    ['Nelder–Mead simplex', () => { const r = nelderMead(fOp, z0, { lo, hi, tol: 1e-8, maxIter: 45, scale: 0.15 }); return { x: r.x, f: r.f, evals: r.evals }; }],
+    ['Projected gradient (finite differences)', () => gradientDescent(fOp, z0, { lo, hi, maxIter: 10 })],
+    ['Differential evolution', () => { const r = diffEvolution(fOp, lo, hi, { pop: 8, gens: 9, seed: q.seed }); return { x: r.x, f: r.f, evals: r.evals ?? 8 * 10 }; }],
+    ['Genetic algorithm', () => geneticAlgorithm(fOp, lo, hi, { pop: 10, gens: 8, seed: q.seed })],
+    ['Particle swarm', () => particleSwarm(fOp, lo, hi, { n: 8, iters: 9, seed: q.seed })],
   ].map(([name, fn]) => { const r = fn(); return { name, x: r.x, f: r.f, evals: r.evals ?? null, npv: npvOp(r.x[0], r.x[1]), pen: penAll(r.x[0], r.x[1]) }; });
   const feasS = solvers.filter((s) => s.pen < 1e-7), opBest = (feasS.length ? feasS : solvers).reduce((a, s) => (s.f < a.f ? s : a)), opCons = X.constraints(opBest.x[0]), active = opCons.filter((c) => Math.abs(c.g) < 0.005).map((c) => c.name);
-  const rGrid = linspace(lo[0], hi[0], 31), inEnv = (x) => pen(x) < 1e-9 && npvOp(x, 1) > 0, rateCurve = rGrid.map((x) => ({ r: x, npv: npvOp(x, 1), ok: pen(x) < 1e-9 })), envOk = rateCurve.filter((c) => c.ok && c.npv > 0);
-  const edge = (a, b) => { for (let i = 0; i < 14; i++) { const mid = 0.5 * (a + b); if (inEnv(mid)) a = mid; else b = mid; } return a; }; // a inside, b outside
+  const rGrid = linspace(lo[0], hi[0], 25), inEnv = (x) => pen(x) < 1e-9 && npvOp(x, 1) > 0, rateCurve = rGrid.map((x) => ({ r: x, npv: npvOp(x, 1), ok: pen(x) < 1e-9 })), envOk = rateCurve.filter((c) => c.ok && c.npv > 0);
+  const edge = (a, b) => { for (let i = 0; i < 10; i++) { const mid = 0.5 * (a + b); if (inEnv(mid)) a = mid; else b = mid; } return a; }; // a inside, b outside
   const envelope = envOk.length ? { lo: envOk[0].r > lo[0] + 1e-9 ? edge(envOk[0].r, envOk[0].r - (rGrid[1] - rGrid[0])) : envOk[0].r, hi: envOk[envOk.length - 1].r < hi[0] - 1e-9 ? edge(envOk[envOk.length - 1].r, envOk[envOk.length - 1].r + (rGrid[1] - rGrid[0])) : envOk[envOk.length - 1].r } : null;
   // mixed-integer nonlinear: enumerate the discrete strategy, optimise the continuous rate inside each
-  const minlp = keys.map((k) => { const f = (z) => { const e = evalOp(z[0], 1, k); return -e.npv / MM + W * pen(z[0]) + 1e3 * e.vio; }, r = nelderMead(f, [1], { lo: [lo[0]], hi: [hi[0]], tol: 1e-7, maxIter: 25, scale: 0.1 }), e = evalOp(r.x[0], 1, k); return { key: k, name: STRATEGIES[k].name, rate: r.x[0], npv: e.npv, feasible: pen(r.x[0]) < 1e-7 && e.vio === 0 }; }).sort((a, b) => b.feasible - a.feasible || b.npv - a.npv);
+  const minlp = keys.map((k) => { const f = (z) => { const e = evalOp(z[0], 1, k); return -e.npv / MM + W * pen(z[0]) + 1e3 * e.vio; }, r = nelderMead(f, [1], { lo: [lo[0]], hi: [hi[0]], tol: 1e-6, maxIter: 14, scale: 0.1 }), e = evalOp(r.x[0], 1, k); return { key: k, name: STRATEGIES[k].name, rate: r.x[0], npv: e.npv, feasible: pen(r.x[0]) < 1e-7 && e.vio === 0 }; }).sort((a, b) => b.feasible - a.feasible || b.npv - a.npv);
   await tick();
 
   // ---------------------------------------------------------------- reliability economics: inspection interval, spares, replacement
@@ -1104,7 +1592,8 @@ async function run(v, ctx = {}) {
   // ---------------------------------------------------------------- uncertainty: sampling, scenarios, sensitivities
   prog(0.66, 'Monte Carlo simulation');
   const ds = VARS.map((id) => q.dists[id]), Rm = rng(q.seed + 17), alpha = q.alpha / 100, evBuf = zeros(lifeEff);
-  const mc = monteCarlo((x) => { const m = mOf(x); if (q.priceModel !== 'static') m.path = pricePath(q.priceModel, K, Rm, { sigma: q.priceVol / 100, kappa: q.priceKappa }); if (q.failEvents) { for (let j = 0; j < lifeEff; j++) evBuf[j] = Rm.uniform(); m.events = evBuf; } return cashflow(pR, m, false); }, ds, { n: q.nMC, method: q.sampling, corr: q.corr, seed: q.seed, alpha });
+  const pathOnly = q.priceModel !== 'static' && q.priceCal !== 'manual' && C.price.source !== 'entered by hand'; // a fitted price process carries the whole price uncertainty: the level multiplier is then not sampled on top of it
+  const mc = monteCarlo((x) => { const m = mOf(x); if (pathOnly) m.price = 1; if (q.priceModel !== 'static') m.path = pricePath(q.priceModel, K, Rm, { sigma: q.priceVol / 100, kappa: q.priceKappa }); if (q.failEvents) { for (let j = 0; j < lifeEff; j++) evBuf[j] = Rm.uniform(); m.events = evBuf; } return cashflow(pR, m, false); }, ds, { n: q.nMC, method: q.sampling, corr: q.corr, seed: q.seed, alpha });
   if (mc.shrink > 0) warn('warn', `The correlation matrix is not positive definite; its off-diagonal terms were shrunk by ${(mc.shrink * 100).toFixed(0)} % before sampling.`);
   const conv = []; { let s = 0; const step = Math.max(1, Math.floor(mc.y.length / 60)); mc.y.forEach((y, i) => { s += y; if ((i + 1) % step === 0 || i === mc.y.length - 1) conv.push({ n: i + 1, mean: s / (i + 1) }); }); }
   const se = mc.sd / Math.sqrt(mc.n), ce = certaintyEquivalent(mc.y, q.riskTol * MM);
@@ -1152,6 +1641,28 @@ async function run(v, ctx = {}) {
   const tMaxM = q.tMaxMm / 1000, pfEval = (z) => { const o = optionProject('wet', q, S, X, { insT: z[0], rate: z[1], treat: z[2], profile: profileOf(q, z[1]), brief: true }), pe = 1e3 * pen(z[1]) + o.sm.vio; return [-cashflow(cut(o.p), {}, false) / MM + 1e5 * pe, (o.sm.block + o.sm.deferral + eal) / MM + 1e3 * pe, emissions(q, S, X, o.sm, z[1]).total + 1e7 * pe]; };
   const front = nsga2(pfEval, [0, lo[0], 0], [tMaxM, hi[0], 1], { pop: q.nPop, gens: q.nGens, seed: q.seed + 9 }).filter((s) => pen(s.x[1]) < 1e-9 && strategyModel('wet', q, S, X, { insT: s.x[0], rate: s.x[1], treat: s.x[2] }).safe).map((s) => ({ t: s.x[0] * 1000, rate: s.x[1], treat: s.x[2], npv: -s.f[0], risk: s.f[1], carbon: s.f[2] })).sort((a, b) => a.npv - b.npv);
 
+  // ---------------------------------------------------------------- Bayesian optimisation of insulation thickness × bore (Gaussian-process surrogate, expected improvement)
+  const dT = S.diam.filter((d) => !d.failed).sort((a, b) => a.d - b.d), lnD = dT.map((d) => Math.log(d.d)), dAt = (d, key, logv) => (logv ? Math.exp(lin(lnD, dT.map((x) => Math.log(Math.max(x[key], 1e-9))), Math.log(d))) : lin(lnD, dT.map((x) => x[key]), Math.log(d)));
+  const boEval = (t, d) => {
+    const fr = dAt(d, 'dpFric', true), gr = dAt(d, 'dpGrav'), need = (x) => S.pInOf(x, fr, gr) - X.pAvail(x), rate = need(1) <= 0 ? 1 : need(0.05) >= 0 ? 0.05 : brent(need, 0.05, 1, 1e-9);
+    const o = optionProject('wet', q, S, X, { insT: t, rate, thermal: S.thermal((S.uOf(t, d) * d) / S.id, rate), profile: rate === 1 ? undefined : profileOf(q, rate), capex: { id: d, wt: (S.wt * d) / S.id, slugVol: Math.max(dAt(d, 'slugVol', true), 1) }, brief: true });
+    const er = (dAt(d, 'eros', true) * rate * S.base.eros) / Math.max(S.base.erosKernel, 1e-9), vio = Math.max(0, er - 1) + Math.max(0, S.pInOf(rate, fr, gr) / q.mawp - 1) + o.sm.vio;
+    return { npv: cashflow(cut(o.p), {}, false), vio, rate };
+  };
+  let bo = null;
+  if (dT.length >= 2) {
+    const r = bayesOpt((z) => { const e = boEval(z[0], z[1]); return -e.npv / MM + 1e3 * e.vio; }, [0, dT[0].d], [tMaxM, dT[dT.length - 1].d], { n0: 5, iters: q.nBayes, seed: q.seed + 13, refit: 6, cand: 120, x0: [[q.insMm / 1000, clamp(S.id, dT[0].d, dT[dT.length - 1].d)]] }), e = boEval(r.x[0], r.x[1]), ref = boEval(q.insMm / 1000, S.id);
+    bo = { t: r.x[0] * 1000, d: r.x[1], npv: e.npv, vio: e.vio, rate: e.rate, evals: r.evals, len: r.len, history: r.history, refNpv: ref.npv, Y: r.Y };
+  }
+  // ---------------------------------------------------------------- electricity and fuel-price scenarios, fiscal-stability stress test, Morris screening
+  const eW = sum(q.energyScen.map((s) => s.weight)), enScen = q.energyScen.map((s) => { const o = optionProject(sel, q, S, X, { inhibRate: q.inhibRate, brief: true, enMult: { elec: s.elec, fuel: s.fuel } }); return { ...s, w: s.weight / eW, npv: cashflow(cut(o.p), {}, false), energy: o.p.fixedItems[6][1] }; }), enEv = sum(enScen.map((s) => s.w * s.npv));
+  const fisc = q.fiscalHist.length ? (() => { const tx = q.fiscalHist.map((r) => r.tax), ry = q.fiscalHist.map((r) => r.royalty).filter((x) => Number.isFinite(x) && x !== null), at = (t, r) => cashflow({ ...p0, taxRate: clamp(t / 100, 0, 0.99), ...(r === null ? {} : { royalty: r / 100 }) }, {}, false); return { n: tx.length, y0: q.fiscalHist[0].year, y1: q.fiscalHist[tx.length - 1].year, lo: Math.min(...tx), hi: Math.max(...tx), mean: mean(tx), sd: tx.length > 1 ? Math.sqrt(variance(tx)) : 0, changes: tx.filter((x, i) => i > 0 && x !== tx[i - 1]).length, npvLo: at(Math.min(...tx), ry.length ? Math.min(...ry) : null), npvHi: at(Math.max(...tx), ry.length ? Math.max(...ry) : null) }; })() : null;
+  const mor = live.length ? morrisScreening((u) => { const x = ones.slice(); live.forEach((j, i) => (x[j] = ds[j].inv(0.05 + 0.9 * u[i]))); return fVec(x); }, live.length, { r: 8, seed: q.seed + 31 }) : { muStar: [], sigma: [], evals: 0 };
+  // ---------------------------------------------------------------- hindcast: information frozen at the decision year
+  prog(0.9, 'Hindcast');
+  const hc = hindcastProject(q, C, pR, K, q.seed + 41), hYears = q.priceHist.map((r) => r.year), hPrices = q.priceHist.map((r) => r.oil), hModel = q.priceModel === 'ou' ? 'ou' : 'gbm';
+  const roll = hPrices.length >= 14 ? priceHindcast({ years: hYears, prices: hPrices, model: hModel, horizon: q.hindcastHorizon, minHistory: 10 }) : null;
+
   // ---------------------------------------------------------------- sustainability
   const carbonT = em0.total, intensity = meanBoe > 0 ? (carbonT * 1000) / meanBoe : 0, crf = capitalRecovery(X.r, lifeEff), refEm = options[argBest(options.map((o) => o.emis))];
   const mac = options.map((o) => { const dT = refEm.emis - o.emis, dC = (o.lcc - o.parts.carbon - (refEm.lcc - refEm.parts.carbon)) * crf; return { name: o.name, emis: o.emis, abate: dT, cost: dC, mac: dT > 1e-6 ? dC / dT : null }; }).sort((a, b) => (a.mac ?? 1e99) - (b.mac ?? 1e99));
@@ -1176,8 +1687,10 @@ async function run(v, ctx = {}) {
     { label: `CVaR (${q.alpha} %)`, value: mUSD(mc.cvar), unit: 'M$', status: mc.cvar >= 0 ? 'ok' : 'warn', help: `Mean NPV of the worst ${rd(100 - q.alpha, 1)} % of outcomes; value at risk ${mUSD(mc.var)} M$` },
     { label: 'Expected annual loss', value: mUSD(eal, 2), unit: 'M$/y', status: eal < 0.01 * capex.total ? 'ok' : 'warn', help: 'Annual failure probability × consequence in the first year' },
     { label: 'Deferred and lost production', value: mUSD(deferredCost, 2), unit: 'M$/y', status: deferredCost < 0.03 * Math.max(cf.revenue[y1], 1) ? 'ok' : 'warn', help: `${rd(downH, 0)} h of downtime a year; ${q.deferFrac} % of the volume is recovered at the end of field life` },
-    { label: 'Carbon intensity', value: rd(intensity, 1), unit: 'kgCO₂e/boe', status: intensity < 20 ? 'ok' : intensity < 40 ? 'warn' : 'bad', help: `${rd(carbonT, 0)} tCO₂e a year` },
+    { label: 'Carbon intensity', value: rd(intensity, 1), unit: 'kgCO₂e/boe', status: intensity < UKCS_INTENSITY.total ? 'ok' : intensity < CI_GLOBAL ? 'warn' : 'bad', help: `${rd(carbonT, 0)} tCO₂e a year from the line and its flow-assurance system (host processing, drilling and transport are outside this inventory). Published whole-chain upstream figures: UK shelf ${UKCS_INTENSITY.total} kgCO₂e/boe (${UKCS_INTENSITY.year}); world average ${rd(CI_GLOBAL, 0)} kgCO₂e/boe (2015)` },
     { label: 'Best flow-assurance strategy', value: noneSafe ? 'none passes the safety screen' : bestOpt.name, unit: '', status: noneSafe ? 'bad' : bestOpt.key === sel ? 'ok' : 'warn', help: `Lowest lifecycle cost among the options that meet the safety constraints (${mUSD(bestOpt.lcc)} M$); the case uses "${sm0.name}"` },
+    { label: 'Cost escalation to the evaluation year', value: rd(C.index.factor, 3), unit: '×', status: 'ok', help: `${q.costBasisYear} → ${q.evalYear}: ${C.index.source}` },
+    ...(roll ? [{ label: 'Hindcast: realised prices inside the P10–P90 band', value: pct(roll.coverage, 0), unit: '%', status: roll.coverage >= 0.7 ? 'ok' : 'warn', help: `${roll.n} forecasts from ${roll.origins} historical decision years, horizons up to ${q.hindcastHorizon} y; the band should hold 80 %. Median forecast ${pct(Math.exp(roll.bias) - 1, 0)} % against what happened` }] : []),
     { label: 'Optimum insulation', value: rd(insOpt.t, 0), unit: 'mm', status: Math.abs(insOpt.t - q.insMm) <= 15 ? 'ok' : 'warn', help: `Minimum lifecycle cost ${mUSD(insOpt.lcc)} M$; the case has ${q.insMm} mm` },
   ];
 
@@ -1187,12 +1700,14 @@ async function run(v, ctx = {}) {
   if (S.base.pIn > q.mawp) flags.push(`inlet pressure ${rd(S.base.pIn, 0)} bara exceeds the allowable ${q.mawp} bara`);
   if (q.integUtil > 1) flags.push(`structural utilisation ${rd(q.integUtil, 2)} exceeds 1.0`);
   if (q.integViol > 0) flags.push(`${q.integViol} integrity code check(s) fail`);
-  { const hM = Math.max(...p0.haz.slice(0, lifeEff)); if (hM > q.maxPof) flags.push(`annual failure probability reaches ${rd(hM, 4)} with the current inspection interval, above the tolerable ${q.maxPof}`); }
+  { const hM = q.pofManaged ? Math.max(q.pofPeak, p0.haz[0]) : Math.max(...p0.haz.slice(0, lifeEff)); if (hM > q.maxPof) flags.push(q.pofManaged ? `managed annual failure probability ${rd(hM, 4)} from the integrity study is above the tolerable ${q.maxPof}` : `annual failure probability reaches ${rd(hM, 4)} with the current inspection interval, above the tolerable ${q.maxPof}`); }
+  if (q.flareFrac > q.flareLimit) flags.push(`routine flaring of ${q.flareFrac} % of the gas exceeds the regulatory limit of ${q.flareLimit} %`);
+  if (q.ciLimit > 0 && intensity > q.ciLimit) flags.push(`carbon intensity ${rd(intensity, 1)} kgCO₂e/boe exceeds the limit of ${q.ciLimit}`);
   if (q.severeSlug) flags.push('severe slugging is predicted and not suppressed');
   if (!selOpt.sm.safe) flags.push(...selOpt.sm.viol.map((x) => `case strategy: ${x}`));
   flags.forEach((f) => warn('bad', `Safety constraint: ${f}.`));
   if (noneSafe) warn('bad', 'No flow-assurance strategy meets the safety constraints; the ranking shows the least-cost option for reference only.');
-  kpis.push({ label: 'Safety constraints', value: flags.length ? `${flags.length} violated` : 'all met', unit: '', status: flags.length ? 'bad' : 'ok', help: flags.length ? flags.join('; ') : 'Erosion, pressure, structural utilisation, failure probability, cooldown, blockage frequency and injection capacity are inside their limits' });
+  kpis.push({ label: 'Safety constraints', value: flags.length ? `${flags.length} violated` : 'all met', unit: '', status: flags.length ? 'bad' : 'ok', help: flags.length ? flags.join('; ') : 'Erosion, pressure, structural utilisation, failure probability, cooldown, blockage frequency, injection capacity and the regulatory limits are inside their limits' });
 
   // ---- warnings
   if (!okNpv) warn('bad', `NPV of ${mUSD(npv0)} M$ is below the ${q.minNpv} M$ threshold.`);
@@ -1231,7 +1746,7 @@ async function run(v, ctx = {}) {
 
   // ---- plots
   const years = cf.year, M = (a) => a.map((x) => x / MM), cdfN = Math.min(200, mc.n), cdfI = Array.from({ length: cdfN }, (_, i) => Math.round((i * (mc.n - 1)) / Math.max(cdfN - 1, 1))), hist = histogram(mc.y.map((y) => y / MM), 30);
-  const gKeys = Object.keys(capex.groups), opexCat = [...p0.fixedItems.map(([n, x]) => [n, x]), ['Tariff and production chemicals', p0.opexVarBoe * boeY1], ['Produced-water handling', p0.waterCost * cf.water[y1]], ['Shutdown preservation', p0.opexDown], ['Hydrate / wax remediation (expected)', p0.opexBlock]];
+  const gKeys = Object.keys(capex.groups), opexCat = [...p0.fixedItems.map(([n, x, drv]) => [n, x, drv]), ['Tariff and production chemicals', p0.opexVarBoe * boeY1, `${q.tariff} + ${q.chemOther} $/boe`], ['Produced-water handling', p0.waterCost * cf.water[y1], `${q.waterCost} $/m³`], ['Shutdown preservation', p0.opexDown, `${rd(sm0.nLong, 2)} long shutdowns a year`], ['Hydrate / wax remediation (expected)', p0.opexBlock, `${rd(sm0.events, 3)} events/y × ${mUSD(X.blockCost)} M$`], ['Turnaround, backlog and chemical stock (first year)', p0.opexExtra ? p0.opexExtra[0] : 0, `backlog ${q.maintBacklog} M$, stock ${q.chemInventory} m³${q.taDays > 0 || q.taCost > 0 ? `, turnaround every ${q.taInterval} y` : ''}`]];
   plots.push(
     { type: 'bar', title: 'Annual cash flow (money of the day)', ylabel: 'M$', categories: years.map(String), stacked: true, series: [{ name: 'Revenue', values: M(cf.revenue) }, { name: 'Royalty, tax and state share', values: M(cf.royalty.map((x, k) => -(x + cf.tax[k] + cf.govShare[k]))) }, { name: 'OPEX, carbon and risk cost', values: M(cf.opex.map((x, k) => -(x + cf.carbon[k] + (cfR.risk[k] || 0)))) }, { name: 'CAPEX, working capital, abandonment', values: M(cf.capex.map((x, k) => -(x + cf.dwc[k] + cf.abandon[k]))) }] },
     { type: 'line', title: 'Cumulative cash flow', xlabel: 'Year from the evaluation date', ylabel: 'M$', zeroY: true, series: [{ name: 'Cumulative', x: years, y: M(cf.cum) }, { name: 'Discounted cumulative', x: years, y: M(cf.cumDcf) }, { name: 'Discounted cumulative, risk-adjusted', x: years, y: M(cfR.cumDcf), dash: true }], hlines: [{ y: 0, label: 'break-even' }], vlines: met.payback !== null && met.payback > 0 ? [{ x: met.payback, label: 'payback' }] : [] },
@@ -1258,6 +1773,11 @@ async function run(v, ctx = {}) {
     { type: 'bar', title: 'Marginal abatement cost of the strategies', ylabel: '$/tCO₂e', categories: mac.filter((x) => x.mac !== null).map((x) => x.name), series: [{ name: `Relative to "${refEm.name}"`, values: mac.filter((x) => x.mac !== null).map((x) => x.mac) }, { name: 'Carbon price', values: mac.filter((x) => x.mac !== null).map(() => q.carbonPrice) }] },
   );
 
+  if (hc) plots.push({ type: 'line', title: `Hindcast from ${hc.t0}: forecast band against the realised oil price`, xlabel: 'Year', ylabel: '$/bbl', series: [{ name: 'Realised', x: hc.band.map((b) => b.year), y: hc.band.map((b) => b.actual), mode: 'both' }, { name: 'Forecast P50', x: hc.band.map((b) => b.year), y: hc.band.map((b) => b.p50) }, { name: 'Forecast P10', x: hc.band.map((b) => b.year), y: hc.band.map((b) => b.p10), dash: true }, { name: 'Forecast P90', x: hc.band.map((b) => b.year), y: hc.band.map((b) => b.p90), dash: true }], note: `Price model fitted to the history up to ${hc.t0} only.` });
+  if (roll && roll.n) plots.push({ type: 'line', title: 'Rolling price hindcast: median forecast against the realised price', xlabel: 'Realised price ($/bbl)', ylabel: 'Forecast ($/bbl)', series: [{ name: 'P50', x: roll.rows.map((r) => r.actual), y: roll.rows.map((r) => r.p50), mode: 'points' }, { name: 'P10', x: roll.rows.map((r) => r.actual), y: roll.rows.map((r) => r.p10), mode: 'points' }, { name: 'P90', x: roll.rows.map((r) => r.actual), y: roll.rows.map((r) => r.p90), mode: 'points' }, { name: 'Perfect foresight', x: [Math.min(...roll.rows.map((r) => r.actual)), Math.max(...roll.rows.map((r) => r.actual))], y: [Math.min(...roll.rows.map((r) => r.actual)), Math.max(...roll.rows.map((r) => r.actual))], dash: true }] });
+  if (C.decline) plots.push({ type: 'line', title: 'Production history and Arps fit', xlabel: 'Year', ylabel: 'Rate (unit of the history table)', logy: true, series: [{ name: 'History', x: C.decline.t.map((t) => C.decline.year0 + t), y: C.decline.y, mode: 'points' }, { name: `Fit to all years (b = ${rd(C.decline.b, 2)})`, x: C.decline.t.map((t) => C.decline.year0 + t), y: C.decline.t.map((t) => arps(C.decline.qi, C.decline.Di, C.decline.b, t).q) }, { name: `Forecast from the first ${C.decline.nFit} years`, x: C.decline.t.map((t) => C.decline.year0 + t), y: C.decline.t.map((t) => arps(C.decline.part.qi, C.decline.part.Di, C.decline.part.b, t).q), dash: true }], vlines: [{ x: C.decline.year0 + C.decline.t[C.decline.nFit - 1], label: 'end of the fitting window' }] });
+  if (bo) plots.push({ type: 'line', title: 'Bayesian optimisation: best NPV found against model runs', xlabel: 'Model run', ylabel: 'NPV (M$)', series: [{ name: 'Best so far', x: bo.history.map((_, i) => bo.evals - bo.history.length + 1 + i), y: bo.history.map((f) => -f), mode: 'both' }], hlines: [{ y: bo.refNpv / MM, label: 'case design' }], note: 'Five Latin-hypercube starting designs and the case design, then one design per step where the expected improvement of the Gaussian-process surrogate is largest.' });
+
   // ---- tables
   const col = (a, d = 2) => a.map((x) => rd(x / MM, d));
   tables.push({ title: 'Cash-flow statement (M$, money of the day)', columns: ['Year', 'Oil (kbbl)', 'Gas sold (GJ ×10³)', 'Oil price ($/bbl)', 'Revenue', 'Royalty', 'State profit share', 'OPEX', 'Carbon cost', 'Operating cash flow', 'Depreciation', 'Taxable income', 'Tax', 'After-tax cash flow', 'CAPEX', 'Δ working capital', 'Abandonment', 'Free cash flow', 'Cumulative', 'Discount factor', 'Discounted', 'Cumulative discounted', 'Free cash flow (real)'],
@@ -1276,8 +1796,8 @@ async function run(v, ctx = {}) {
     ['Continuous inhibitor dosage', rd(be.inhib, 1), `m³/d ${q.inhibitor}`, rd(q.inhibRate, 2), be.inhib === null ? 'no break-even in range' : 'additional rate that takes the NPV to zero'], ['Blockage / intervention frequency', rd(be.block, 2), 'events/y', rd(sm0.events, 3), be.block === null ? 'no break-even in range' : `at ${mUSD(X.blockCost)} M$ per event`], ['Uptime', be.uptime === null ? '—' : pct(be.uptime, 1), '%', pct(cf.uptime, 1), be.uptime === null ? 'NPV positive at any uptime above 5 %' : 'minimum availability'],
     ['Discount rate (= IRR)', pct(met.irr, 2), '%/y', q.discount, '—'], ['Economic cut-off', limit0 === null ? `> ${q.life}` : limit0, 'production year', q.life, q.stopAtLimit ? 'evaluation stops at the limit' : 'evaluation runs the full life'],
   ] });
-  tables.push({ title: 'CAPEX build-up', columns: ['Group', 'Item', 'Basis', 'Cost (M$)'], rows: [...capex.items.map((i) => [i.group, i.item, i.basis, rd(i.cost / MM, 2)]), ['Total', 'CAPEX', `cost index ${q.costIndexEval}/${q.costIndexBase}, location factor ${q.locFactor}`, rd(capex.total / MM, 2)], ['Check', 'Topsides by bare-module factors', 'purchased cost × item factors', rd(capex.moduleCost / MM, 2)], ['Check', 'Topsides by one Lang factor', `purchased cost ${rd(capex.purchased / MM, 2)} M$ × ${q.langFactor}`, rd(capex.langCost / MM, 2)], ['Check', 'Installed line by the parametric relationship', `${q.cerCoef} M$/km, exponent ${q.cerExp}, learning ${q.learnRate} %`, rd(pipelineCER({ dIn: S.id / 0.0254, lengthKm: q.lineLen / 1000, depth: q.depth, cerCoef: q.cerCoef, cerExp: q.cerExp, layFactor: q.layFactor, learnRate: q.learnRate / 100, vesselRate: q.vesselRate, layRate: q.layRate, mobCost: q.mobCost, depthCoef: q.depthCoef }) * capex.escalation, 2)]], note: `Cost basis: 2023 US$ (index ${q.costIndexBase}), escalated to ${q.evalYear} (index ${q.costIndexEval}). ${rd(capex.steelT, 0)} t of steel, ${rd(capex.layDays, 1)} vessel days. Order-of-magnitude (class 4–5) estimate.` });
-  tables.push({ title: 'OPEX build-up (first production year, real terms)', columns: ['Category', 'M$/y', '$/boe', 'Driver'], rows: [...opexCat.map(([n, x]) => [n, rd(x / MM, 3), rd(x / Math.max(boeY1, 1), 2), '']), ['Total', rd(sum(opexCat.map((c) => c[1])) / MM, 3), rd(sum(opexCat.map((c) => c[1])) / Math.max(boeY1, 1), 2), ''], ['Carbon cost', rd((carbonT * q.carbonPrice) / MM, 3), rd((carbonT * q.carbonPrice) / Math.max(boeY1, 1), 2), `${rd(carbonT, 0)} t at ${q.carbonPrice} $/t`]].map((r, i) => { const drv = [`fixed`, `${q.maintPct} % of CAPEX`, `${q.insurPct} % of CAPEX`, `${q.inspCost} M$ every ${q.inspInterval} y`, 'monitoring and chemicals', sm0.note, `${rd(q.pumpKW + q.compKW, 0)} kW at ${rd(X.enPrice, 3)} $/kWh`, `${rd(sm0.pigRuns, 1)} runs at ${q.pigCost} k$`, `${q.tariff} + ${q.chemOther} $/boe`, `${q.waterCost} $/m³`, `${rd(sm0.nLong, 2)} long shutdowns a year`, `${rd(sm0.events, 3)} events/y × ${mUSD(X.blockCost)} M$`][i]; return drv !== undefined ? [r[0], r[1], r[2], drv] : r; }) });
+  tables.push({ title: 'CAPEX build-up', columns: ['Group', 'Item', 'Basis', 'Cost (M$)'], rows: [...capex.items.map((i) => [i.group, i.item, i.basis, rd(i.cost / MM, 2)]), ['Total', 'CAPEX', `escalation × ${rd(C.index.factor, 4)}, location factor ${rd(q.locFactor, 3)}`, rd(capex.total / MM, 2)], ['Check', 'Topsides by bare-module factors', 'purchased cost × item factors', rd(capex.moduleCost / MM, 2)], ['Check', 'Topsides by one Lang factor', `purchased cost ${rd(capex.purchased / MM, 2)} M$ × ${q.langFactor}`, rd(capex.langCost / MM, 2)], ['Check', 'Installed line by the parametric relationship', `${q.cerCoef} M$/km, exponent ${q.cerExp}, learning ${q.learnRate} %`, rd(pipelineCER({ dIn: S.id / 0.0254, lengthKm: q.lineLen / 1000, depth: q.depth, cerCoef: q.cerCoef, cerExp: q.cerExp, layFactor: q.layFactor, learnRate: q.learnRate / 100, vesselRate: q.vesselRate, layRate: q.layRate, mobCost: q.mobCost, depthCoef: q.depthCoef }) * capex.escalation, 2)]], note: `Cost basis: ${q.costBasisYear} US$, escalated to ${q.evalYear} by × ${rd(C.index.factor, 4)} (${C.index.source}). ${rd(capex.steelT, 0)} t of steel, ${rd(capex.layDays, 1)} vessel days. Order-of-magnitude (class 4–5) estimate.` });
+  tables.push({ title: 'OPEX build-up (first production year, real terms)', columns: ['Category', 'M$/y', '$/boe', 'Driver'], rows: [...opexCat.map(([n, x, drv]) => [n, rd(x / MM, 3), rd(x / Math.max(boeY1, 1), 2), drv || '']), ['Total', rd(sum(opexCat.map((c) => c[1])) / MM, 3), rd(sum(opexCat.map((c) => c[1])) / Math.max(boeY1, 1), 2), ''], ['Carbon cost', rd((carbonT * q.carbonPrice) / MM, 3), rd((carbonT * q.carbonPrice) / Math.max(boeY1, 1), 2), `${rd(carbonT, 0)} t at ${q.carbonPrice} $/t`]], note: 'Operating-cost inputs are in evaluation-year money.' });
   tables.push({ title: 'Production economics', columns: ['Quantity', 'Value', 'Unit'], rows: [
     ['Recoverable volume produced', rd(sum(cf.boe) / 1e6, 2), 'million boe'], ['Potential volume (no downtime)', rd(sum(cf.potBoe) / 1e6, 2), 'million boe'], ['Production efficiency', pct(sum(cf.boe) / Math.max(sum(cf.potBoe), 1), 2), '%'], ['Uptime used', pct(cf.uptime, 2), '%'],
     ['Deferred volume (recovered in the last year)', rd(sum(cf.potBoe) * (1 - cf.uptime) * p0.deferFrac / 1e6, 3), 'million boe'], ['Lost volume', rd(sum(cf.lostBoe) / 1e6, 3), 'million boe'], ['Value lost by deferral', mUSD(downH * X.marginH * p0.deferFrac * (X.lossFrac - (1 - p0.deferFrac)) / Math.max(p0.deferFrac, 1e-9), 3), 'M$/y'], ['Value of lost production', mUSD(downH * X.marginH * (1 - p0.deferFrac), 3), 'M$/y'],
@@ -1287,13 +1807,15 @@ async function run(v, ctx = {}) {
     rows: byLcc.map((o, i) => [o.sm.safe ? i + 1 : '—', o.name, rd(o.sm.U, 2), rd(o.sm.tArr, 1), o.sm.cooldownH >= 1e4 ? 'never' : rd(o.sm.cooldownH, 1), rd(o.sm.events, 3), mUSD(o.parts.capex), mUSD(o.parts.chem + o.parts.pig + o.parts.shut + o.parts.carbon), mUSD(o.parts.block), mUSD(o.lcc), mUSD(o.npv), rd(o.emis, 0), rd(o.score, 3), rd(o.closeness, 3), o.sm.safe ? 'passes' : 'EXCLUDED: ' + o.sm.viol.join('; '), o.sm.note]),
     note: `Lifecycle cost = flow-assurance CAPEX + PV(OPEX) + PV(expected blockage cost), before tax. Blockage frequency = long shutdowns × plug probability (${q.plugProb}) × residual exposure; one blockage costs ${mUSD(X.blockCost)} M$. MCDA winner: ${mcdaBest.name}; TOPSIS winner: ${topsisBest.name}; minimax-regret choice: ${regretBest.name}. Options that break a safety constraint are listed last and take no part in the multi-criteria ranking.` });
   tables.push({ title: 'Criteria weights (Analytic Hierarchy Process)', columns: ['Criterion', 'Weight', 'Direction'], rows: [...crit.map((c, i) => [c, rd(ahpR.weights[i], 4), benefit[i] ? 'maximise' : 'minimise']), ['λmax', rd(ahpR.lambdaMax, 4), ''], ['Consistency index', rd(ahpR.ci, 4), ''], ['Consistency ratio', rd(ahpR.cr, 4), ahpR.cr <= 0.1 ? 'acceptable (≤ 0.10)' : 'inconsistent']], note: 'Operability scores (1–10): ' + keys.map((k) => `${STRATEGIES[k].name} ${STRATEGIES[k].operability}`).join(', ') + '.' });
-  tables.push({ title: 'Uncertainty: input distributions and sensitivities', columns: ['Input (multiplier)', 'Distribution', 'P10', 'Mean', 'P90', 'NPV at P10 (M$)', 'NPV at P90 (M$)', 'Swing (M$)', 'Sobol first-order', 'Sobol total', 'Std. regression coeff.'],
-    rows: VARS.map((id, j) => { const t = torn.find((x) => x.name === VAR_LABEL[id]), li = live.indexOf(j); return [VAR_LABEL[id], ds[j].kind, rd(ds[j].inv(0.1), 3), rd(ds[j].mean, 3), rd(ds[j].inv(0.9), 3), mUSD(t.low), mUSD(t.high), mUSD(t.swing), li >= 0 ? rd(sob.first[li], 3) : 0, li >= 0 ? rd(sob.total[li], 3) : 0, li >= 0 && srcFit.src.length ? rd(srcFit.src[li], 3) : 0]; }),
-    note: `Sobol indices by the Saltelli scheme with ${sob.evals} model runs (independent inputs; sampling error about ±${rd(1.5 / Math.sqrt(q.nSobol), 2)}). Regression R² = ${rd(srcFit.r2, 3)}. Sampling: ${q.sampling === 'lhs' ? 'Latin hypercube with Iman–Conover rank correlation' : 'Monte Carlo with a Gaussian copula'}${q.priceModel === 'static' ? '' : `, ${q.priceModel === 'gbm' ? 'geometric Brownian' : 'mean-reverting'} price paths`}${q.failEvents ? ', failures sampled as discrete events' : ''}.` });
+  tables.push({ title: 'Uncertainty: input distributions and sensitivities', columns: ['Input (multiplier)', 'Distribution', 'P10', 'Mean', 'P90', 'NPV at P10 (M$)', 'NPV at P90 (M$)', 'Swing (M$)', 'Sobol first-order', 'Sobol total', 'Std. regression coeff.', 'Morris μ* (M$)', 'Morris σ (M$)'],
+    rows: VARS.map((id, j) => { const t = torn.find((x) => x.name === VAR_LABEL[id]), li = live.indexOf(j); return [VAR_LABEL[id], ds[j].kind, rd(ds[j].inv(0.1), 3), rd(ds[j].mean, 3), rd(ds[j].inv(0.9), 3), mUSD(t.low), mUSD(t.high), mUSD(t.swing), li >= 0 ? rd(sob.first[li], 3) : 0, li >= 0 ? rd(sob.total[li], 3) : 0, li >= 0 && srcFit.src.length ? rd(srcFit.src[li], 3) : 0, li >= 0 ? mUSD(mor.muStar[li]) : 0, li >= 0 ? mUSD(mor.sigma[li]) : 0]; }),
+    note: `Morris screening: ${mor.evals} runs on 8 trajectories over the 5th–95th percentile range of each input; μ* is the mean absolute elementary effect over that range, σ its spread (non-linearity or interaction). Sobol indices by the Saltelli scheme with ${sob.evals} model runs (independent inputs; sampling error about ±${rd(1.5 / Math.sqrt(q.nSobol), 2)}). Regression R² = ${rd(srcFit.r2, 3)}. Sampling: ${q.sampling === 'lhs' ? 'Latin hypercube with Iman–Conover rank correlation' : 'Monte Carlo with a Gaussian copula'}${q.priceModel === 'static' ? '' : `, ${q.priceModel === 'gbm' ? 'geometric Brownian' : 'mean-reverting'} price paths${pathOnly ? ' fitted to the price history (the price-level multiplier is then used for the tornado and Sobol study only, not sampled on top of the paths)' : ''}`}${q.failEvents ? ', failures sampled as discrete events' : ''}.` });
   tables.push({ title: 'Uncertainty: NPV statistics and scenarios', columns: ['Quantity', 'Value (M$)', 'Note'], rows: [
     ['Mean', mUSD(mc.mean), `standard error ${mUSD(se, 2)} M$ with ${mc.n} samples`], ['Standard deviation', mUSD(mc.sd), `variance ${rd(mc.variance / MM / MM, 0)} (M$)²`], ['P10 (low)', mUSD(mc.p10), '10th percentile'], ['P50', mUSD(mc.p50), 'median'], ['P90 (high)', mUSD(mc.p90), '90th percentile'], ['Minimum / maximum', `${mUSD(mc.min, 0)} / ${mUSD(mc.max, 0)}`, ''],
     [`Value at risk (${q.alpha} %)`, mUSD(mc.var), `NPV exceeded with ${q.alpha} % probability`], [`Conditional value at risk (${q.alpha} %)`, mUSD(mc.cvar), `mean of the worst ${rd(100 - q.alpha, 1)} %`], ['Probability of loss', `${pct(mc.probLoss, 2)} %`, 'P(NPV < 0)'], ['Certainty equivalent', mUSD(ce), `exponential utility, risk tolerance ${q.riskTol} M$; risk premium ${mUSD(mc.mean - ce)} M$`],
     ...scen.map((s) => [`Scenario: ${s.name}`, mUSD(s.npv), `weight ${rd(s.weight / wSum, 3)}; price ×${s.price}, production ×${s.prod}, CAPEX ×${s.capex}, OPEX ×${s.opex}`]), ['Scenario-weighted NPV', mUSD(scenEv), 'weights normalised to 1'],
+    ...enScen.map((s) => [`Energy prices: ${s.name}`, mUSD(s.npv), `weight ${rd(s.w, 3)}; electricity ×${s.elec}, fuel ×${s.fuel}; energy cost ${mUSD(s.energy, 2)} M$/y`]), ['Energy-scenario-weighted NPV', mUSD(enEv), 'not risk-adjusted; compare with the NPV of the case'],
+    ...(fisc ? [['Fiscal stability: lowest historical rates', mUSD(fisc.npvLo), `marginal tax ${fisc.lo} %, ${fisc.y0}–${fisc.y1}`], ['Fiscal stability: highest historical rates', mUSD(fisc.npvHi), `marginal tax ${fisc.hi} %; ${fisc.changes} change(s) in ${fisc.n} years, mean ${rd(fisc.mean, 1)} %, standard deviation ${rd(fisc.sd, 1)} points`]] : []),
   ] });
   tables.push({ title: 'Decision analysis', columns: ['Item', 'Value', 'Unit', 'Note'], rows: [
     ['Best action without further information', alts[voi.best].name, '', `EMV ${mUSD(voi.emv)} M$`], ['Expected value with perfect information', mUSD(voi.evWithPI), 'M$', ''], ['Value of perfect information', mUSD(voi.evpi, 2), 'M$', 'upper bound on any appraisal spend'], ['Value of imperfect information', mUSD(voi.evii, 2), 'M$', `appraisal reliability ${q.testRel} % (Bayesian revision)`], ['Appraisal cost', q.testCost, 'M$', voi.evii > q.testCost * MM ? 'worth buying' : 'not worth buying'],
@@ -1313,6 +1835,7 @@ async function run(v, ctx = {}) {
     ['Pigging interval', 'grid search', `${rd(pigBest.tau, 0)} d`, `${mUSD(pigBest.total, 3)} M$/y`, `stuck-pig probability ${pct(pigBest.pStuck, 2)} % per run`],
     ['Critical spare', 'expected-cost comparison', spare.saving > 0 ? 'hold the spare' : 'no spare', `net ${mUSD(spare.saving, 3)} M$/y`, `break-even failure rate ${rd(spare.beRate, 3)} /y`],
     ['Insulation under uncertainty', 'sample-average approximation', `expected NPV: ${rd(pMean.t, 0)} mm; CVaR: ${rd(pCvar.t, 0)} mm`, `E[NPV] ${mUSD(pMean.mean)} M$`, `${q.nMCopt} common random samples per design`],
+    ...(bo ? [['Insulation thickness × bore', 'Bayesian optimisation (Gaussian process + expected improvement)', `${rd(bo.t, 0)} mm on a ${rd(bo.d * 1000, 0)} mm bore`, `NPV ${mUSD(bo.npv, 2)} M$`, `${bo.evals} model runs; fitted length scales ${bo.len.map((x) => rd(x, 2)).join(' and ')} of the box; case design ${mUSD(bo.refNpv, 2)} M$${bo.vio > 0 ? '; the best point found breaks a constraint' : ''}`]] : []),
     ['Value – risk – carbon', 'non-dominated sorting GA', `${front.length} Pareto designs`, front.length ? `NPV ${rd(front[0].npv, 0)}–${rd(front[front.length - 1].npv, 0)} M$` : '—', `population ${q.nPop}, ${q.nGens} generations`],
   ] });
   tables.push({ title: 'Economically optimised strategies subject to the engineering safety constraints', columns: ['Area', 'Decision', 'Optimum', 'Economic result', 'Constraints applied', 'Status'], rows: [
@@ -1333,10 +1856,63 @@ async function run(v, ctx = {}) {
   ], note: `${S.calls} steady solutions of the case line on the flow kernel (${q.nCells} cells). Rate response fitted from the kernel: friction ∝ rate^${rd(S.nf, 2)}, thermal exponent ${rd(S.mExp, 2)}.` });
   tables.push({ title: 'Integrity and reliability economics', columns: ['Item', 'Value', 'Unit', 'Note'], rows: [
     ['Annual failure probability (year 1)', rd(p0.haz[0], 5), '1/y', 'base rate + wear-out hazard'], ['Largest annual failure probability', rd(Math.max(...p0.haz.slice(0, lifeEff)), 5), '1/y', `with inspection every ${q.inspInterval} y (detection ${q.pod} %); Weibull shape ${q.weibullBeta}, ${q.pEnd} % cumulative at ${q.remLife} y without inspection`], ['Consequence per failure', q.consequence, 'M$', ''], ['Expected annual loss (year 1)', mUSD(eal, 3), 'M$/y', 'probability × consequence'], ['Lifecycle expected failure cost', mUSD(lifeFail, 2), 'M$', 'present value, = NPV − risk-adjusted NPV'],
-    ['Downtime cost of one failure', mUSD(q.repairDays * dayValue, 2), 'M$', `${q.repairDays} d at ${mUSD(dayValue, 2)} M$/d after deferral credit`], ['Optimum inspection interval', rd(rbiBest.t, 1), 'y', `PV ${mUSD(rbiBest.total, 2)} M$ (inspection ${mUSD(rbiBest.inspection, 2)}, failure ${mUSD(rbiBest.failure, 2)})`], ['Current inspection interval', q.inspInterval, 'y', `PV ${mUSD(rbiNow.total, 2)} M$`],
+    ['Downtime cost of one failure', mUSD((q.repairDays / (q.vesselAvail / 100)) * dayValue, 2), 'M$', `${q.repairDays} d ÷ ${q.vesselAvail} % crew and vessel availability at ${mUSD(dayValue, 2)} M$/d after deferral credit`], ['Optimum inspection interval', rd(rbiBest.t, 1), 'y', `PV ${mUSD(rbiBest.total, 2)} M$ (inspection ${mUSD(rbiBest.inspection, 2)}, failure ${mUSD(rbiBest.failure, 2)})`], ['Current inspection interval', q.inspInterval, 'y', `PV ${mUSD(rbiNow.total, 2)} M$`],
     ...mats.map((mR) => [`Material: ${mR.name}`, mUSD(mR.lcc, 2), 'M$ lifecycle', `rate ${rd(mR.rate, 3)} mm/y, allowance ${rd(mR.ca, 1)} mm${mR.practical ? '' : ' (capped; line replaced at year ' + rd(mR.life, 0) + ')'}, ΔCAPEX ${mUSD(mR.dCap, 2)}, PV OPEX ${mUSD(mR.opex, 2)}, PV failure ${mUSD(mR.fail, 2)}${mR.repl > 0 ? ', PV replacement ' + mUSD(mR.repl, 2) : ''}`]),
   ] });
   tables.push({ title: 'Emissions and abatement', columns: ['Item', 'tCO₂e/y', 'Abatement (t/y)', 'Annual cost difference (M$/y)', 'Abatement cost ($/t)'], rows: [...em0.items.map((i) => [i.source, rd(i.t, 0), '—', '—', '—']), ['Total (case strategy)', rd(carbonT, 0), '—', rd((carbonT * q.carbonPrice) / MM, 3) + ' carbon cost', '—'], ['Embodied in line-pipe steel (one-off)', rd(capex.steelT * EF.steel, 0), '—', '—', '—'], ...mac.map((x) => [`Strategy: ${x.name}`, rd(x.emis, 0), rd(x.abate, 0), rd(x.cost / MM, 3), rd(x.mac, 0)])], note: `Power factor ${rd(X.enCarbon, 2)} kgCO₂/kWh (${q.powerSource === 'gas' ? 'own gas turbines' : 'grid'}); abatement is measured against "${refEm.name}", the highest-emitting strategy.` });
+  // ---- provenance of the numbers: cost basis, escalation, fiscal terms
+  const ixF = C.index.factor, entryF = (e) => (e.index === 'none' ? 1 : bundledFactor(e.index || 'machinery', e.basisYear, q.costBasisYear) * (e.opex ? C.index.of(q.costBasisYear) : ixF));
+  tables.push({ title: 'Cost basis: sources, basis years and escalation', columns: ['Item', 'Published value', 'Unit', 'Basis year', 'Low', 'High', `Factor to ${q.evalYear}`, `Value in ${q.evalYear} money`, 'Feeds', 'Status', 'Source'],
+    rows: COST_ENTRIES.map((e) => { const f = entryF(e); return [e.label, e.value, e.unit, e.basisYear, e.low ?? '—', e.high ?? '—', rd(f, 3), +(e.value * f).toPrecision(4), e.input || '—', e.status, e.source ? `${e.source.citation} — ${e.source.url}` : 'no open source found: engineering estimate']; }),
+    note: `${COST_ENTRIES.filter((e) => e.source).length} of ${COST_ENTRIES.length} entries are read from a cited publication; the others are marked as engineering estimates. Costs are held in ${q.costBasisYear} money and escalated to ${q.evalYear} by × ${rd(ixF, 4)} (index ${rd(C.index.base, 1)} → ${rd(C.index.evalV, 1)}; ${C.index.source}${C.index.extrapolated ? `; the index was continued at the inflation rate of ${q.inflation} %/y beyond its last year` : ''}). Index: ${COST_INDEX.label}; steel items use ${STEEL_INDEX.label} up to the basis year. ${C.index.growth !== null ? `Time-series fit of the index: mean growth ${pct(C.index.growthMean, 2)} %/y over ${C.index.nGrowth} years${C.index.ar ? `, first-order autocorrelation ${rd(C.index.ar.b, 2)} (± ${rd(C.index.ar.seB, 2)}), long-run growth ${pct(C.index.growth, 2)} %/y` : ''}.` : ''}` });
+  tables.push({ title: 'Fiscal terms used and their source', columns: ['Term', 'Value', 'Source'], rows: [
+    ['Regime', q.regime === 'psc' ? `production-sharing contract${p0.pscScale ? ', sliding scale on the R-factor' : ''}` : 'royalty and tax', C.fiscal ? `${C.fiscal.country}: ${C.fiscal.label}` : 'entered by hand (generic terms, not a country regime)'],
+    ['Royalty', `${rd(q.royalty, 2)} %`, C.fiscal ? C.fiscal.terms.royalty || '—' : 'input'], ['Tax on profit', `${rd(q.taxRate, 2)} %`, C.fiscal ? C.fiscal.terms.tax || '—' : 'input'],
+    ...(q.regime === 'psc' ? [['Cost-oil cap', `${rd(q.costOilCap, 1)} % of net revenue`, C.fiscal ? C.fiscal.terms.costOil || 'not published: input value kept' : 'input'], ['Contractor profit share', p0.pscScale ? p0.pscScale.map((r) => `${rd(100 * r.share, 0)} % from R = ${r.r}`).join(', ') : `${rd(q.profitSplit, 1)} %`, C.fiscal ? C.fiscal.terms.profit || 'not published: input value kept' : 'input']] : []),
+    ...(C.fiscal ? [['Ring fence and allowances', C.fiscal.terms.ringFence || '—', ''], ['How the regime is represented', C.fiscal.model.note || '', C.fiscal.status], ...C.fiscal.sources.map((x, i) => [`Source ${i + 1} (${x.year})`, x.citation, x.url])] : [['Country regimes available', Object.keys(FISCAL).join(', '), FISCAL_NOTE]]),
+    ['Government take in this run', `${pct(met.governmentTake, 1)} %`, 'royalty, tax and state share of pre-take cash'],
+  ] });
+  { // benchmarks from published statistics
+    const lastY = Math.max(...DALLAS_BREAKEVEN.newWell.map((r) => r.year)), dn = DALLAS_BREAKEVEN.newWell.filter((r) => r.year === lastY), wm = (a) => sum(a.map((r) => r.mean * r.n)) / sum(a.map((r) => r.n)), code = String(ctx.site?.countryCode || '').toUpperCase(), cName = UPSTREAM_CI.codes[code], cRow = cName ? UPSTREAM_CI.rows.find((r) => r.country === cName) : null, uoc = COST_ENTRIES.find((e) => e.key === 'uocUk2018'), uoc25 = COST_ENTRIES.find((e) => e.key === 'uocUk2025'), sub = COST_ENTRIES.find((e) => e.key === 'flowlineInfield'), jul = COST_ENTRIES.find((e) => e.key === 'flowlineJulia');
+    const lineMi = ((capex.groups.Pipeline || 0) + (capex.groups.Riser || 0) + sum(capex.items.filter((i) => /Pipelay spread|Riser pull-in|Mobilisation/.test(i.item)).map((i) => i.cost))) / MM / (q.lineLen / 1609.344);
+    tables.push({ title: 'Benchmarks from published statistics', columns: ['Quantity', 'This case', 'Published value', 'Unit', 'What the published value is', 'Source'], rows: [
+      ['Break-even oil price', rd(be.price, 1), `${rd(wm(dn), 1)} (answers ${Math.min(...dn.map((r) => r.min))}–${Math.max(...dn.map((r) => r.max))})`, '$/bbl', `price needed to drill a new well profitably, response-weighted mean of ${dn.length} US plays, ${lastY} survey (onshore wells: a different asset class, shown as the marginal-supply reference)`, DALLAS_BREAKEVEN.source.citation],
+      ['Lifting cost', rd(met.liftingCost, 2), `${uoc.value} (2018); ${uoc25.value} £/boe in 2025`, '$/boe', 'unit operating cost of the UK continental shelf', `${uoc.source.citation}; ${uoc25.source.citation}`],
+      ['Installed line cost', rd(lineMi, 2), `${sub.value} ± 3.19; ${jul.low}–${jul.high} for the closest analogue (2014 money; × ${rd(C.index.of(2014), 2)} to ${q.evalYear})`, 'M$ per mile', 'deep-water infield flowline systems, Gulf of Mexico: mean and standard deviation of 41 projects, and an insulated 10.75-inch line with risers', sub.source.citation],
+      ['Carbon intensity', rd(intensity, 1), `${UKCS_INTENSITY.total} (UK shelf, ${UKCS_INTENSITY.year}); ${rd(CI_GLOBAL, 1)} (world, 2015)${cRow ? `; ${rd(cRow.ci * GJ_PER_BOE, 1)} (${cName}, 2015)` : ''}`, 'kgCO₂e/boe', `whole upstream chain; this case counts the line and its flow-assurance system only. Country values are ${UPSTREAM_CI.globalMean} g/MJ-type figures converted with ${rd(GJ_PER_BOE, 3)} GJ per boe`, `${UKCS_INTENSITY.source.citation}; ${UPSTREAM_CI.source.citation}`],
+      ['CAPEX outcome against the estimate at approval', `${pct(q.dists.capex.mean - 1, 0)} % mean overrun assumed`, `${pct(NCS_STATS.mean - 1, 0)} % mean, ${pct(NCS_STATS.p10 - 1, 0)} % to ${pct(NCS_STATS.p90 - 1, 0)} % (P10–P90)`, '%', `${NCS_PROJECTS.rows.length} Norwegian shelf projects completed 2020–2025, final estimate ÷ estimate in the development plan; this case's CAPEX distribution spans ${pct(q.dists.capex.inv(0.1) - 1, 0)} % to ${pct(q.dists.capex.inv(0.9) - 1, 0)} %`, NCS_PROJECTS.source.citation],
+    ], note: 'Published statistics, not targets: they place the result of this case among real outcomes. They replace the fixed thresholds that the status colours used before.' });
+  }
+  // ---- calibration results
+  const calRows = [
+    ['Cost-index normalisation', `escalation ${q.costBasisYear} → ${q.evalYear}`, rd(ixF, 4), '×', C.index.source, 'always'],
+    ['Time-series (AR(1)) calibration', 'cost-index growth, long run', C.index.growth === null ? '—' : pct(C.index.growth, 2), '%/y', C.index.ar ? `persistence ${rd(C.index.ar.b, 3)} ± ${rd(C.index.ar.seB, 3)}, ${C.index.nGrowth} annual changes` : 'too few index years', 'reported'],
+    ...(C.infl.n ? [['Inflation index', 'mean consumer-price inflation', pct(C.infl.cpi, 2), '%/y', `last ${C.infl.n} annual changes to ${C.infl.last}; whole table ${pct(C.infl.all, 2)} %/y${C.infl.ar ? `; AR(1) persistence ${rd(C.infl.ar.b, 2)} ± ${rd(C.infl.ar.seB, 2)}` : ''}; entered ${C.infl.manualInfl} %/y`, C.infl.applied ? 'yes' : 'reported'], ['Escalation index', 'real escalation of the cost index', pct(C.infl.real, 2), '%/y', `cost-index growth relative to consumer prices over the same ${C.infl.n} years; entered ${C.infl.manualEsc} %/y`, C.infl.applied ? 'yes' : 'reported']] : []),
+    ['Maximum likelihood, geometric Brownian motion', 'oil-price volatility', pct(C.price.gbm.sigma, 1), '%/y', `${C.price.gbm.n} annual log returns ${C.price.first ?? ''}–${C.price.last ?? ''}, ± ${pct(C.price.gbm.seSigma, 1)}; mean log return ${pct(C.price.gbm.drift, 1)} %/y ± ${pct(C.price.gbm.seDrift, 1)}`, q.priceCal !== 'manual' && q.priceModel !== 'ou' ? 'yes' : 'reported'],
+    ['Maximum likelihood, mean-reverting log price', 'reversion speed κ', C.price.ou.stationary ? rd(C.price.ou.kappa, 3) : '—', '1/y', C.price.ou.stationary ? `AR(1) coefficient ${rd(C.price.ou.b, 3)}, half-life ${rd(C.price.ou.halfLife, 1)} y, long-run level ${rd(C.price.ou.level, 1)} $/bbl, σ ${pct(C.price.ou.sigma, 1)} %/y` : 'the history shows no mean reversion (AR(1) coefficient ≥ 1): the random walk is kept', q.priceCal !== 'manual' && C.price.ou.stationary ? 'yes' : 'reported'],
+    ['Maximum likelihood, gas price', 'gas-price volatility', pct(C.price.gasSigma, 1), '%/y', 'annual log returns of the gas column', 'reported'],
+    ...(C.price.daily ? [['Maximum likelihood, live daily series', 'oil-price volatility (annualised)', pct(C.price.daily.sigma, 1), '%/y', `${C.price.daily.n} daily prices from the site page; split-sample check: ${C.price.daily.coverage === null ? '—' : pct(C.price.daily.coverage, 0)} % of the second half inside the P10–P90 band fitted to the first half`, q.priceCal === 'live' ? 'yes' : 'reported']] : []),
+    ...(C.price.gasDaily ? [['Maximum likelihood, live daily series', 'gas-price volatility (annualised)', pct(C.price.gasDaily.sigma, 1), '%/y', `${C.price.gasDaily.n} daily prices from the site page`, 'reported']] : []),
+    ['Price parameters used in the simulation', 'volatility / reversion', `${rd(q.priceVol, 1)} % / ${rd(q.priceKappa, 3)}`, '%/y · 1/y', C.price.source + (C.price.note ? ` (${C.price.note})` : ''), q.priceCal !== 'manual' ? 'yes' : 'no'],
+    ['Bayesian update (gamma–Poisson)', 'random failure rate', rd(C.pof.mean, 5), '1/y', `prior ${rd(C.pof.priorMean, 5)} with weight ${q.priorStrength}; ${C.pof.events} failure(s) in ${rd(C.pof.exposure, 0)} line-years; 90 % interval ${rd(C.pof.p05, 5)}–${rd(C.pof.p95, 5)}; data weight ${pct(C.pof.weight, 0)} %`, C.pof.applied ? 'yes' : 'reported'],
+    ...(C.decline ? [['Least squares, Arps decline', 'initial decline / exponent b', `${pct(C.decline.Di, 1)} % / ${rd(C.decline.b, 2)}`, '%/y · –', `${C.decline.n} annual rates from ${C.decline.year0}, R² ${rd(C.decline.r2, 3)}; fitted on the first ${C.decline.nFit} years the remaining ${C.decline.nHold} are forecast with a mean error of ${rd(C.decline.holdMape, 1)} % (cumulative ${C.decline.holdBias >= 0 ? '+' : ''}${rd(C.decline.holdBias, 1)} %)`, C.decline.applied ? 'yes' : 'reported']] : []),
+    ...Object.entries(BF.regions).map(([reg, f]) => ['Location-factor calibration', `region "${reg}"`, rd(f.factor, 3), '×', `${f.n} record(s), 80 % interval ${rd(f.lo, 3)}–${rd(f.hi, 3)}`, q.applyCal && reg === q.calRegion ? 'yes' : 'reported']),
+    ...(BF.regression.elasticity !== undefined ? [['Econometric regression', 'ln(actual) on ln(estimate)' + (BF.regression.trend !== null ? ' and year' : ''), rd(BF.regression.elasticity, 3), 'elasticity', `± ${rd(BF.regression.seElasticity, 3)}; intercept ${rd(BF.regression.intercept, 3)}${BF.regression.trend !== null ? `; trend ${pct(BF.regression.trend, 2)} %/y ± ${pct(BF.regression.seTrend, 2)}` : ''}; R² ${rd(BF.regression.r2, 3)}, ${BF.regression.n} capital-cost records`, 'reported']] : []),
+    ...(BF.learning ? [['Learning curve', 'cost of repeated units', pct(BF.learning.rate, 1), '% per doubling', `${BF.learning.n} capital-cost records with a unit number, R² ${rd(BF.learning.r2, 3)}; first unit ${+BF.learning.first.toPrecision(4)} M$`, q.applyCal ? 'yes' : 'reported']] : []),
+    ['Parametric cost regression', 'pipeline material cost against diameter', rd(DIAMETER_FIT.materials.b, 3), 'exponent', `± ${rd(DIAMETER_FIT.materials.seB, 3)}, R² ${rd(DIAMETER_FIT.materials.r2, 3)}, ${DIAMETER_FIT.materials.n} diameters from 4 to 42 in (${PARKER_TABLE.source.citation.split(',').slice(0, 2).join(',')}); total installed cost: exponent ${rd(DIAMETER_FIT.total.b, 3)} ± ${rd(DIAMETER_FIT.total.seB, 3)}`, 'default of the parametric diameter exponent'],
+    ['Cost-estimating relationship, back-fit', 'subsea scope of a two-well tie-back against distance', rd(SUBSEA_FIT.factor, 3), '×', SUBSEA_FIT.points.map((pt) => `${pt.miles} miles: published ${rd(pt.published, 0)} M$, model ${rd(pt.model, 0)} M$, calibrated ${rd(pt.calibrated, 0)} M$ (${pt.error >= 0 ? '+' : ''}${pct(pt.error, 0)} %)`).join('; ') + ` in ${SUBSEA_FIT.year} money (EIA 2016, figure 9-41)`, `default of the calibration factor of the subsea scope; this run uses ${rd(q.subseaCal, 2)}`],
+  ];
+  tables.push({ title: 'Calibration: parameters fitted to the histories', columns: ['Method', 'Quantity', 'Fitted value', 'Unit', 'Basis', 'Fed into the model'], rows: calRows, note: 'Every fit is recomputed from the history tables on the setup tab; the switch next to each table decides whether its result replaces the hand-entered value.' });
+  tables.push({ title: 'Back-fit: predicted against actual by record type', columns: ['Record type', 'Unit', 'Records', 'Mean actual', 'Mean predicted', 'Bias (predicted − actual)', 'RMSE', 'MAPE %', 'Actual ÷ predicted (geometric mean)', 'Bayesian factor', 'Data weight %', 'Feeds', 'Applied'],
+    rows: Object.entries(REC_TYPES).map(([t, T]) => { const r = BF.types[t], rs = BF.rows.filter((x) => x.type === t && !x.region); return r ? [T.label, rs.every((x) => x.own) ? 'unit of the records' : T.unit, r.n, +mean(rs.map((x) => x.act)).toPrecision(4), +mean(rs.map((x) => x.pred)).toPrecision(4), +r.bias.toPrecision(3), +r.rmse.toPrecision(3), rd(r.mape, 1), rd(r.mle, 3), rd(r.factor, 3), pct(r.weight, 0), T.feeds, q.applyCal && T.feeds !== 'comparison only' ? 'yes' : 'no'] : [T.label, T.unit, 0, '—', '—', '—', '—', '—', '—', 1, 0, T.feeds, 'no records']; }),
+    note: `Money records are normalised to ${q.evalYear} with the cost index before the comparison. A record without its own "predicted" value is compared with what this model computes for the case; one with its own estimate back-tests that estimate. The factor is the posterior median of actual ÷ predicted with a prior centred on 1 (log standard deviation ${q.calPriorSd}). ${BF.rows.length} record(s) in the table${q.applyCal ? '; the factors are applied to this run' : '; the factors are reported only (switch "Apply the back-fitted factors" is off)'}.` });
+  // ---- hindcast
+  if (hc || roll) {
+    const rowsH = [];
+    if (roll) { rowsH.push(['Rolling price hindcast', `${roll.origins} decision years, horizons 1–${q.hindcastHorizon} y`, `${roll.n} forecasts`, `${hModel === 'ou' ? 'mean-reverting' : 'geometric Brownian'} model refitted at every decision year`], ['Coverage of the realised price by the P10–P90 band', `${pct(roll.coverage, 1)} %`, 'nominal 80 %', roll.coverage < 0.7 ? 'the band is too narrow: realised prices fall outside it more often than the model says' : 'consistent with the nominal coverage'], ['Bias of the median forecast', `${pct(Math.exp(roll.bias) - 1, 1)} %`, 'P50 ÷ realised − 1, geometric mean', roll.bias < 0 ? 'the median forecast was below what happened' : 'the median forecast was above what happened'], ['Mean absolute error of the median forecast', `${rd(roll.mape, 1)} %`, '', '']); for (let h = 1; h <= q.hindcastHorizon; h++) { const rs = roll.rows.filter((r) => r.h === h); if (rs.length) rowsH.push([`Horizon ${h} y`, `${pct(rs.filter((r) => r.inside).length / rs.length, 0)} % inside the band`, `${rs.length} forecasts`, `median error ${pct(Math.exp(mean(rs.map((r) => Math.log(r.p50 / r.actual)))) - 1, 0)} %`]); } }
+    if (hc) rowsH.push(['Project hindcast: decision year', hc.t0, '', `price ${rd(hc.price0, 2)} $/bbl and ${rd(hc.gas0, 2)} $/MMBtu; costs deflated by × ${rd(hc.deflator, 3)} to ${hc.t0} money`], ['Price model fitted to the history up to that year', hc.model === 'ou' ? 'mean-reverting' : 'geometric Brownian, no drift', `σ ${pct(hc.sigma, 1)} %/y`, hc.kappa !== null ? `κ ${rd(hc.kappa, 3)} 1/y, long-run level ${rd(hc.fit.level, 1)} $/bbl` : ''], ['Forecast NPV P10 / P50 / P90', `${mUSD(hc.p10, 0)} / ${mUSD(hc.p50, 0)} / ${mUSD(hc.p90, 0)}`, 'M$', `${hc.nSamples} price paths; flat-price NPV ${mUSD(hc.flat, 0)} M$`], ['NPV on the realised prices', mUSD(hc.realised, 0), 'M$', `${hc.nReal} realised years, later years held flat in real terms`], ['Position of the outcome in the forecast', `P${rd(100 * hc.percentile, 0)}`, '', hc.inside ? 'inside the P10–P90 band' : 'outside the P10–P90 band'], ['Realised price inside the forecast band', hc.bandCoverage === null ? '—' : `${pct(hc.bandCoverage, 0)} %`, `of ${hc.band.length - 1} years`, '']);
+    tables.push({ title: 'Hindcast: information frozen at a historical decision date', columns: ['Item', 'Value', 'Unit / basis', 'Note'], rows: rowsH, note: 'The price model is fitted only to prices up to the decision year; nothing after it is used. The project is the case of this run moved to that year, so the comparison tests the price model and its band, not the cost model.' });
+  }
   if (front.length) tables.push({ title: 'Pareto designs (sample)', columns: ['Insulation (mm)', 'Rate (% of case)', 'Shutdowns preserved (%)', 'NPV (M$)', 'Expected annual loss (M$/y)', 'Emissions (tCO₂e/y)'], rows: front.filter((_, i) => i % Math.max(1, Math.floor(front.length / 12)) === 0 || i === front.length - 1).map((f) => [rd(f.t, 0), pct(f.rate, 0), pct(f.treat, 0), rd(f.npv, 1), rd(f.risk, 3), rd(f.carbon, 0)]) });
 
   // ---- balances (conservation and consistency identities)
@@ -1372,6 +1948,12 @@ async function run(v, ctx = {}) {
       optimumInsulation: insOpt.t, optimumDiameter: dBest ? dBest.d : null, optimumRate: opBest.x[0], operatingEnvelope: envelope, inspectionIntervalOptimum: rbiBest.t, piggingIntervalOptimum: pigBest.tau, materialChoice: matBest.name,
       evpi: voi.evpi, evii: voi.evii, emv: voi.emv, optionValue: defer, optionExpand: expand, optionAbandon: abandonOpt, blackScholes: bs, mcdaBest: mcdaBest.name, topsisBest: topsisBest.name, ahpWeights: ahpR.weights, consistencyRatio: ahpR.cr,
       strategy: sm0.name, currency: cur, fxPerUSD: fx, npvLocal: npv0 * fx, kernelCalls: S.calls,
+      escalationFactor: C.index.factor, costIndexSource: C.index.source, costBasisYear: q.costBasisYear, fiscalRegime: C.fiscal ? `${C.fiscal.country}: ${C.fiscal.label}` : 'manual', fiscalSource: C.fiscal ? C.fiscal.sources.map((x) => x.url) : [], liveFieldsUsed: C.used,
+      priceVolatility: q.priceVol, priceReversion: q.priceKappa, priceFit: { gbmSigma: C.price.gbm.sigma, ouKappa: C.price.ou.stationary ? C.price.ou.kappa : null, ouSigma: C.price.ou.stationary ? C.price.ou.sigma : null, ouLevel: C.price.ou.level, n: C.price.gbm.n, source: C.price.source },
+      failureRatePosterior: { mean: C.pof.mean, p05: C.pof.p05, p95: C.pof.p95, applied: C.pof.applied }, declineFit: C.decline ? { Di: C.decline.Di, b: C.decline.b, r2: C.decline.r2, holdoutMape: C.decline.holdMape } : null, calibrationFactors: BF.F, calibrationApplied: !!(q.applyCal && BF.rows.length),
+      hindcast: hc ? { year: hc.t0, model: hc.model, npvP10: hc.p10, npvP50: hc.p50, npvP90: hc.p90, npvRealised: hc.realised, percentile: hc.percentile, inside: hc.inside, realisedYears: hc.nReal } : null, hindcastCoverage: roll ? roll.coverage : null, hindcastBias: roll ? Math.exp(roll.bias) - 1 : null, hindcastForecasts: roll ? roll.n : 0,
+      bayesOptimum: bo ? { insulation: bo.t, diameter: bo.d, npv: bo.npv, evals: bo.evals, feasible: bo.vio === 0 } : null, energyScenarioNpv: enEv, energyScenarios: enScen.map((s) => ({ name: s.name, weight: s.w, npv: s.npv })), morris: { inputs: live.map((j) => VAR_LABEL[VARS[j]]), muStar: mor.muStar, sigma: mor.sigma },
+      designFeatureCapex: sum(capex.items.filter((i) => /Buckle arrestors|Lateral-buckling|Artificial-lift/.test(i.item)).map((i) => i.cost)), labourCost: p0.fixedItems[8][1], unsoldVolume: sum(cf.unsoldBoe), startingScenario: q.m0.name,
     },
   };
 }
@@ -1386,6 +1968,9 @@ const DIST_DEFAULT = [
   { id: 'price', dist: 'lognormal', lo: 0.65, mode: 1, hi: 1.45 }, { id: 'prod', dist: 'pert', lo: 0.6, mode: 1, hi: 1.3 }, { id: 'capex', dist: 'triangular', lo: 0.9, mode: 1, hi: 1.5 }, { id: 'opex', dist: 'triangular', lo: 0.85, mode: 1, hi: 1.35 },
   { id: 'downtime', dist: 'triangular', lo: 0.5, mode: 1, hi: 2.5 }, { id: 'failFreq', dist: 'lognormal', lo: 0.4, mode: 1, hi: 2.5 }, { id: 'repair', dist: 'uniform', lo: 0.7, mode: 1, hi: 1.6 },
 ];
+const NCS_STATS = (() => { const r = NCS_PROJECTS.rows.map((x) => x.final / x.pdo); return { mean: mean(r), p10: quantile(r, 0.1), p50: quantile(r, 0.5), p90: quantile(r, 0.9), n: r.length, weighted: sum(NCS_PROJECTS.rows.map((x) => x.final)) / sum(NCS_PROJECTS.rows.map((x) => x.pdo)) }; })();
+const FAIL_DEFAULT = FAILURE_RECORDS.map((r) => ({ source: r.source, exposure: r.exposure, events: r.events })), FISCAL_HIST_DEFAULT = FISCAL_HISTORY.map((r) => ({ year: r.year, royalty: r.royalty, tax: r.tax }));
+const REC_DEFAULT = (REF_SETS.records || []).map((r) => ({ type: r.type, year: r.year, region: r.region || '', actual: r.actual, predicted: r.predicted ?? null, seq: r.seq ?? null, note: r.note || '' }));
 const INPUTS = [
   { group: 'Project frame and fiscal terms', tab: 'inputs', help: 'Cash flows are built in money of the day and discounted at the nominal rate; the same result in real terms is reported as a check.', fields: [
     N('evalYear', 'Evaluation year', '', 2026, 1990, 2100, 'Project evaluation date; year 0 of every cash flow.', { int: true }),
@@ -1400,20 +1985,26 @@ const INPUTS = [
     N('hurdle', 'Hurdle rate (minimum IRR)', '%/y', 12, 0, 60, 'Minimum acceptable internal rate of return.'),
     N('maxPayback', 'Maximum acceptable payback', 'y', 6, 0.5, 40, 'Decision threshold for the simple payback.'),
     N('minNpv', 'Minimum NPV', 'M$', 0, -1e4, 1e5, 'Decision threshold for the net present value.'),
-    sel('regime', 'Fiscal regime', 'tax', [['tax', 'Royalty and income tax'], ['psc', 'Production-sharing contract']], 'Royalty/tax concession or a simple production-sharing contract.'),
+    sel('fiscalCountry', 'Fiscal terms taken from', 'manual', [['manual', 'The terms entered below'], ...Object.entries(FISCAL).map(([code, f]) => [code, `${f.country} — ${f.label} (${f.year})`])], 'A country choice replaces the regime, royalty, tax rate, cost-oil cap and profit split below by the published terms of that country and shows their source in the results. The site page offers the country of the location.'),
+    sel('regime', 'Fiscal regime', 'tax', [['tax', 'Royalty and income tax'], ['psc', 'Production-sharing contract']], 'Royalty/tax concession or a production-sharing contract.'),
     N('royalty', 'Royalty', '% of revenue', 10, 0, 60, 'Taken off gross revenue before anything else.'),
     N('taxRate', 'Income tax rate', '%', 30, 0, 90, 'Applied to taxable income after depreciation and losses brought forward (contractor profit share under a PSC).'),
     N('costOilCap', 'Cost-oil cap', '% of net revenue', 60, 5, 100, 'Largest share of net revenue available for cost recovery each year.', { showIf: (v) => v.regime === 'psc' }),
     N('profitSplit', 'Contractor profit share', '%', 40, 1, 100, 'Contractor share of profit oil.', { showIf: (v) => v.regime === 'psc' }),
+    sel('pscMode', 'Profit-oil split', 'fixed', [['fixed', 'One split for the whole life'], ['rfactor', 'Sliding scale on the R-factor']], 'R-factor = cumulative contractor receipts (cost oil + profit oil − tax) ÷ cumulative contractor spending, evaluated at the start of each year.', { showIf: (v) => v.regime === 'psc' }),
+    { key: 'pscScale', label: 'R-factor scale', type: 'table', showIf: (v) => v.regime === 'psc' && v.pscMode === 'rfactor', help: 'Contractor share of profit oil once the R-factor reaches each threshold. Illustrative scale unless a country with a published scale is selected.', columns: [{ key: 'r', label: 'R-factor from' }, { key: 'share', label: 'Contractor share', unit: '%' }], value: [{ r: 0, share: 50 }, { r: 1, share: 40 }, { r: 1.5, share: 30 }, { r: 2, share: 20 }] },
     sel('deprMethod', 'Depreciation', 'sl', [['sl', 'Straight line'], ['db', 'Declining balance'], ['uop', 'Units of production']], 'Tax depreciation of capitalised cost from first production.'),
     N('deprLife', 'Depreciation life', 'y', 10, 1, 40, 'Years over which CAPEX is written off.', { int: true }),
     N('dbRate', 'Declining-balance rate', '%/y', 20, 1, 100, 'Annual rate; switches to straight line when that is larger.', { showIf: (v) => v.deprMethod === 'db' }),
     N('wcDays', 'Working capital', 'days of revenue', 30, 0, 180, 'Receivables less payables, released at the end.'),
-    N('abandon', 'Abandonment cost', 'M$', 60, 0, 5000, 'Decommissioning cost in evaluation-year money, paid the year after production stops.'),
+    N('wcInitial', 'Initial working capital', 'M$', 0, 0, 1e4, 'Opening stocks, spares and cash float tied up at the evaluation date and released at the end.'),
+    sel('startScenario', 'Starting economic scenario', 'base', [['base', 'Base case (inputs as entered)'], ['low', 'Low row of the scenario table'], ['high', 'High row of the scenario table']], 'The deterministic case starts from this scenario: its price, production, CAPEX and OPEX multipliers are applied to the inputs.'),
+    N('abandon', 'Abandonment cost', 'M$', Math.round(abandonmentEstimate({ wells: 2, lineM: L0.total, umbilicalM: 1.05 * L0.total, year: 2026 }).total), 0, 5000, 'Decommissioning cost in evaluation-year money, paid the year after production stops.'),
     { key: 'abandonProvision', label: 'Provide for abandonment (tax-deductible accrual)', type: 'bool', value: true, help: 'When off, the cost is only deductible when spent and usually finds no income to shelter.' },
     { key: 'stopAtLimit', label: 'Stop at the economic limit', type: 'bool', value: true, help: 'Cease production in the first year whose operating margin is negative.' },
     N('capexSunk', 'CAPEX already committed', 'M$', 0, 0, 1e5, 'Sunk cost: excluded from the forward NPV but still depreciable.'),
     N('residual', 'Book value of existing equipment', 'M$', 0, 0, 1e5, 'Remaining equipment value carried into the depreciable base.'),
+    N('salvageEnd', 'Residual value of the equipment at the end', 'M$', 0, 0, 1e5, 'Resale or re-use value received in the abandonment year (evaluation-year money).'),
     N('gearing', 'Debt share of CAPEX', '%', 0, 0, 90, 'Financing assumption for the equity view (0 = all equity).'),
     N('loanRate', 'Loan interest rate', '%/y', 7, 0, 30, 'Interest during construction is capitalised.', { showIf: (v) => v.gearing > 0 }),
     N('loanTenor', 'Loan tenor', 'y', 8, 1, 30, 'Level annuity repayment from first production.', { int: true, showIf: (v) => v.gearing > 0 }),
@@ -1436,6 +2027,11 @@ const INPUTS = [
     N('oilPrice', 'Oil price', '$/bbl', BASE.oilPrice, 0, 500, 'Evaluation-year price, real terms.'),
     N('gasPrice', 'Gas price', '$/MMBtu', BASE.gasPrice, 0, 100, 'Evaluation-year price, real terms.'),
     N('tariff', 'Transport and processing tariff', '$/boe', 2, 0, 50, 'Existing tariffs and transportation charges.'),
+    N('oilSalesCap', 'Contractual oil sales limit', 'bbl/d', 0, 0, 5e6, 'Largest average daily quantity the lifting or offtake agreement accepts; 0 = no limit. Volume above it is not sold.'),
+    N('gasSalesCap', 'Contractual gas sales limit', 'MMBtu/d', 0, 0, 5e7, 'Daily contract quantity of the gas sales agreement; 0 = no limit.'),
+    N('taInterval', 'Planned turnaround interval', 'y', 4, 1, 15, 'Years between planned shutdowns of the host facility.', { int: true }),
+    N('taDays', 'Turnaround duration', 'd', 0, 0, 120, 'Days without production in a turnaround year, in addition to the uptime above; 0 = already inside the uptime figure.'),
+    N('taCost', 'Cost of one turnaround', 'M$', 0, 0, 500, 'Maintenance scope of the planned shutdown, in addition to routine maintenance.'),
     N('pi', 'Productivity index', 'Sm³/d/bar', BASE.pi, 0.1, 1e4, 'Liquid inflow per bar of drawdown; turns extra back-pressure into lost rate.'),
     N('chokeDp', 'Choke pressure margin', 'bar', 10, 0, 300, 'Pressure drop across the production choke at the case rate; available to absorb extra line losses.'),
     N('capacityFrac', 'Facility capacity', '× case rate', 1.15, 0.3, 3, 'Largest rate the facilities and the operating envelope accept.'),
@@ -1450,7 +2046,7 @@ const INPUTS = [
     N('idMm', 'Inner diameter', 'mm', BASE.idMm, 50, 1500, 'Flowline bore.'),
     N('wtMm', 'Wall thickness', 'mm', BASE.wtMm, 3, 80, 'Steel wall.'),
     N('depth', 'Water depth', 'm', BASE.waterDepth, 0, 4000, 'Raises the installation day rate.'),
-    N('nWells', 'Wells', '', 2, 1, 40, 'Subsea wells tied back.', { int: true }),
+    N('nWells', 'Wells', '', 5, 1, 40, 'Subsea wells tied back (the reference network has five).', { int: true }),
     N('slugVol', 'Slug-catcher volume', 'm³', BASE.slugCatcherVol, 1, 5000, 'Surge volume the receiving vessel must hold.'),
     N('pumpKW', 'Pumping power', 'kW', 0, 0, 1e5, 'Continuous pump power.'),
     N('compKW', 'Compression power', 'kW', 2000, 0, 2e5, 'Continuous compressor power.'),
@@ -1470,13 +2066,31 @@ const INPUTS = [
     N('inhibRate', 'Continuous inhibitor rate', 'm³/d', 0, 0, 5000, 'When above zero this replaces the modelled inhibitor demand of the case strategy.'),
     N('cooldownBase', 'Cooldown time from operations', 'h', 0, 0, 2000, 'When above zero the lumped cooldown model is scaled to match it.'),
   ] },
+  { group: 'Design features and existing assets', tab: 'inputs', help: 'Buckle arrestors, lateral-buckling management and artificial lift come from the network and integrity studies when they have been run. Existing equipment, its maintenance state and stocks describe a brownfield starting point.', fields: [
+    N('nArrestors', 'Buckle arrestors', '', 81, 0, 2000, 'Integral ring arrestors that confine a propagating collapse.', { int: true }),
+    N('arrestorCost', 'Cost of one buckle arrestor', 'k$', costDefault('arrestorCost', 45), 0, 5000, 'Forging, two extra girth welds and coating.'),
+    N('nSleepers', 'Sleepers, buckle initiators and span supports', '', 10, 0, 2000, 'Structures placed on the seabed to trigger lateral buckles at chosen sites or to support free spans.', { int: true }),
+    N('sleeperCost', 'Cost of one sleeper or support, installed', 'k$', costDefault('sleeperCost', 350), 0, 20000, 'Fabrication, transport and installation by the construction vessel.'),
+    N('liftKW', 'Artificial-lift power', 'kW', 53, 0, 1e5, 'Continuous power of gas-lift compression, electric submersible pumps or subsea boosting.'),
+    N('liftFactor', 'Artificial-lift cost factor', '× topsides pump', 1.5, 0.5, 20, 'Installed cost relative to a topsides pump of the same power (down-hole or subsea service costs more).'),
+    N('existTopsides', 'Topsides scope already installed', '%', 0, 0, 100, 'Share of the topsides equipment that exists on the host and is not bought again.'),
+    N('existSubsea', 'Subsea scope already installed', '%', 0, 0, 100, 'Share of the subsea equipment (trees, manifold, umbilical, terminations) that exists.'),
+    sel('maintState', 'Maintenance state of the existing equipment', 'good', [['good', 'Good — no backlog'], ['fair', 'Fair — some deferred work'], ['poor', 'Poor — large backlog']], 'Fair and poor raise the routine maintenance cost (× 1.15, × 1.4) and the random failure rate (× 1.5, × 2.5); the multipliers are engineering estimates.'),
+    N('maintBacklog', 'Maintenance backlog to clear', 'M$', 0, 0, 1000, 'Deferred maintenance paid in the first production year.'),
+    N('chemInventory', 'Chemical inventory on hand', 'm³', 0, 0, 1e5, 'Inhibitor already in the storage tanks at the evaluation date; its value is credited against the first purchases.'),
+  ] },
   { group: 'Engineering safety constraints and availability', tab: 'inputs', help: 'Limits taken from the flow, solids, operations and integrity studies. An option that breaks one is reported but never recommended; optimisations are restricted to the designs that pass.', fields: [
     N('minCooldown', 'Required cooldown time', 'h', 8, 0, 200, 'Shortest time to hydrate conditions accepted for strategies that rely on insulation (no-touch time plus preservation).'),
     N('maxBlockFreq', 'Tolerable hydrate blockage frequency', '1/y', 0.05, 0.0001, 10, 'Options with a higher expected blockage frequency are excluded.'),
     N('maxInject', 'Chemical injection capacity', 'm³/d', 150, 0.1, 5000, 'Largest continuous once-through inhibitor rate that can be supplied, stored and injected.'),
     N('inhibAvail', 'Availability of the inhibition or heating system', '%', 98, 50, 100, 'Chemical supply and equipment availability; the unavailable share leaves the line unprotected.'),
     N('vesselWait', 'Wait for an intervention vessel', 'd', 15, 0, 365, 'Vessel availability: added to the outage of every blockage.'),
+    N('vesselAvail', 'Maintenance crew and vessel availability', '%', 100, 20, 100, 'Share of the time (weather window, fleet and crew) in which repair and intervention work can proceed; waits and repair outages are divided by it.'),
+    N('flareLimit', 'Regulatory limit on routine flaring', '% of produced gas', 100, 0, 100, 'Flaring above the permitted share is a regulatory violation; 100 = no limit.'),
+    N('ciLimit', 'Regulatory or corporate limit on carbon intensity', 'kgCO₂e/boe', 0, 0, 500, '0 = no limit.'),
+    N('decomSecurity', 'Decommissioning security', '% of the obligation per year', 0, 0, 10, 'Annual fee of the bond or letter of credit that the regulator requires for the abandonment obligation.'),
     N('mawp', 'Allowable inlet pressure', 'bara', BASE.designPressure, 5, 2000, 'Design or maximum allowable working pressure of the line.'),
+    N('pofPeak', 'Largest managed annual probability of failure', '1/y', 0, 0, 1, 'Highest year of the managed probability from the integrity study; the safety screen compares it with the tolerable value. 0 = use the annual probability of the integrity group.'),
     N('maxPof', 'Tolerable annual probability of failure', '1/y', 0.02, 0.00001, 1, 'Target that the inspection interval must respect.'),
     N('integUtil', 'Largest structural utilisation', '–', 0.7, 0, 10, 'Hoop, combined-stress or collapse utilisation from the integrity study; above 1 the design fails.'),
     N('integViol', 'Integrity code checks failed', '', 0, 0, 1000, 'Count of violated checks from the integrity study.', { int: true }),
@@ -1484,7 +2098,8 @@ const INPUTS = [
     { key: 'severeSlug', label: 'Severe slugging predicted and not suppressed', type: 'bool', value: false },
   ] },
   { group: 'Integrity and reliability', tab: 'inputs', fields: [
-    N('pof', 'Annual probability of failure', '1/y', 0.002, 0, 0.5, 'Random (time-independent) failure rate.'),
+    N('pof', 'Annual probability of failure', '1/y', 0.002, 0, 0.5, 'Random (time-independent) failure rate, or the managed annual probability published by the integrity study.'),
+    { key: 'pofManaged', label: 'That probability is the managed value of the integrity study', type: 'bool', value: false, help: 'A managed probability already contains degradation, the inspection plan and the mitigations of the integrity study. It is then used as it stands in every year and in the safety screen, without the wear-out term of this suite.' },
     N('consequence', 'Consequence of one failure', 'M$', 150, 0, 1e4, 'Repair, clean-up and production loss.'),
     N('ealOverride', 'Expected annual loss from the integrity study', 'M$/y', 0, 0, 1e4, 'When above zero it sets the base failure rate (= this ÷ consequence).'),
     N('remLife', 'Remaining asset life', 'y', 25, 0.5, 200, 'Time until wear-out (wall loss, fatigue) is expected.'),
@@ -1508,55 +2123,61 @@ const INPUTS = [
     N('leadWith', 'Outage with a spare', 'd', 14, 0, 365, 'Time to mobilise and install.'),
     N('spareShare', 'Production affected', '%', 50, 0, 100, 'Share of production lost while the item is out.'),
   ] },
-  { group: 'CAPEX cost basis', tab: 'setup', help: 'Order-of-magnitude industry values in 2023 US dollars (cost index 800). Purchased cost = ref × (capacity ÷ reference capacity)^exponent; installed cost = purchased × factor.', fields: [
+  { group: 'CAPEX cost basis', tab: 'setup', help: 'Costs in basis-year US dollars. The default of every field comes from the cost-basis file, which records the publication each number was read from or marks it as an engineering estimate; the results list them with their sources. Purchased cost = ref × (capacity ÷ reference capacity)^exponent; installed cost = purchased × factor.', fields: [
     { key: 'costBasis', label: 'Equipment cost basis', type: 'table', help: 'Edit ref (M$), reference capacity, exponent (0.6 is the six-tenths rule) and installation factor. Keep the id column.', columns: [{ key: 'id', label: 'Id', type: 'text' }, { key: 'item', label: 'Item', type: 'text' }, { key: 'ref', label: 'Ref. cost', unit: 'M$' }, { key: 'cap', label: 'Ref. capacity' }, { key: 'unit', label: 'Capacity unit', type: 'text' }, { key: 'exp', label: 'Exponent' }, { key: 'fac', label: 'Installation factor' }], value: COST_BASIS.map((r) => ({ ...r })) },
     sel('costMethod', 'Topsides installed cost', 'module', [['module', 'Bare-module factor for each item'], ['lang', 'One Lang factor on purchased cost']], 'Both are shown in the CAPEX table.'),
     N('langFactor', 'Lang factor', '–', 3.6, 1, 10, 'Installed cost ÷ purchased equipment cost for the whole topsides scope.'),
     sel('pipeMethod', 'Line-pipe cost', 'bottom', [['bottom', 'Bottom-up: steel tonnage, coating, welding'], ['cer', 'Parametric cost-estimating relationship']], 'The parametric relationship can be calibrated to past projects.'),
-    N('steelPrice', 'Line-pipe steel', '$/t', 1800, 300, 20000, 'Delivered X65 line pipe.'),
-    N('coatPrice', 'Anti-corrosion coating', '$/m²', 60, 0, 1000, 'Three-layer polypropylene or equivalent.'),
-    N('fabPerM', 'Welding and field joints', '$/m', 120, 0, 5000, 'Double-jointing, NDT and field-joint coating.'),
-    N('insPrice', 'Wet insulation applied', '$/m³', 5000, 200, 50000, 'Syntactic or solid polyurethane / polypropylene.'),
-    N('pipPremium', 'Pipe-in-pipe premium', '$/m', 650, 0, 10000, 'Annulus insulation, centralisers, bulkheads and assembly.'),
-    N('dehCable', 'Heating cable and anodes', '$/m', 450, 0, 10000, 'Piggy-back cable for direct electrical heating.'),
-    N('craFactor', 'CRA-clad pipe cost factor', '× carbon steel', 4.5, 1, 20, 'Line-pipe cost multiplier for corrosion-resistant cladding.'),
-    N('riserFactor', 'Riser cost factor', '× flowline per metre', 2.5, 1, 20, 'Fatigue-class welds, strakes, flex joint.'),
-    N('vesselRate', 'Installation vessel day rate', 'k$/d', 350, 20, 3000, 'Pipelay or construction vessel spread.'),
-    N('layRate', 'Lay rate at 10 in', 'km/d', 2.5, 0.05, 20, 'Scaled with diameter and thermal system.'),
-    N('mobCost', 'Mobilisation and demobilisation', 'M$', 6, 0, 500, 'Lump sum.'),
-    N('depthCoef', 'Depth factor on the day rate', 'per 1000 m', 0.2, 0, 2, 'Day rate × (1 + this × depth / 1000 m).'),
-    N('wellCost', 'Drilling and completion per well', 'M$', 70, 0, 1000, 'First well; later wells follow the learning curve.'),
-    N('cerCoef', 'Parametric line cost at 10 in', 'M$/km', 0.4, 0.05, 20, 'Coefficient of the cost-estimating relationship (line pipe, coating, welding).'),
-    N('cerExp', 'Parametric diameter exponent', '–', 1.3, 0.2, 3, 'Cost ∝ (diameter ÷ 10 in)^exponent.'),
-    N('layFactor', 'Installation day-rate factor', '–', 1, 0.2, 5, 'Multiplies the vessel spread cost (market tightness, weather downtime).'),
-    N('learnRate', 'Learning-curve rate', '%', 90, 60, 100, 'Each doubling of repeated units costs this share of the previous.'),
-    N('costIndexBase', 'Cost index of the basis year', '', 800, 100, 5000, 'Plant cost index of the reference costs.'),
-    N('costIndexEval', 'Cost index of the evaluation year', '', 830, 100, 5000, 'Escalates the basis to the evaluation year.'),
+    N('steelPrice', 'Line-pipe steel', '$/t', costDefault('steelPrice', 1800), 300, 20000, 'Delivered X65 line pipe.'),
+    N('coatPrice', 'Anti-corrosion coating', '$/m²', costDefault('coatPrice', 60), 0, 1000, 'Three-layer polypropylene or equivalent.'),
+    N('fabPerM', 'Welding and field joints', '$/m', costDefault('fabPerM', 120), 0, 5000, 'Double-jointing, NDT and field-joint coating.'),
+    N('insPrice', 'Wet insulation applied', '$/m³', costDefault('insPrice', 5000), 200, 50000, 'Syntactic or solid polyurethane / polypropylene.'),
+    N('pipPremium', 'Pipe-in-pipe premium', '$/m', costDefault('pipPremium', 650), 0, 10000, 'Annulus insulation, centralisers, bulkheads and assembly.'),
+    N('dehCable', 'Heating cable and anodes', '$/m', costDefault('dehCable', 450), 0, 10000, 'Piggy-back cable for direct electrical heating.'),
+    N('craFactor', 'CRA-clad pipe cost factor', '× carbon steel', costDefault('craFactor', 4.5), 1, 20, 'Line-pipe cost multiplier for corrosion-resistant cladding.'),
+    N('riserFactor', 'Riser cost factor', '× flowline per metre', costDefault('riserFactor', 2.5), 1, 20, 'Fatigue-class welds, strakes, flex joint.'),
+    N('vesselRate', 'Installation vessel day rate', 'k$/d', costDefault('vesselRate', 350), 20, 3000, 'Pipelay or construction vessel spread.'),
+    N('layRate', 'Lay rate at 10 in', 'km/d', costDefault('layRate', 2.5), 0.05, 20, 'Scaled with diameter and thermal system.'),
+    N('mobCost', 'Mobilisation and demobilisation', 'M$', costDefault('mobCost', 6), 0, 500, 'Lump sum.'),
+    N('depthCoef', 'Depth factor on the day rate', 'per 1000 m', costDefault('depthUplift', 0.2), 0, 2, 'Day rate × (1 + this × depth / 1000 m).'),
+    N('wellCost', 'Drilling and completion per well', 'M$', costDefault('wellCost', 70), 0, 1000, 'First well; later wells follow the learning curve.'),
+    N('cerCoef', 'Parametric line cost at 10 in', 'M$/km', CER_COEF_10, 0.05, 20, 'Coefficient of the cost-estimating relationship (line pipe, coating, welding).'),
+    N('cerExp', 'Parametric diameter exponent', '–', +DIAMETER_FIT.materials.b.toFixed(2), 0.2, 3, 'Cost ∝ (diameter ÷ 10 in)^exponent. Default: regression of published pipeline material cost on diameter (see the calibration table).'),
+    N('layFactor', 'Installation day-rate factor', '–', costDefault('spreadFactor', 1), 0.2, 5, 'Multiplies the vessel spread cost (market tightness, weather downtime).'),
+    N('learnRate', 'Learning-curve rate', '%', costDefault('learnRate', 90), 60, 100, 'Each doubling of repeated units costs this share of the previous.'),
+    sel('escalCal', 'Escalation of the cost basis', 'series', [['series', 'Cost-index series: live from the site page when present, else the table on this tab'], ['manual', 'The two index values below']], 'The costs on this tab are in basis-year money; they are moved to the evaluation year by the ratio of the cost index. Beyond the last index year the series is continued at the inflation rate.'),
+    N('costBasisYear', 'Basis year of the costs', '', BASIS_YEAR, 1987, 2100, 'Year of the money in which the cost inputs on this tab are expressed.', { int: true }),
+    N('costIndexBase', 'Cost index of the basis year', '', COST_INDEX.values[COST_INDEX.years.indexOf(BASIS_YEAR)], 1, 50000, 'Used when the escalation is set to the two index values.', { showIf: (v) => v.escalCal === 'manual' }),
+    N('costIndexEval', 'Cost index of the evaluation year', '', COST_INDEX.values[COST_INDEX.values.length - 1], 1, 50000, 'Used when the escalation is set to the two index values; the site page offers the latest live value.', { showIf: (v) => v.escalCal === 'manual' }),
     N('locFactor', 'Location factor', '–', 1, 0.3, 4, 'Regional cost level relative to the basis.'),
+    N('subseaCal', 'Calibration factor of the subsea scope', '–', +SUBSEA_FIT.factor.toFixed(2), 0.2, 5, 'Multiplies the flowline, riser, installation and subsea-equipment cost. The default is fitted to the published cost of a two-well deep-water tie-back against distance (see the calibration table); 1 uses the unit costs as entered.'),
     N('contingency', 'Contingency', '% of direct', 15, 0, 100, 'Allowance for undefined scope.'),
     N('owners', "Owner's costs", '% of direct', 8, 0, 60, 'Project team, insurance, studies.'),
   ] },
-  { group: 'OPEX and carbon basis', tab: 'setup', fields: [
-    N('opsFixed', 'Operations, labour and logistics', 'M$/y', 12, 0, 2000, 'Fixed production-operations cost.'),
+  { group: 'OPEX and carbon basis', tab: 'setup', help: 'Operating-cost inputs are in evaluation-year money. Methanol, MEG and the intervention spread default to dated published prices (see the cost-basis table in the results).', fields: [
+    N('opsFixed', 'Operations support and logistics', 'M$/y', 6, 0, 2000, 'Fixed production-operations cost without the labour below: supply vessels, helicopters, shore base, host services.'),
+    N('labourFte', 'Positions', 'full-time equivalents', 40, 0, 5000, 'Offshore and onshore positions charged to the asset.', { int: true }),
+    N('labourRate', 'Cost of one position', 'k$/y', costDefault('labourRate', 150), 0, 2000, 'Fully loaded annual cost (salary, rotation, social charges, training).'),
     N('maintPct', 'Maintenance', '% of CAPEX per year', 2.5, 0, 20, 'Routine maintenance.'),
     N('insurPct', 'Insurance', '% of CAPEX per year', 0.6, 0, 10, ''),
     N('corrMgmt', 'Corrosion management', 'M$/y', 0.8, 0, 100, 'Monitoring, coupons, cathodic protection.'),
     N('chemOther', 'Production chemicals', '$/boe', 0.6, 0, 20, 'Demulsifier, scale and corrosion inhibitors.'),
     N('waterCost', 'Produced-water handling', '$/m³', 2.5, 0, 100, 'Treatment and disposal.'),
     N('pigCost', 'Cost of a pig run', 'k$', 60, 0, 5000, 'Pigs, labour, deferred production.'),
-    N('meohPrice', 'Methanol', '$/m³', 550, 50, 5000, 'Delivered offshore.'),
-    N('megPrice', 'MEG', '$/m³', 1100, 100, 8000, 'Delivered offshore.'),
+    N('meohPrice', 'Methanol', '$/m³', costDefault('meohPrice', 550), 50, 5000, 'Delivered offshore.'),
+    N('megPrice', 'MEG', '$/m³', costDefault('megPrice', 1100), 100, 8000, 'Delivered offshore.'),
     N('megLoss', 'MEG losses', '% of circulation', 1, 0, 100, 'Make-up needed with regeneration.'),
-    N('ldhiPrice', 'Low-dosage inhibitor', '$/m³', 9000, 500, 60000, ''),
+    N('ldhiPrice', 'Low-dosage inhibitor', '$/m³', costDefault('ldhiPrice', 9000), 500, 60000, ''),
     N('ldhiDose', 'Low-dosage inhibitor dose', 'vol % of water', 0.5, 0.05, 5, ''),
-    N('spreadRate', 'Intervention vessel spread', 'k$/d', 250, 10, 3000, 'Vessel, coiled tubing or ROV spread for remediation.'),
+    N('spreadRate', 'Intervention vessel spread', 'k$/d', costDefault('spreadRate', 250), 10, 3000, 'Vessel, coiled tubing or ROV spread for remediation.'),
     N('remedDays', 'Remediation campaign', 'd', 20, 0, 365, 'Vessel days to clear one blockage.'),
     N('blockDays', 'Production outage of a blockage', 'd', 30, 0, 720, ''),
     sel('powerSource', 'Power source', 'grid', [['grid', 'Grid / power from shore'], ['gas', 'Own gas turbines (fuel gas)']], 'Sets the energy price and the emission factor.'),
     N('elecPrice', 'Electricity price', '$/kWh', 0.12, 0, 2, ''),
-    N('gridCarbon', 'Grid carbon intensity', 'kgCO₂/kWh', 0.45, 0, 2, ''),
+    N('gridCarbon', 'Grid carbon intensity', 'kgCO₂/kWh', +EMISSION_FACTORS.gridUS.value.toFixed(3), 0, 2, 'Default: US average of the EPA emission-factor tables; the site page supplies the national value.'),
     N('carbonPrice', 'Carbon price', '$/tCO₂e', 50, 0, 1000, 'Charged on the emission inventory each year.'),
     N('carbonEsc', 'Carbon-price escalation above inflation', '%/y', 3, -5, 20, ''),
+    { key: 'energyScen', label: 'Electricity and fuel-price scenarios', type: 'table', help: 'Multipliers on the electricity price and on the fuel-gas value used for the energy cost. Weights are normalised; the NPV of each scenario and their expectation are reported.', columns: [{ key: 'name', label: 'Scenario', type: 'text' }, { key: 'weight', label: 'Weight' }, { key: 'elec', label: 'Electricity ×' }, { key: 'fuel', label: 'Fuel ×' }], value: [{ name: 'Low energy prices', weight: 0.25, elec: 0.7, fuel: 0.6 }, { name: 'Base', weight: 0.5, elec: 1, fuel: 1 }, { name: 'High energy prices', weight: 0.25, elec: 1.6, fuel: 1.8 }] },
     N('flareFrac', 'Routine flaring', '% of produced gas', 0.5, 0, 100, ''),
     N('waterCapCost', 'Water-handling capacity', 'k$ per m³/d', 12, 0.1, 500, 'First-stage cost in the capacity study.'),
     N('waterPenalty', 'Cost of water above capacity', '$/m³', 15, 0.1, 500, 'Recourse cost in the capacity study.'),
@@ -1573,6 +2194,24 @@ const INPUTS = [
     N('alpha', 'Confidence level for VaR and CVaR', '%', 95, 50, 99.9, ''),
     N('riskTol', 'Risk tolerance', 'M$', 300, 1, 1e6, 'Parameter of the exponential utility.'),
     N('seed', 'Random seed', '', 2026, 0, 1e9, 'Same seed, same result.', { int: true }),
+  ] },
+  { group: 'Histories and calibration data', tab: 'setup', help: 'Histories that the suite fits its parameters to. Each table has a method (maximum likelihood, time-series regression, Bayesian updating, parametric regression, cost-index normalisation) and a switch that feeds the fitted result into the model; the fits themselves are always reported in the results.', fields: [
+    { key: 'priceHist', label: 'Commodity-price history', type: 'table', help: `Annual average prices. Default: ${PRICE_HISTORY.source.citation}. The price process is fitted to the oil column by maximum likelihood; the hindcast freezes this history at the decision year.`, columns: [{ key: 'year', label: 'Year' }, { key: 'oil', label: 'Oil', unit: '$/bbl' }, { key: 'gas', label: 'Gas', unit: '$/MMBtu' }], value: PRICE_HISTORY.rows.map((r) => ({ year: r.year, oil: r.oil, gas: r.gas })) },
+    sel('priceCal', 'Volatility and mean reversion of the price', 'history', [['manual', 'As entered in the uncertainty group'], ['history', 'Maximum-likelihood fit to the price history'], ['live', 'Volatility from the live daily series when the site page has one, mean reversion from the history']], 'Geometric Brownian motion: volatility of the log returns. Mean-reverting: exact AR(1) discretisation of the log price.'),
+    N('hindcastYear', 'Hindcast: decision year', '', 2014, 1900, 2100, 'The price history is frozen at the end of this year, the price model is fitted to it and the economics are run as though the later years were unknown.', { int: true }),
+    N('hindcastHorizon', 'Hindcast: forecast horizon', 'y', 5, 1, 20, 'Longest look-ahead scored in the rolling price hindcast.', { int: true }),
+    { key: 'indexHist', label: 'Cost and escalation index history', type: 'table', help: `Default: ${COST_INDEX.label} (${COST_INDEX.id}). Used for cost-index normalisation of the cost basis and of historical cost records, and for the time-series fit of the escalation rate.`, columns: [{ key: 'year', label: 'Year' }, { key: 'index', label: 'Cost index' }, { key: 'cpi', label: 'Consumer price index' }], value: COST_INDEX.years.map((y, i) => ({ year: y, index: COST_INDEX.values[i], cpi: CPI_INDEX.values[CPI_INDEX.years.indexOf(y)] ?? null })) },
+    sel('escCal', 'Inflation and real cost escalation', 'manual', [['manual', 'As entered in the project frame'], ['fit', 'Fitted to the index history (last ten years)']], `Inflation = mean growth of the consumer-price column (default: ${CPI_INDEX.label}, World Bank); real cost escalation = growth of the cost index relative to it. The fitted values replace the inflation and cost-escalation inputs.`),
+    { key: 'prodHist', label: 'Production history of the field or an analogue', type: 'table', help: `Annual rates in any one unit, from the start of decline. Default: an analogue with a long decline — ${FIELD_PRODUCTION.source.citation.split(',')[0]}, Draugen field, net oil in million Sm³ per year from 2001. The Arps decline is fitted by least squares on the logarithm of the rate.`, columns: [{ key: 'year', label: 'Year' }, { key: 'rate', label: 'Rate' }], value: FIELD_PRODUCTION.fields.Draugen.oil.slice(8).map((r, i) => ({ year: FIELD_PRODUCTION.fields.Draugen.first + 8 + i, rate: r })) },
+    sel('declineCal', 'Decline parameters', 'manual', [['manual', 'As entered in the production group'], ['fit', 'Arps fit to the production history']], 'The fitted initial decline and exponent replace the decline inputs (hyperbolic model).'),
+    { key: 'failHist', label: 'Failure records', type: 'table', help: 'Observed failures of comparable lines and their exposure in line-years. The random failure rate is updated by the conjugate gamma–Poisson rule; with no rows the posterior equals the prior.', columns: [{ key: 'source', label: 'Population', type: 'text' }, { key: 'exposure', label: 'Exposure', unit: 'line-years' }, { key: 'events', label: 'Failures' }], value: FAIL_DEFAULT },
+    sel('pofCal', 'Random failure rate', 'manual', [['manual', 'As entered or linked from the integrity study'], ['bayes', 'Posterior mean of the Bayesian update']], 'The prior mean is the annual probability of failure entered in the integrity group.'),
+    N('priorStrength', 'Weight of the prior failure rate', 'pseudo-failures', 0.5, 0.01, 100, 'Shape of the gamma prior: ½ is a weak prior that the records soon dominate.'),
+    { key: 'fiscalHist', label: 'Tax and royalty history', type: 'table', help: `Headline rates of the regime by year. Their range gives a fiscal-stability stress test: the NPV is recomputed at the lowest and highest historical marginal rate. Default example: United Kingdom (${FISCAL_HISTORY_SOURCE.citation}).`, columns: [{ key: 'year', label: 'Year' }, { key: 'royalty', label: 'Royalty', unit: '%' }, { key: 'tax', label: 'Marginal tax on profit', unit: '%' }], value: FISCAL_HIST_DEFAULT },
+    { key: 'calRecords', label: 'Predicted-against-actual records', type: 'table', help: `One row for each historical record. Types: ${Object.keys(REC_TYPES).join(', ')}. Actual values are in the unit of the type and, for money, in the money of their year (they are normalised with the cost index). Leave "predicted" empty to compare with what this model computes for the case; give the estimate made at the time to back-test estimates of other projects. A region label sends the record to the location-factor calibration of that region. A unit number (first, second, third … repeat of the same scope) lets the learning curve be fitted to the capital-cost records.`, columns: [{ key: 'type', label: 'Type', type: 'text' }, { key: 'year', label: 'Year' }, { key: 'region', label: 'Region', type: 'text' }, { key: 'actual', label: 'Actual' }, { key: 'predicted', label: 'Predicted' }, { key: 'seq', label: 'Unit number' }, { key: 'note', label: 'Record', type: 'text' }], value: REC_DEFAULT },
+    { key: 'applyCal', label: 'Apply the back-fitted factors to the model', type: 'bool', value: false, help: 'Each factor is the Bayesian estimate of actual ÷ predicted for its record type; when on, it multiplies the matching model quantity.' },
+    N('calPriorSd', 'Prior uncertainty of a model factor', 'log units', 0.3, 0.01, 2, 'Standard deviation of the prior on the logarithm of each factor (prior median 1). Few records are shrunk towards 1.'),
+    { key: 'calRegion', label: 'Region of this project', type: 'text', value: '', help: 'When records carry this region label, the calibrated location factor of the region multiplies the location factor.' },
   ] },
   { group: 'Decision analysis', tab: 'setup', fields: [
     { key: 'ahp', label: 'Pairwise comparison of criteria', type: 'table', help: 'Saaty scale 1–9: how much more important the row is than the column. Only the upper triangle is read; the lower one is its reciprocal.', columns: [{ key: 'name', label: 'Criterion', type: 'text' }, { key: 'c1', label: 'vs Value' }, { key: 'c2', label: 'vs Risk' }, { key: 'c3', label: 'vs Carbon' }, { key: 'c4', label: 'vs Operability' }], value: [{ name: 'Value (risked NPV)', c1: 1, c2: 2, c3: 4, c4: 3 }, { name: 'Blockage risk', c1: 0.5, c2: 1, c3: 3, c4: 2 }, { name: 'Carbon', c1: 0.25, c2: 0.333, c3: 1, c4: 0.5 }, { name: 'Operability', c1: 0.333, c2: 0.5, c3: 2, c4: 1 }] },
@@ -1592,10 +2231,11 @@ const INPUTS = [
   { group: 'Resolution', tab: 'mesh', help: 'Sample sizes and grid counts. The kernel studies cost about 0.1 s for each steady solution.', fields: [
     N('nMC', 'Simulation samples', '', 2000, 100, 400000, 'Monte Carlo / Latin-hypercube sample size.', { int: true }),
     N('nLattice', 'Lattice steps', '', 120, 5, 4000, 'Time steps of the binomial lattice.', { int: true }),
-    N('nSobol', 'Base sample of the Sobol study', '', 192, 16, 20000, 'Model runs = this × (inputs + 2).', { int: true }),
-    N('nMCopt', 'Samples per design under uncertainty', '', 200, 50, 20000, '', { int: true }),
-    N('nPop', 'Population of the Pareto search', '', 30, 8, 400, '', { int: true }),
-    N('nGens', 'Generations of the Pareto search', '', 12, 2, 400, '', { int: true }),
+    N('nSobol', 'Base sample of the Sobol study', '', 96, 16, 20000, 'Model runs = this × (inputs + 2).', { int: true }),
+    N('nMCopt', 'Samples per design under uncertainty', '', 150, 50, 20000, '', { int: true }),
+    N('nPop', 'Population of the Pareto search', '', 20, 8, 400, '', { int: true }),
+    N('nGens', 'Generations of the Pareto search', '', 8, 2, 400, '', { int: true }),
+    N('nBayes', 'Steps of the Bayesian optimisation', '', 14, 2, 60, 'Model runs after the six starting designs (five space-filling ones and the case design).', { int: true }),
     N('nCells', 'Cells along the line (flow kernel)', '', 40, 20, 400, '', { int: true }),
     N('nThick', 'Insulation thicknesses solved on the kernel', '', 4, 3, 8, '', { int: true }),
     N('tMaxMm', 'Largest insulation thickness studied', 'mm', 140, 20, 300, ''),
@@ -1613,7 +2253,7 @@ function readInputs(v = {}) {
     const raw = v[f.key];
     if (f.type === 'select') { q[f.key] = f.options.some((o) => o.value === raw) ? raw : f.value; continue; }
     if (f.type === 'bool') { q[f.key] = raw === undefined || raw === null ? f.value : !!raw; continue; }
-    if (f.type === 'text') { q[f.key] = typeof raw === 'string' && raw.trim() ? raw.trim().slice(0, 12) : f.value; continue; }
+    if (f.type === 'text') { q[f.key] = typeof raw === 'string' && raw.trim() ? raw.trim().slice(0, 30) : f.value; continue; }
     if (f.type === 'table') { q[f.key] = Array.isArray(raw) ? raw.filter((r) => r && typeof r === 'object') : f.value; continue; }
     const x = raw === undefined || raw === null || raw === '' ? f.value : +raw;
     if (!Number.isFinite(x)) throw new Error(`${f.label} must be a number.`);
@@ -1635,6 +2275,16 @@ function readInputs(v = {}) {
   q.scenarios = q.scenarios.filter((s) => +s.weight > 0).slice(0, 7).map((s, i) => ({ name: String(s.name ?? `Scenario ${i + 1}`).slice(0, 30), weight: +s.weight, price: pos(s.price), prod: pos(s.prod), capex: pos(s.capex), opex: pos(s.opex) }));
   if (!q.scenarios.length) throw new Error('The scenario table needs at least one scenario with a positive weight.');
   q.ahpM = [0, 1, 2, 3].map((i) => [0, 1, 2, 3].map((j) => (i === j ? 1 : i < j ? pos(q.ahp[i]?.[`c${j + 1}`]) : 1 / pos(q.ahp[j]?.[`c${i + 1}`]))));
+  const numRows = (rows, keys) => rows.map((r) => Object.fromEntries(keys.map((k) => [k, r[k] === null || r[k] === '' || r[k] === undefined ? null : +r[k]]))).filter((r) => Number.isFinite(r[keys[0]]));
+  q.priceHist = numRows(q.priceHist, ['year', 'oil', 'gas']).filter((r) => r.oil > 0).sort((a, b) => a.year - b.year).slice(-200);
+  q.indexHist = numRows(q.indexHist, ['year', 'index', 'cpi']).filter((r) => r.index > 0).sort((a, b) => a.year - b.year).slice(-200);
+  q.prodHist = numRows(q.prodHist, ['year', 'rate']).filter((r) => r.rate > 0).sort((a, b) => a.year - b.year).slice(0, 200);
+  q.failHist = q.failHist.map((r) => ({ source: String(r.source ?? '').slice(0, 60), exposure: +r.exposure, events: +r.events })).filter((r) => r.exposure > 0 && r.events >= 0).slice(0, 50);
+  q.fiscalHist = numRows(q.fiscalHist, ['year', 'royalty', 'tax']).filter((r) => Number.isFinite(r.tax)).sort((a, b) => a.year - b.year).slice(0, 100);
+  q.calRecords = q.calRecords.map((r) => ({ type: String(r.type ?? '').trim(), year: +r.year, region: String(r.region ?? '').trim().slice(0, 30), actual: +r.actual, predicted: r.predicted === null || r.predicted === '' || r.predicted === undefined ? null : +r.predicted, seq: +r.seq > 0 ? +r.seq : null, note: String(r.note ?? '').slice(0, 80) })).filter((r) => REC_TYPES[r.type] && r.actual > 0).slice(0, 400);
+  q.pscScale = numRows(q.pscScale, ['r', 'share']).filter((r) => r.r >= 0 && r.share >= 0 && r.share <= 100).sort((a, b) => a.r - b.r).slice(0, 12).map((r) => ({ r: r.r, share: r.share / 100 }));
+  q.energyScen = q.energyScen.filter((r) => +r.weight > 0).slice(0, 7).map((r, i) => ({ name: String(r.name ?? `Scenario ${i + 1}`).slice(0, 30), weight: +r.weight, elec: pos(r.elec), fuel: pos(r.fuel) }));
+  if (!q.energyScen.length) q.energyScen = [{ name: 'Base', weight: 1, elec: 1, fuel: 1 }];
   q.portfolio = q.portfolio.filter((r) => Number.isFinite(+r.capex) && +r.capex >= 0 && Number.isFinite(+r.npv)).slice(0, 12).map((r, i) => ({ name: String(r.name ?? `Project ${i + 1}`).slice(0, 40), capex: +r.capex, npv: +r.npv, days: Math.max(+r.days || 0, 0) }));
   return q;
 }
@@ -1644,7 +2294,8 @@ const PRESETS = [
   { name: 'Marginal field — low-price stress test', values: { oilPrice: 48, gasPrice: 2.5, qOil: 1400, qGas: 250000, plateau: 1, Di: 22, nWells: 1, wellCost: 85, discount: 12, abandon: 45, uptime: 92, hurdle: 15, priceModel: 'gbm' } },
   { name: 'Gas-condensate export with MEG loop', values: { strategy: 'bare', inhibitor: 'MEG', qOil: 700, qGas: 4500000, gasSalesFrac: 96, gasPrice: 6.5, wc0: 3, wcEnd: 15, plateau: 6, Di: 10, declineType: 'hyp', bHyp: 0.4, compKW: 9000, powerSource: 'gas', tariff: 1.2, life: 25 } },
   { name: 'Brownfield late life with integrity spend', values: { life: 10, phasing: [{ year: 1, pct: 100 }], qOil: 1500, qGas: 200000, wc0: 55, wcEnd: 88, plateau: 0, Di: 12, wellCost: 0, capexSunk: 300, residual: 40, pof: 0.01, remLife: 8, assetAge: 18, corrRate: 0.35, inspInterval: 3, maintPct: 4, uptime: 90, abandon: 80, consequence: 220, corrMgmt: 2.5, deprLife: 5, pEnd: 60 } },
-  { name: 'Production-sharing contract', values: { regime: 'psc', royalty: 5, costOilCap: 60, profitSplit: 35, taxRate: 30, deprMethod: 'uop', gearing: 50, loanRate: 8, loanTenor: 7 } },
+  { name: 'Production-sharing contract with an R-factor scale', values: { regime: 'psc', pscMode: 'rfactor', royalty: 5, costOilCap: 60, profitSplit: 35, taxRate: 30, deprMethod: 'uop', gearing: 50, loanRate: 8, loanTenor: 7 } },
+  { name: 'Norwegian shelf terms, brownfield tie-in with turnarounds', values: { fiscalCountry: 'NO', existTopsides: 60, maintState: 'fair', maintBacklog: 5, taInterval: 4, taDays: 21, taCost: 10, chemInventory: 300, wcInitial: 15, gasSalesCap: 15000, decomSecurity: 1, flareLimit: 1, declineCal: 'fit' } },
   { name: 'High carbon price', values: { carbonPrice: 150, carbonEsc: 5, powerSource: 'gas', flareFrac: 2, compKW: 4000, blowdowns: 3, deprMethod: 'db', mid: true } },
 ];
 
@@ -1674,7 +2325,9 @@ function pull({ fluid, outputs } = {}) {
   add('cooldownBase', o.ops?.cooldownTime, 'Operations suite: cooldown time'); add('heatKW', o.ops?.heatingPower, 'Operations suite: heating power');
   add('capacityFrac', o.ops?.envelope?.qMax, 'Operations suite: upper rate limit'); add('qMinFrac', o.ops?.envelope?.qMin, 'Operations suite: lower rate limit'); add('qMinFrac', o.flow?.turndownRate, 'Flow suite: minimum stable rate');
   add('plugProb', o.solids?.plugProbability, 'Solids suite: plug probability'); add('wat', o.solids?.wat, 'Solids suite: wax appearance temperature'); add('wat', o.pvt?.wat, 'Fluid suite: wax appearance temperature'); add('waxRate', o.solids?.waxRate, 'Solids suite: wax build-up rate');
-  add('pof', o.integ?.pof, 'Integrity suite: annual probability of failure'); add('consequence', isNum(o.integ?.consequence) ? o.integ.consequence / MM : undefined, 'Integrity suite: consequence of failure');
+  { const managed = isNum(o.integ?.pofManaged) ? o.integ.pofManaged : o.integ?.pof; add('pof', managed, 'Integrity suite: managed annual probability of failure'); if (isNum(managed)) items.push({ key: 'pofManaged', value: true, from: 'Integrity suite: the probability includes degradation, inspection and mitigation' }); add('pofPeak', o.integ?.pofMaxYear, 'Integrity suite: largest managed annual probability'); add('maxPof', o.integ?.targetPof, 'Integrity suite: target annual probability of failure'); }
+  { const cnt = (x) => (isNum(x) ? x : Array.isArray(x) ? x.length : x && typeof x === 'object' ? [x.count, x.n, x.number].find(isNum) : undefined), a = cnt(o.net?.buckleArrestors), sup = o.net?.supports, ini = o.net?.buckleInitiators, b = Array.isArray(sup) ? undefined : ini && typeof ini === 'object' && !Array.isArray(ini) && ini.type && ini.type !== 'sleeper' ? 0 : cnt(ini), c = Array.isArray(sup) ? sup.filter((x) => x?.type !== 'snake lay').length : cnt(sup), lift = o.net?.lift, kw = isNum(lift) ? lift : lift && typeof lift === 'object' ? [lift.power, lift.powerKW, lift.kW].find(isNum) : undefined;
+    add('nArrestors', a, 'Network suite: buckle arrestors'); add('nSleepers', isNum(b) || isNum(c) ? (b || 0) + (c || 0) : undefined, 'Network suite: sleepers and span supports (snake-lay initiators need no structure)'); add('nWells', o.net?.wellsFlowing, 'Network suite: flowing wells'); add('liftKW', kw, 'Network suite: artificial-lift power'); } add('consequence', isNum(o.integ?.consequence) ? o.integ.consequence / MM : undefined, 'Integrity suite: consequence of failure');
   add('ealOverride', isNum(o.integ?.riskCostPerYear) ? o.integ.riskCostPerYear / MM : undefined, 'Integrity suite: risk cost per year'); add('remLife', o.integ?.remainingLife, 'Integrity suite: remaining life');
   add('inspInterval', o.integ?.inspectionInterval, 'Integrity suite: inspection interval'); add('corrRate', o.integ?.corrosionRate, 'Integrity suite: corrosion rate');
   add('mawp', o.integ?.mawp, 'Integrity suite: maximum allowable working pressure'); add('mawp', o.net?.designPressure, 'Network suite: design pressure');
@@ -1688,15 +2341,23 @@ function siteHook(site) {
   const d = site?.data || {}, items = [], add = (key, value, from) => { const f = FIELD[key]; if (f.type === 'text') { if (typeof value === 'string' && value.trim()) items.push({ key, value: value.trim().slice(0, 12), from }); return; } if (isNum(value)) items.push({ key, value: clamp(value, f.min, f.max), from }); };
   add('inflation', d.inflation, 'Inflation at the site'); add('discount', isNum(d.lendingRate) ? d.lendingRate + 2 : undefined, 'Lending rate + 2 points as a discount-rate suggestion'); add('loanRate', d.lendingRate, 'Lending rate');
   add('fx', d.fxPerUSD, 'Exchange rate per US$'); add('currency', d.currency, 'Local currency'); add('elecPrice', d.electricityPrice, 'Electricity price'); add('gridCarbon', d.gridCarbon, 'Grid carbon intensity');
-  add('oilPrice', d.oilPrice, 'Oil price'); add('gasPrice', d.gasPrice, 'Gas price'); add('carbonPrice', d.carbonPrice, 'Carbon price'); add('taxRate', d.taxRate, 'Corporate tax rate'); add('depth', d.depth, 'Water depth at the site');
+  add('oilPrice', d.oilPrice, 'Oil price'); add('gasPrice', d.gasPrice, 'Gas price'); add('carbonPrice', d.carbonPrice, 'Carbon price'); add('depth', d.depth, 'Water depth at the site');
+  const code = String(site?.countryCode || d.countryCode || '').toUpperCase();
+  if (FISCAL[code]) items.push({ key: 'fiscalCountry', value: code, from: `Published petroleum fiscal terms of ${FISCAL[code].country} (${FISCAL[code].year})` });
+  else if (isNum(d.corporateTaxRate)) add('taxRate', d.corporateTaxRate, `Statutory corporate tax rate${d.corporateTaxYear ? ` (${d.corporateTaxYear})` : ''}; no petroleum-specific terms are tabulated for this country`);
+  else add('taxRate', d.taxRate, 'Headline tax rate of the site page (not a sourced petroleum regime)');
+  add('priceVol', isNum(d.oilPriceVolatility) ? 100 * d.oilPriceVolatility : undefined, 'Annualised volatility of the daily oil price over the last year');
+  add('steelPrice', d.steelPrice, 'Steel price'); add('costIndexEval', d.costIndex, 'Latest value of the cost index');
   return items;
 }
 
-const CAL_TRUE = { cerCoef: 0.52, cerExp: 1.22, layFactor: 1.18, learnRate: 93 };
-const calModel = (v) => ({ cost: pipelineCER({ dIn: v.calD ?? 10, lengthKm: v.calL ?? 20, depth: v.calDepth ?? 1000, unitNo: v.calUnit ?? 1, cerCoef: v.cerCoef ?? 0.4, cerExp: v.cerExp ?? 1.3, layFactor: v.layFactor ?? 1, learnRate: (v.learnRate ?? 90) / 100, vesselRate: v.vesselRate ?? 350, layRate: v.layRate ?? 2.5, mobCost: v.mobCost ?? 6, depthCoef: v.depthCoef ?? 0.2 }) });
+// calibration data of the installed-line relationship: published deep-water contracts, moved to basis-year money with the cost index
+const CAL_ROWS = [...KAISER_PROJECTS.rows.map((r) => ({ calD: r.d, calL: +(r.miles * 1.609344).toFixed(1), calDepth: 1500, calUnit: 1, cost: +(r.cost * r.miles * bundledFactor('machinery', 2014, BASIS_YEAR)).toFixed(1) })),
+  ...KAISER_PROJECTS.text2007.map((r) => ({ calD: r.d, calL: +(r.miles * 1.609344).toFixed(1), calDepth: 1500, calUnit: 1, cost: +(r.total * bundledFactor('machinery', 2007, BASIS_YEAR)).toFixed(1) }))];
+const calModel = (v) => ({ cost: (v.subseaCal ?? 1) * pipelineCER({ dIn: v.calD ?? 10, lengthKm: v.calL ?? 20, depth: v.calDepth ?? 1000, unitNo: v.calUnit ?? 1, cerCoef: v.cerCoef ?? CER_COEF_10, cerExp: v.cerExp ?? DIAMETER_FIT.materials.b, layFactor: v.layFactor ?? 1, learnRate: (v.learnRate ?? 90) / 100, vesselRate: v.vesselRate ?? 350, layRate: v.layRate ?? 2.5, mobCost: v.mobCost ?? 6, depthCoef: v.depthCoef ?? 0.2 }) });
 // catalogue items that the engine computes (full item names, lower case) and those it does not
-const IMPLEMENTED = ["present-value equation","future-value equation","compound-interest equation","continuous-compounding equation","discount-factor equation","annuity equation","perpetuity equation","discounted cash flow","cumulative cash flow","free cash flow","operating cash flow","after-tax cash flow","net present value","internal rate of return","modified internal rate of return","return on investment","return on capital employed","profitability index","discounted payback period","simple payback period","equivalent annual value","equivalent annual cost","equipment-cost scaling equations","capacity-factor/scaling-law model","six-tenths-rule-type scaling","installation factors","lang-factor methodology","bare-module costing","pipeline cost-per-length models","subsea installation cost models","vessel/day-rate calculations","compressor/pump costing","insulation costing","chemical-injection-system capex","slug-catcher sizing/cost relations","energy-consumption cost","pumping cost","compression cost","chemical/inhibitor cost","meg/methanol consumption cost","heating cost","pigging cost","inspection cost","maintenance cost","corrosion-management cost","hydrate-remediation cost","vessel/intervention cost","production-operations cost","production-revenue equation","oil/gas price models","production-decline models","cumulative production","uptime/availability","production-efficiency equation","deferred-production calculation","lost-production calculation","expected failure cost","expected annual loss","probability × consequence formulation","expected monetary value","lifecycle failure cost","intervention-cost model","downtime-cost model","monte carlo simulation","latin-hypercube sampling","probability distributions","expected-value analysis","variance","value at risk","conditional value at risk","stochastic cash-flow modelling","scenario analysis","sensitivity analysis","tornado analysis","decision trees","bayesian decision analysis","utility theory","multi-criteria decision analysis","analytic hierarchy process","topsis where appropriate","real-options analysis","linear programming","nonlinear programming","mixed-integer linear programming","mixed-integer nonlinear programming","dynamic programming","stochastic programming","robust optimization","multi-objective optimization","pareto-front optimization","genetic algorithms","particle-swarm optimization","hydrate risk + economics","slugging + economics","thermal hydraulics + economics","integrity + economics","reliability + economics","production + flow assurance + economics","physics + economics + uncertainty","historical capex","installation campaign costs","vessel/day rates","cost-estimating relationships","parametric cost regression","learning curves","historical back-fitting","npv analytical benchmarks","irr benchmark cases","mirr verification","discount-factor verification","nominal-vs-real cash-flow consistency","inflation calculations","tax calculations","depreciation schedules","royalty calculations","working-capital calculations","escalation calculations","capex phasing","opex aggregation","revenue calculations","production-decline integration","unit conversion","currency conversion","cash-flow sign conventions","payback calculation","breakeven root finding","probability-weighted cash flows","monte-carlo convergence","latin-hypercube sampling convergence","correlation-matrix handling","probability-distribution sampling tests","sensitivity calculations","tornado-chart calculations","scenario-weight normalization","decision-tree arithmetic","predicted capex vs actual capex","project evaluation date","project life","remaining asset life","base currency","exchange rates where multiple currencies are involved","initial commodity prices","initial production rates","initial water and gas handling rates","remaining equipment value","existing hydrate/wax/scale management strategy","initial capex already committed","baseline electricity or fuel prices","inhibitor and chemical prices","pigging costs","inspection and maintenance costs","logistics and offshore-vessel costs","disposal and treatment costs","existing tariffs","transportation charges","taxes","royalties and other fiscal assumptions relevant to the project","project evaluation horizon","discount rate","inflation assumptions","escalation rates","commodity-price scenarios","exchange-rate assumptions","tax and royalty structure","financing assumptions where considered","production limits","equipment capacity constraints","chemical availability and maximum injection capacity","emissions or carbon costs where applicable","abandonment/decommissioning obligations","minimum economic return requirements","decision thresholds such as minimum npv","maximum acceptable payback period or required rate of return","base and high cases","probability distributions or scenario ranges for production","commodity prices","capex","opex","downtime","failure frequency","repair costs and other uncertain economic drivers","engineering outputs and constraints from modules 1-6","project/evaluation life","base currency and exchange-rate assumptions","production/revenue forecasts","fixed/variable opex","energy prices","inhibitor/chemical costs","heating, compression and pumping costs","pigging, inspection, maintenance, intervention and repair costs","downtime and deferred-production assumptions","taxes/royalties","discount and inflation/escalation rates","equipment/chemical availability","failure frequencies and consequences","uncertainty distributions/scenarios","decision and return thresholds","capex/opex breakdowns","chemical and energy expenditure","maintenance/intervention and remediation costs","production revenue, deferment and downtime losses","expected failure/risk cost","lifecycle cost and unit production cost","cash-flow profiles","npv","irr","payback and discounted payback","profitability/break-even metrics","sensitivity and uncertainty results","scenario comparisons","pareto/decision metrics where applicable","economically optimized design, operating, mitigation, inspection and intervention strategies subject to engineering safety constraints"];
-const REFERENCE_ONLY = ["bayesian optimization","actual procurement costs","epc cost data","actual chemical consumption","historical chemical prices","electricity/fuel consumption","energy tariffs","actual maintenance expenditures","historical downtime","production deferment","equipment availability","actual production profiles","commodity-price histories","inflation indices","escalation indices","tax/royalty histories","decommissioning costs","econometric regression","maximum-likelihood estimation","bayesian calibration","time-series calibration","cost-index normalization","location-factor calibration","predicted opex vs actual opex","forecast vs actual production","predicted vs actual chemical consumption","predicted vs actual energy consumption","predicted vs actual maintenance","predicted vs actual intervention frequency","predicted vs actual downtime","predicted vs actual production losses","forecast vs actual project cash flow","forecast vs actual abandonment costs","existing installed equipment and infrastructure","existing maintenance state","available chemical inventory","initial working capital and the starting economic scenario","labour costs","electricity and fuel-price scenarios","contractual sales limits","maintenance and vessel availability","planned turnaround periods","regulatory constraints"];
+const IMPLEMENTED = ["present-value equation","future-value equation","compound-interest equation","continuous-compounding equation","discount-factor equation","annuity equation","perpetuity equation","discounted cash flow","cumulative cash flow","free cash flow","operating cash flow","after-tax cash flow","net present value","internal rate of return","modified internal rate of return","return on investment","return on capital employed","profitability index","discounted payback period","simple payback period","equivalent annual value","equivalent annual cost","equipment-cost scaling equations","capacity-factor/scaling-law model","six-tenths-rule-type scaling","installation factors","lang-factor methodology","bare-module costing","pipeline cost-per-length models","subsea installation cost models","vessel/day-rate calculations","compressor/pump costing","insulation costing","chemical-injection-system capex","slug-catcher sizing/cost relations","energy-consumption cost","pumping cost","compression cost","chemical/inhibitor cost","meg/methanol consumption cost","heating cost","pigging cost","inspection cost","maintenance cost","corrosion-management cost","hydrate-remediation cost","vessel/intervention cost","production-operations cost","production-revenue equation","oil/gas price models","production-decline models","cumulative production","uptime/availability","production-efficiency equation","deferred-production calculation","lost-production calculation","expected failure cost","expected annual loss","probability × consequence formulation","expected monetary value","lifecycle failure cost","intervention-cost model","downtime-cost model","monte carlo simulation","latin-hypercube sampling","probability distributions","expected-value analysis","variance","value at risk","conditional value at risk","stochastic cash-flow modelling","scenario analysis","sensitivity analysis","tornado analysis","decision trees","bayesian decision analysis","utility theory","multi-criteria decision analysis","analytic hierarchy process","topsis where appropriate","real-options analysis","linear programming","nonlinear programming","mixed-integer linear programming","mixed-integer nonlinear programming","dynamic programming","stochastic programming","robust optimization","multi-objective optimization","pareto-front optimization","genetic algorithms","particle-swarm optimization","hydrate risk + economics","slugging + economics","thermal hydraulics + economics","integrity + economics","reliability + economics","production + flow assurance + economics","physics + economics + uncertainty","historical capex","installation campaign costs","vessel/day rates","cost-estimating relationships","parametric cost regression","learning curves","historical back-fitting","npv analytical benchmarks","irr benchmark cases","mirr verification","discount-factor verification","nominal-vs-real cash-flow consistency","inflation calculations","tax calculations","depreciation schedules","royalty calculations","working-capital calculations","escalation calculations","capex phasing","opex aggregation","revenue calculations","production-decline integration","unit conversion","currency conversion","cash-flow sign conventions","payback calculation","breakeven root finding","probability-weighted cash flows","monte-carlo convergence","latin-hypercube sampling convergence","correlation-matrix handling","probability-distribution sampling tests","sensitivity calculations","tornado-chart calculations","scenario-weight normalization","decision-tree arithmetic","predicted capex vs actual capex","project evaluation date","project life","remaining asset life","base currency","exchange rates where multiple currencies are involved","initial commodity prices","initial production rates","initial water and gas handling rates","remaining equipment value","existing hydrate/wax/scale management strategy","initial capex already committed","baseline electricity or fuel prices","inhibitor and chemical prices","pigging costs","inspection and maintenance costs","logistics and offshore-vessel costs","disposal and treatment costs","existing tariffs","transportation charges","taxes","royalties and other fiscal assumptions relevant to the project","project evaluation horizon","discount rate","inflation assumptions","escalation rates","commodity-price scenarios","exchange-rate assumptions","tax and royalty structure","financing assumptions where considered","production limits","equipment capacity constraints","chemical availability and maximum injection capacity","emissions or carbon costs where applicable","abandonment/decommissioning obligations","minimum economic return requirements","decision thresholds such as minimum npv","maximum acceptable payback period or required rate of return","base and high cases","probability distributions or scenario ranges for production","commodity prices","capex","opex","downtime","failure frequency","repair costs and other uncertain economic drivers","engineering outputs and constraints from modules 1-6","project/evaluation life","base currency and exchange-rate assumptions","production/revenue forecasts","fixed/variable opex","energy prices","inhibitor/chemical costs","heating, compression and pumping costs","pigging, inspection, maintenance, intervention and repair costs","downtime and deferred-production assumptions","taxes/royalties","discount and inflation/escalation rates","equipment/chemical availability","failure frequencies and consequences","uncertainty distributions/scenarios","decision and return thresholds","capex/opex breakdowns","chemical and energy expenditure","maintenance/intervention and remediation costs","production revenue, deferment and downtime losses","expected failure/risk cost","lifecycle cost and unit production cost","cash-flow profiles","npv","irr","payback and discounted payback","profitability/break-even metrics","sensitivity and uncertainty results","scenario comparisons","pareto/decision metrics where applicable","economically optimized design, operating, mitigation, inspection and intervention strategies subject to engineering safety constraints","bayesian optimization","actual procurement costs","epc cost data","actual chemical consumption","historical chemical prices","electricity/fuel consumption","energy tariffs","actual maintenance expenditures","historical downtime","production deferment","equipment availability","actual production profiles","commodity-price histories","inflation indices","escalation indices","tax/royalty histories","decommissioning costs","econometric regression","maximum-likelihood estimation","bayesian calibration","time-series calibration","cost-index normalization","location-factor calibration","predicted opex vs actual opex","forecast vs actual production","predicted vs actual chemical consumption","predicted vs actual energy consumption","predicted vs actual maintenance","predicted vs actual intervention frequency","predicted vs actual downtime","predicted vs actual production losses","forecast vs actual project cash flow","forecast vs actual abandonment costs","existing installed equipment and infrastructure","existing maintenance state","available chemical inventory","initial working capital and the starting economic scenario","labour costs","electricity and fuel-price scenarios","contractual sales limits","maintenance and vessel availability","planned turnaround periods","regulatory constraints"];
+const REFERENCE_ONLY = [];
 
 /** Verification: textbook cases with hand or closed-form answers, sampling tests against analytic moments, and solver benchmarks. */
 function verify() {
@@ -1800,8 +2461,134 @@ function verify() {
   chk('Unit conversion: one boe in GJ', 6.11932393, MMBTU_PER_BOE * GJ_PER_MMBTU, 1e-8, '5.8 MMBtu × 1.05505585 GJ/MMBtu');
   { const usd = 123.45, fx = 1500; chk('Currency conversion round trip', usd, (usd * fx) / fx, 1e-12, 'US$ → local → US$'); }
   chk('Equivalent annual value × annuity factor = NPV', 1000, annuityPV(equivalentAnnual(1000, 0.1, 7), 0.1, 7), 1e-9, '');
+  // --- price processes, time series and hindcast
+  { const g = fitGBM([100, 110, 99, 108.9]); chk('Maximum-likelihood volatility of a price series (hand case)', 0.09459707303, g.sigma, 1e-9, 'log returns ln 1.1, ln 0.9, ln 1.1: σ² = Σ(r − r̄)²/3'); chk('Maximum-likelihood drift of geometric Brownian motion', 0.0328942511, g.mu, 1e-9, 'μ = r̄ + σ²/2'); }
+  { const x = [1]; for (let i = 0; i < 8; i++) x.push(1 + 0.5 * x[x.length - 1]); const a = fitAR1(x); chk('AR(1) regression recovers an exact recursion', 0.5, a.b, 1e-12, 'x′ = 1 + 0.5x'); chk('AR(1) long-run mean', 2, a.mean, 1e-12, 'a/(1 − b)'); }
+  { const R = rng(3), k = 0.4, th = Math.log(60), sg = 0.3, e = Math.exp(-k), sd = sg * Math.sqrt((1 - e * e) / (2 * k)), xs = [th]; for (let i = 0; i < 4000; i++) xs.push(th + (xs[i] - th) * e + sd * R.normal()); const f = fitOU(xs.map(Math.exp));
+    chk('Mean-reverting price: reversion speed recovered from a simulated path', 0.4, f.kappa, 0.05, '4,000 annual steps simulated with κ = 0.4'); chk('Mean-reverting price: volatility recovered', 0.3, f.sigma, 0.015, 'σ = 0.3'); chk('Mean-reverting price: long-run level recovered', 60, f.level, 2, 'exp θ = 60'); }
+  { const f = priceForecast('ou', { stationary: true, kappa: 0.5, theta: Math.log(60), sigma: 0.3 }, Math.log(90), 2); chk('Mean-reverting forecast: conditional mean of the log price', 4.243506839, f.mean, 1e-8, 'θ + (x₀ − θ)e^(−κh) with θ = ln 60, x₀ = ln 90, κh = 1'); chk('Mean-reverting forecast: conditional standard deviation', 0.27896205, f.sd, 1e-7, 'σ√((1 − e^(−2κh))/(2κ))'); }
+  { const R = rng(12), pr = [50]; for (let i = 0; i < 600; i++) pr.push(pr[i] * Math.exp(0.25 * R.normal())); const h = priceHindcast({ years: pr.map((_, i) => i), prices: pr, model: 'gbm', horizon: 1, minHistory: 50 });
+    chk('Hindcast coverage of a correctly specified model', 0.8, h.coverage, 0.05, 'driftless random walk with σ = 0.25: the P10–P90 band must hold 80 % of the outcomes'); chk('Hindcast bias of a correctly specified model', 0, h.bias, 0.03, 'mean of ln(P50/actual)'); }
+  { const pr = [10, 11, 12.1, 13.31, 14.641, 16.1051, 17.71561, 19.487171], h = priceHindcast({ years: pr.map((_, i) => i), prices: pr, model: 'gbm', horizon: 2, minHistory: 3, drift: true }); chk('Hindcast of a noise-free growth path has no error', 0, h.mape, 1e-9, '10 % growth every year: the fitted drift reproduces the later prices'); }
+  // --- Bayesian updating, regression, normalisation
+  chk('Incomplete gamma function', 0.6321205588285577, gammaP(1, 1), 1e-12, 'P(1, 1) = 1 − e^−1');
+  chk('Gamma quantile (exponential case)', 0.029957322735539908, gammaQuantile(0.95, 1, 100), 1e-10, '−ln(0.05)/100');
+  { const g = gammaPoisson({ priorMean: 0.002, strength: 0.5, events: 2, exposure: 150 }); chk('Gamma–Poisson posterior mean of a failure rate', 0.00625, g.mean, 1e-12, 'prior Gamma(0.5, 250); 2 failures in 150 line-years → 2.5/400'); chk('Gamma–Poisson: weight of the data', 0.375, g.weight, 1e-12, '150/(250 + 150)'); }
+  { const o = olsRegression([[1], [2], [3], [4], [5]], [2, 4, 5, 4, 5]); chk('Least-squares slope (textbook case)', 0.6, o.coef[1], 1e-12, 'x = 1…5, y = 2, 4, 5, 4, 5: ŷ = 2.2 + 0.6x'); chk('Standard error of the slope', 0.2828427124746190, o.se[1], 1e-10, '√(2.4/3)/√10'); chk('Coefficient of determination', 0.6, o.r2, 1e-12, '1 − 2.4/6'); }
+  chk('Parametric cost regression recovers the exponent', 0.6, powerLawFit([1, 2, 4, 8], [3, 3 * 2 ** 0.6, 3 * 4 ** 0.6, 3 * 8 ** 0.6]).b, 1e-10, 'cost = 3·size^0.6');
+  chk('Learning-curve fit', 0.85, learningFit([1, 2, 4, 8], [10, 8.5, 7.225, 6.14125]).rate, 1e-10, 'each doubling costs 85 % of the previous');
+  { const ix = { years: [2014, 2023], values: [267.8, 310] }; chk('Cost-index normalisation factor', 1.157580283793876, indexFactor(ix, 2014, 2023), 1e-12, '310.0/267.8'); chk('Cost index continued at the inflation rate', 322.524, indexAt(ix, 2025, 0.02), 1e-9, '310 × 1.02²'); chk('Cost index interpolated inside the series', 288.9, indexAt(ix, 2018.5), 1e-9, 'midway between 267.8 and 310'); }
+  chk('Location factor: geometric mean of the cost ratios', 1.2489995996796797, locationFactor([1.2, 1.3]).factor, 1e-12, '√(1.2 × 1.3)');
+  chk('Bayesian model factor (normal–normal in logarithms)', 1.1292432346572343, bayesFactor([1.2, 1.2], { priorSd: 0.2, obsSd: 0.2 }).factor, 1e-12, 'two records at 1.2, equal prior and record spread: 1.2^(2/3)');
+  { const t = [0, 1, 2, 3, 4, 5, 6, 7], f = fitArps(t, t.map((x) => 1000 * (1 + 0.5 * 0.3 * x) ** -2)); chk('Arps fit recovers the initial decline', 0.3, f.Di, 1e-5, 'data generated with q_i = 1000, D_i = 0.3, b = 0.5'); chk('Arps fit recovers the exponent b', 0.5, f.b, 1e-5, ''); }
+  { const m = morrisScreening((u) => 5 * u[0] + u[1] + 3 * u[2], 3); chk('Morris screening: mean absolute elementary effect of a linear model', 5, m.muStar[0], 1e-9, 'equals the coefficient'); chk('Morris screening: no spread for a linear model', 0, Math.max(...m.sigma), 1e-9, 'σ = 0 without curvature or interaction'); }
+  // --- Gaussian-process surrogate and Bayesian optimisation
+  { const Xs = [[0], [0.25], [0.5], [0.75], [1]], gp = gaussianProcess(Xs, Xs.map((v) => Math.sin(3 * v[0]))); chk('Gaussian process interpolates its training data', Math.sin(1.5), gp.predict([0.5]).mean, 1e-3, 'sin(3x) at x = 0.5'); chk('Gaussian process predicts between the training points', Math.sin(1.8), gp.predict([0.6]).mean, 0.03, 'sin(3x) at x = 0.6 from five points');
+    flag('Fitted kernel has a higher marginal likelihood than a fixed short length scale', gp.logML >= gaussianProcess(Xs, Xs.map((v) => Math.sin(3 * v[0])), { len: 0.05, noise: 1e-6 }).logML, gp.logML, 'larger than at length scale 0.05'); }
+  chk('Expected improvement (closed form)', 0.3989422804014327, expectedImprovement(0, 1, 0), 1e-12, 'φ(0) for a standard normal prediction at the incumbent');
+  { const b = bayesOpt((z) => (z[0] - 1) ** 2 + 2 * (z[1] + 0.5) ** 2, [-2, -2], [2, 2], { n0: 6, iters: 14, seed: 9 }); chk('Bayesian optimisation reaches the minimum of a quadratic bowl', 0, b.f, 0.02, `${b.evals} function evaluations; minimum at (1, −0.5)`); flag('Bayesian optimisation improves on its starting design', b.f < Math.min(...b.Y.slice(0, 6)), b.f, `< ${Math.min(...b.Y.slice(0, 6)).toFixed(3)}`); }
+  // --- new fiscal and project terms
+  { const cf = cashflow(mini({ regime: 'psc', capex: 0, opexFixed: 20, oilPrice: 100, life: 2, oil: [1, 1], gas: [0, 0], water: [0, 0], haz: [0, 0], deprFrac: [1, 0], costOilCap: 1, pscScale: [{ r: 0, share: 0.5 }, { r: 1.5, share: 0.2 }] }));
+    chk('Production sharing with an R-factor scale: first year', 40, cf.ocf[1], 1e-9, 'R = 0: cost oil 20, profit oil 80, contractor 50 %'); chk('Production sharing with an R-factor scale: second year', 16, cf.ocf[2], 1e-9, 'R = 60/20 = 3 ≥ 1.5: contractor share falls to 20 %'); }
+  { const cf = cashflow(mini({ oil: [10, 10, 10], oilCap: 8 })); chk('Contractual sales limit caps the volume sold', 480, cf.revenue[1], 1e-9, '8 of 10 units at 60'); chk('Volume above the sales limit is reported as unsold', 6, sum(cf.unsoldBoe), 1e-9, '2 a year for 3 years'); }
+  chk('Planned turnaround lowers the production of its year', 9, cashflow(mini({ oil: [10, 10, 10], downExtra: [0, 0.1, 0] })).oil[2], 1e-9, '10 % of the second year');
+  { const cf = cashflow(mini({ wcInitial: 5 })); chk('Initial working capital is tied up at the start', -105, cf.fcf[0], 1e-9, '−CAPEX − 5'); chk('Initial working capital is released at the end', 0, sum(cf.dwc), 1e-9, ''); }
+  chk('Residual value is received in the abandonment year', 10, cashflow(mini({ salvageEnd: 10 })).fcf[4], 1e-9, 'no other flow in that year');
+  chk('Year-specific operating cost (backlog, turnaround)', 3, cashflow(mini({ opexExtra: [3, 0, 0] })).opex[1], 1e-9, 'charged in the first production year only');
+  { const a = basisArgs({ strategy: 'none', insT: 0 }), item = (c, re) => c.items.find((i) => re.test(i.item))?.cost ?? 0, c0 = capexEstimate(a), c1 = capexEstimate({ ...a, nArrestors: 10, arrestorCost: 45, nSleepers: 4, sleeperCost: 350, subseaCal: 2, exist: { Topsides: 0.5, Subsea: 0 } });
+    chk('Buckle arrestors are costed per unit', 0.9, item(c1, /Buckle arrestors/) / MM, 1e-9, '10 × 45 k$ × calibration factor 2'); chk('Sleepers and supports are costed per unit', 2.8, item(c1, /Lateral-buckling/) / MM, 1e-9, '4 × 350 k$ × 2');
+    chk('Existing topsides equipment is not bought again', 0.5, c1.groups.Topsides / c0.groups.Topsides, 1e-12, '50 % of the scope exists'); chk('Calibration factor scales the installation scope', 2, c1.groups.Installation / c0.groups.Installation, 1e-12, ''); }
+  if (SUBSEA_FIT.points.length === 2) chk('Calibration of the subsea scope is the least-squares factor', 1, (1 + SUBSEA_FIT.points[0].error) * (1 + SUBSEA_FIT.points[1].error), 1e-9, 'with one factor and two points the calibrated errors are reciprocal');
+  chk('Abandonment estimate from the sourced unit costs: wells', 39.41863013698630, abandonmentEstimate({ wells: 2, year: 2026 }).wells, 1e-9, '2 × 17.2 M$ (2022) × 334.6/292.0');
+  // --- published worked examples and official constants
+  { const cfs = [-16000, 2000, 4000, 5000, 5000, 5000, 5000]; chk('Published worked example: net present value', 2835.63, npv(0.09, cfs), 0.015, 'OpenStax, Principles of Finance, section 16.2: −16,000; 2,000; 4,000; 5,000 × 4 at 9 %; the book rounds its discount factors, exact value 2,835.62'); chk('Published worked example: internal rate of return', 0.14, irr(cfs).irr, 0.005, 'printed as 14 % (rounded)'); chk('Published worked example: modified IRR', 0.12, mirr(cfs, 0.09, 0.09), 0.005, 'printed as 12 % (rounded), terminal value 31,595.22');
+    chk('Terminal value of the same inflows (hand calculation)', 31589.2193498, sum(cfs.slice(1).map((c, i) => c * 1.09 ** (5 - i))), 1e-6, '2,000 × 1.09⁵ + 4,000 × 1.09⁴ + 5,000 × (1.09³ + 1.09² + 1.09 + 1); the book prints 31,595.22 for this sum, 6.00 more than its own cash flows give'); chk('Published worked example: future value of an annuity', 5750.74, futureValue(annuityPV(1000, 0.07, 5), 0.07, 5), 0.005, 'OpenStax section 8.2: 1,000 a year for 5 years at 7 %'); }
+  chk('Black–Scholes–Merton call against a numerical-library result', 5.0809, blackScholes({ S: 55, K: 60, r: 0.1, sigma: 0.3, T: 0.7 }), 5e-5, 'NAG Library routine S30AAF example: S 55, K 60, T 0.7, r 10 %, σ 30 %');
+  chk('Barrel in cubic metres (NIST SP 811)', UNIT_DEFS.barrel.value, 1 / BBL_PER_M3, 5e-8, '1.589 873 E−01 m³');
+  chk('British thermal unit in joules (NIST SP 811)', UNIT_DEFS.btu.value, GJ_PER_MMBTU * 1000, 5e-4, '1.055 056 E+03 J');
+  chk('Barrel of oil equivalent (26 USC 45K)', UNIT_DEFS.boe.value, MMBTU_PER_BOE, 1e-12, '5.8 million Btu');
+  chk('Fuel-gas emission factor is the IPCC default', 0.0561, EF.fuelGJ, 1e-12, '56,100 kg CO₂ per TJ');
+  chk('Embodied CO₂ of MEG from the IPCC petrochemical factors', 1.4775393, EF.MEG, 1e-6, '0.863 × 0.70968 + ½(0.95 + 1.73) × 0.64559 t CO₂ per t');
+  chk('Flaring factor of a 39 MJ/Sm³ gas', 1.974727, EF.flareMJ * 39 * 1000, 1e-5, '39 × (0.18231/0.20199) × 56.1 g per Sm³, in kg');
+  chk('Cost-basis default is the sourced value moved to the basis year', 84.4494214259, COST_ENTRIES.find((e) => e.key === 'wellCost').value * bundledFactor('machinery', 2015, BASIS_YEAR), 1e-6, '70 M$ (2015) × 323.2/267.9');
   return out;
 }
+
+// ================================================================================================================
+// 11. Published reference data: blind predictions of the engine, and the provenance of its constants
+// ================================================================================================================
+const lazy = (fn) => { let v; return () => (v === undefined ? (v = fn()) : v); };
+const HC_REF = lazy(() => { const y = PRICE_HISTORY.rows.map((r) => r.year), pz = PRICE_HISTORY.rows.map((r) => r.oil), h = priceHindcast({ years: y, prices: pz, model: 'ou', horizon: 5, minHistory: 10 }); return { rows: h.rows, map: new Map(h.rows.map((r) => [`${r.t0}|${r.year}`, r.p50])) }; });
+const PROD_REF = lazy(() => { const rows = [], fits = {}; for (const [name, f] of Object.entries(FIELD_PRODUCTION.fields)) { const ip = f.oil.indexOf(Math.max(...f.oil)), dec = f.oil.slice(ip), nFit = 6; fits[name] = fitArps(dec.slice(0, nFit).map((_, i) => i), dec.slice(0, nFit)); dec.slice(nFit).forEach((q, i) => rows.push({ field: name, year: f.first + ip + nFit + i, t: nFit + i, actual: q })); } return { rows, fits }; });
+const itemCost = (c, re) => sum(c.items.filter((i) => re.test(i.item)).map((i) => i.cost));
+/** Engine estimate of a published deep-water line contract (M$ per mile, 2014 money): line pipe, coating, insulation, riser, lay spread and mobilisation. */
+function contractPerMile(r) {
+  const od = r.d * 0.0254, wt = od / 18, L = r.miles * 1609.344, rl = r.riser ? 1500 : 0;
+  const c = capexEstimate(basisArgs({ brief: false, costIndexEval: bundledFactor('machinery', BASIS_YEAR, 2014), id: od - 2 * wt, wt, flowLen: L - rl, riserLen: rl, depth: 1500, strategy: r.ins ? 'wet' : 'none', insT: r.ins ? 0.05 : 0, subseaCal: SUBSEA_FIT.factor }));
+  return ((c.groups.Pipeline || 0) + (c.groups.Riser || 0) + itemCost(c, /Pipelay spread|Riser pull-in|Mobilisation/)) / MM / r.miles;
+}
+const src = (o, extra = {}) => ({ citation: o.source.citation, url: o.source.url, licence: o.source.licence, retrieved: o.source.retrieved, ...extra });
+const VALIDATION = [
+  { id: NCS_PROJECTS.id, title: NCS_PROJECTS.title, quantity: 'final investment estimate', unit: 'bn NOK', kind: 'field', source: src(NCS_PROJECTS),
+    columns: [{ key: 'edition', label: 'Budget edition' }, { key: 'project', label: 'Project' }, { key: 'approved', label: 'Plan approved' }, { key: 'pdo', label: 'Estimate at approval', unit: 'bn NOK' }, { key: 'final', label: 'Final estimate', unit: 'bn NOK' }],
+    rows: NCS_PROJECTS.rows.map((r) => ({ ...r })), target: 'final', model: (r) => r.pdo * makeDist(DIST_DEFAULT.find((d) => d.id === 'capex')).mean, tolerance: { mape: 25 },
+    note: 'Predicted CAPEX against actual CAPEX. Prediction = estimate at approval × the mean of the default CAPEX distribution of this suite (triangular 0.9 / 1.0 / 1.5, mean 1.133); nothing is fitted to these projects. The published outcomes average 1.124 with a P10–P90 of 0.87–1.46, so the default distribution is centred correctly but is narrower than the outcomes on both sides. Both columns are in fixed prices of the edition year.' },
+  { id: KAISER_PROJECTS.id, title: KAISER_PROJECTS.title, quantity: 'contract cost per mile', unit: 'M$/mile (2014)', kind: 'field', source: src(KAISER_PROJECTS),
+    columns: [{ key: 'project', label: 'Project' }, { key: 'year', label: 'Year' }, { key: 'description', label: 'Published description' }, { key: 'd', label: 'Diameter', unit: 'in' }, { key: 'miles', label: 'Length', unit: 'miles' }, { key: 'ins', label: 'Insulated' }, { key: 'riser', label: 'With riser' }, { key: 'cost', label: 'Cost', unit: 'M$/mile' }],
+    rows: KAISER_PROJECTS.rows.map((r) => ({ ...r })), target: 'cost', model: contractPerMile, tolerance: { mape: 60 },
+    note: 'Predicted CAPEX against actual CAPEX of installed lines. The engine prices line pipe, coating, insulation, riser, lay spread and mobilisation with the default cost basis and the calibration factor of the subsea scope (fitted to a different source, the EIA cost-against-distance curve), deflated to 2014. Wall thickness is taken as diameter ÷ 18 and water depth as 1,500 m because the contracts do not state them. The published costs scatter from 0.8 to 10 M$ per mile; the engine reproduces the level (geometric mean ratio about 0.8) but not the project-to-project scatter, which is why the tolerance is that of a class 5 estimate.' },
+  { id: 'eia-brent-hindcast', title: 'Brent hindcast: forecasts made at the end of every year 1997–2024 for one to five years ahead', quantity: 'annual average Brent price', unit: '$/bbl', kind: 'market', source: src(PRICE_HISTORY),
+    columns: [{ key: 't0', label: 'Decision year' }, { key: 'year', label: 'Forecast year' }, { key: 'h', label: 'Horizon', unit: 'y' }, { key: 'actual', label: 'Realised price', unit: '$/bbl' }],
+    get rows() { return HC_REF().rows.map((r) => ({ t0: r.t0, year: r.year, h: r.h, actual: r.actual })); }, target: 'actual', model: (r) => HC_REF().map.get(`${r.t0}|${r.year}`), tolerance: { mape: 45 },
+    note: 'Hindcast. For each decision year the mean-reverting price model is fitted by maximum likelihood to the annual prices up to that year only, and its median forecast is compared with the price that followed. The median misses by about 40 % on average and lies below the outcome more often than above; only about 53 % of the outcomes fall inside the P10–P90 band that should hold 80 %, so the fitted band is too narrow. Forecast error of this size is a property of oil prices, not a defect that calibration can remove.' },
+  { id: FIELD_PRODUCTION.id, title: 'Production forecast: Arps decline fitted to the first six years after peak, Draugen and Norne', quantity: 'annual oil production', unit: 'million Sm³/y', kind: 'field', source: src(FIELD_PRODUCTION),
+    columns: [{ key: 'field', label: 'Field' }, { key: 'year', label: 'Year' }, { key: 't', label: 'Years after peak' }, { key: 'actual', label: 'Produced', unit: 'million Sm³' }],
+    get rows() { return PROD_REF().rows.map((r) => ({ ...r })); }, target: 'actual', model: (r) => { const f = PROD_REF().fits[r.field]; return arps(f.qi, f.Di, f.b, r.t).q; }, tolerance: { mape: 50 },
+    note: 'Forecast against actual production. The decline is fitted to the peak year and the five years after it; every later year (to 2025) is forecast blind. Both fits come out exponential; Draugen then declined more slowly at first and faster later, Norne close to the fit for a decade. A single early decline curve is good to roughly a factor of 1.5 on the annual rate.' },
+  { id: UKCS_DECOM.id, title: UKCS_DECOM.title, quantity: 'decommissioning cost for 2023 onwards', unit: '£bn', kind: 'field', source: src(UKCS_DECOM),
+    columns: [{ key: 'survey', label: 'Survey year' }, { key: 'basis', label: 'Price basis' }, { key: 'total', label: 'Estimate', unit: '£bn' }],
+    rows: UKCS_DECOM.rows.map((r) => ({ ...r })), target: 'total', model: (r) => (r.basis === 'real' ? 44.0 : 36.3 * 1.025 ** (r.survey - 2021)), tolerance: { mape: 12 },
+    note: 'Forecast against later abandonment-cost estimates. The engine holds the abandonment cost constant in real terms and inflates it at the default 2.5 % a year; the prediction is therefore the 2021 survey figure carried forward. The published total grew by 15 % in 2025 prices in four years (44.0 → 50.5) and by 39 % in money of the day, so the engine under-predicts later estimates: a real escalation of about 3.5 % a year on the abandonment cost would have matched. The 2021 rows are the starting point and match by construction.' },
+  { id: FINANCE_CASES.id, title: FINANCE_CASES.title, quantity: 'value', unit: '$', kind: 'benchmark', source: src(FINANCE_CASES),
+    columns: [{ key: 'case', label: 'Case' }, { key: 'value', label: 'Published value' }],
+    rows: FINANCE_CASES.rows.filter((r) => r.kind !== 'tv').map((r) => ({ ...r })), target: 'value', tolerance: { maxAbs: 0.015 },
+    model: (r) => { const cfs = [-16000, 2000, 4000, 5000, 5000, 5000, 5000]; return r.kind === 'npv' ? npv(0.09, cfs) : r.kind === 'fva' ? futureValue(annuityPV(1000, 0.07, 5), 0.07, 5) : blackScholes({ S: 55, K: r.K, r: 0.1, sigma: 0.3, T: r.T }); },
+    note: 'Worked examples of an open textbook and example results of a numerical library, reproduced to the precision at which they are printed (four decimals for the option prices; the net present value to one cent, because the book rounds its discount factors). The terminal value printed in section 16.4 of the book does not follow from its own cash flows and is left out.' },
+];
+const pv = (item, used, source, status, note) => ({ item, used, source: source.citation, url: source.url, retrieved: source.retrieved || '2026-10-08', status, note });
+const srcOf = (key) => COST_ENTRIES.find((e) => e.key === key).source;
+export const PROVENANCE = [
+  pv('Net present value, internal rate of return, modified IRR, terminal value and annuity future value', 'npv(), irr(), mirr(), futureValue(), annuityPV()', { citation: 'Dahlquist, J., Knight, R., et al., Principles of Finance, OpenStax, 2022, sections 8.2, 16.2, 16.3 and 16.4', url: 'https://openstax.org/books/principles-finance/pages/16-2-net-present-value-npv-method' }, 'verified', 'Worked example −16,000; 2,000; 4,000; 5,000 × 4 at 9 %: NPV 2,835.62 against the printed 2,835.63 (the book rounds its discount factors); IRR and MIRR agree with the printed 14 % and 12 %; annuity future value 5,750.74 reproduced to the cent. The terminal value printed in section 16.4 (31,595.22) is 6.00 above what its own cash flows give (31,589.22); the code agrees with the hand calculation, not with the printed figure.'),
+  pv('Black–Scholes–Merton European call', 'blackScholes(), binomialOption()', { citation: 'Numerical Algorithms Group, NAG Library Manual Mark 27, routine S30AAF, example program results', url: FINANCE_CASES.source.urlOptions }, 'verified', 'Six published call prices (S 55, r 10 %, σ 30 %, K 58/60/62, T 0.7/0.8) reproduced to the four printed decimals.'),
+  pv('Saaty random consistency index', 'ahp()', { citation: 'Sarani Rad, F., Amiri, M., Li, J., Nutrients 16(18), 3117, 2024, table 2 (reproduction of Saaty\'s random index)', url: 'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC11434635/fullTextXML' }, 'verified', 'RI = 0.58, 0.90, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49 for n = 3…10: identical to the table in the code.'),
+  pv('Barrel, British thermal unit', 'BBL_PER_M3, GJ_PER_MMBTU', UNIT_DEFS.barrel.source, 'verified', 'NIST gives 1.589 873 E−01 m³ and 1.055 056 E+03 J; the code constants 6.28981077 bbl/m³ and 1.05505585 GJ/MMBtu agree to all seven published digits.'),
+  pv('Barrel of oil equivalent', 'MMBTU_PER_BOE', UNIT_DEFS.boe.source, 'verified', '5.8 million Btu per barrel of oil equivalent, as in the code.'),
+  pv('CO₂ factor of natural gas combustion', 'emissions(): fuel gas, gas-turbine power, flaring', EMISSION_FACTORS.naturalGas.source, 'verified', '56,100 kg CO₂/TJ (net). The gas-turbine factor 0.60 kg/kWh follows from it with a turbine efficiency of 33.7 %, which is an engineering estimate.'),
+  pv('Flaring factor', 'emissions(): routine and blowdown flaring', EMISSION_FACTORS.netToGross.source, 'corrected', 'Was a fixed 2.3 kg CO₂ per Sm³. Now the IPCC gas factor on the net heating value: gross heating value entered × 0.9026 (ratio of the UK gross- and net-basis gas factors) × 56.1 g/MJ = 1.97 kg per Sm³ for the 39 MJ/Sm³ reference gas, 14 % lower. The EPA figure of 53.06 kg/MMBtu (higher heating value) gives 1.96 kg per Sm³ for the same gas.'),
+  pv('Embodied CO₂ of methanol', 'strategyModel(): chemicals', EMISSION_FACTORS.methanol.source, 'corrected', 'Was 0.7 t/t; the IPCC default for conventional steam reforming is 0.67 t CO₂ per t.'),
+  pv('Embodied CO₂ of monoethylene glycol', 'strategyModel(): chemicals', EMISSION_FACTORS.ethyleneOxide.source, 'corrected', 'Was 1.6 t/t. Built from the IPCC factors for ethylene oxide (0.863 t/t) and ethylene (0.95 t/t from ethane, 1.73 t/t from naphtha): 1.23 to 1.73 t CO₂ per t of MEG, mean 1.48 used. Hydration of the oxide to glycol is not in the IPCC tables and is left out.'),
+  pv('Embodied CO₂ of steel', 'emissions table: line-pipe steel', EMISSION_FACTORS.steel.source, 'corrected', 'Was 1.9 t/t; worldsteel reports 1.92 t CO₂ per t of crude steel for 2021–2024.'),
+  pv('Vessel emissions', 'emissions(): intervention and inspection vessels', EMISSION_FACTORS.marineGasOil.source, 'unverified', 'Marine gas oil 3,245.3 kg CO₂e per tonne is from the official table; the fuel use of 30 t per vessel day is an engineering estimate (no open figure found), giving 97 t per day (was 96).'),
+  pv('Embodied CO₂ of low-dosage hydrate inhibitor', 'strategyModel(): chemicals', { citation: 'no open source found', url: '' }, 'unverified', '3 t CO₂e per t is an engineering estimate.'),
+  pv('Default grid carbon intensity', 'input gridCarbon', EMISSION_FACTORS.gridUS.source, 'corrected', 'Was a hand-entered 0.45 kg/kWh; now the US average of eGRID2023, 771.523 lb/MWh = 0.350 kg/kWh. The site page replaces it by the national value.'),
+  pv('Cost index for escalation', 'calibrateInputs(), costDefault()', COST_INDEX.source, 'verified', 'Annual means of the monthly BLS series 1987–2026 (2026: January–August, preliminary). Replaces the hand-entered index pair 800/830; basis 2024 → 2026 is × 1.035.'),
+  pv('Steel pipe and tube price index', 'costDefault(): steel price to the basis year', STEEL_INDEX.source, 'verified', 'Annual means of the monthly BLS series; the latest monthly value (434.299, August 2026) was also read on the FRED page of the series.'),
+  pv('Consumer price index', 'calibrateInputs(): inflation fit', CPI_INDEX.source, 'verified', 'World Bank series FP.CPI.TOTL for the United States, 1987–2024.'),
+  pv('Deep-water well cost, tree and wellhead equipment, subsea-system cost against tie-back distance, depth uplift, host modification', 'cost basis: wellCost, tree, subseaCal, depthCoef', srcOf('wellCost'), 'corrected', 'Well cost was a hand-entered, undated 70 M$; the published Miocene range is 70–165 M$ in 2015 money, and its low end (the reference well is short) is 84 M$ in 2024 money. The subsea scope was about half of the published 200–500 M$ curve for a two-well tie-back and is now calibrated to it by × 1.85 (±10 % at the two published points). Numbers re-read in the saved copy of the report.'),
+  pv('Deep-water flowline contract costs', 'validation data; cross-checks in the cost basis', srcOf('flowlineInfield'), 'verified', 'Table 2 (mean 3.61, s.d. 3.19 M$ per mile) and table 3 (16 contracts) read from the free-to-read page; the engine predicts the eleven contracts with a stated diameter with a mean absolute error of about 55 %.'),
+  pv('Offshore pipeline materials, coating and cost per inch-mile', 'cross-checks in the cost basis', srcOf('offshoreMaterials'), 'unverified', 'Values read from the study text (814,000 $ per mile materials, 136,000 $ per inch-mile); the document was downloaded with certificate verification switched off because the host certificate chain did not validate, so the copy is not authenticated.'),
+  pv('Onshore pipeline cost by diameter', 'DIAMETER_FIT: default diameter exponent of the parametric line cost', PARKER_TABLE.source, 'corrected', 'The diameter exponent was a hand-entered 1.3; regression of the published material cost on diameter (11 sizes, 4–42 in) gives 1.08 ± 0.09 (R² 0.95). The table row for 10 in was re-read in the saved copy.'),
+  pv('Decommissioning unit costs', 'abandonmentEstimate(): default abandonment cost', srcOf('abandonLine'), 'corrected', 'Abandonment was a hand-entered 60 M$. Built from the published 17.2 M$ per deep-water subsea well (2022 regulator estimates), 15–40 $ per foot of pipeline, 2–10 $ per foot of umbilical and the 38 % add-ons: 43 M$ in 2026 money for the reference tie-back.'),
+  pv('Vessel day rates and spread factor', 'cost basis: vesselRate, layFactor, spreadRate', srcOf('vesselRate'), 'corrected', 'Lay vessel was a hand-entered 350 k$/d spread. Now the published charter of 242–284 k$/d (2024) times a spread factor of 1.79 from the published vessel (260 k$/d) and total-spread (466 k$/d) figures of the BSEE study = 471 k$/d.'),
+  pv('Methanol and MEG prices', 'cost basis: meohPrice, megPrice', srcOf('meohPrice'), 'corrected', 'Methanol was a hand-entered 550 $/m³; the posted US Gulf reference price for October 2026 is 1,450 $/t = 1,148 $/m³ (Asia 700 $/t = 554 $/m³). MEG was 1,100 $/m³; the Asian contract nomination of 880 $/t is 979 $/m³. Both exclude delivery offshore.'),
+  pv('Steel price', 'cost basis: steelPrice', srcOf('steelPrice'), 'corrected', 'Was a hand-entered 1,800 $/t. US plate benchmark of 30 September 2026: 1,630 $/t, moved to the 2024 basis with the steel pipe index (1,480 $/t). Mill conversion from plate to line pipe is not included.'),
+  pv('Learning rate', 'cost basis: learnRate', srcOf('learnRate'), 'corrected', 'Was a hand-entered 90 %. The only open estimate found is for onshore drilling time: −5.0 % per doubling of rig experience, hence 95 %; an analogue for subsea work.'),
+  pv('Petroleum fiscal terms by country', 'FISCAL: regime, royalty, tax rate, cost-oil cap, profit split', { citation: 'EY, Global oil and gas tax guide 2019, and the official pages cited for each country in the fiscal table', url: 'https://ualberta.scholaris.ca/bitstreams/87b03a19-5372-4a2c-8b6d-2f8436500b17/download' }, 'verified', `${Object.keys(FISCAL).length} countries. Norway, United Kingdom, United States (royalty), Brazil (royalty), Newfoundland and Suriname are from official pages read in 2026; the others rest on the 2019 guide and are flagged as such. Each regime states how it is reduced to the terms of the cash-flow engine. The earlier hand-entered headline rates (for example 50 % for Nigeria and Angola) are not used.`),
+  pv('Default CAPEX uncertainty', 'input dists: CAPEX multiplier triangular 0.9 / 1.0 / 1.5', NCS_PROJECTS.source, 'verified', `Mean 1.133 against a published mean outcome of ${NCS_STATS.mean.toFixed(3)} for ${NCS_STATS.n} completed Norwegian projects; the published P10–P90 of ${NCS_STATS.p10.toFixed(2)}–${NCS_STATS.p90.toFixed(2)} is wider than the default 0.95–1.33.`),
+  pv('Oil-price volatility and mean reversion', 'calibrateInputs(): default priceVol and priceKappa', PRICE_HISTORY.source, 'corrected', 'Were hand-entered 25 %/y and 0.3 1/y. Maximum likelihood on annual Brent 1987–2025 gives σ = 27.2 %/y and κ = 0.086 1/y (half-life 8 years, long-run level 61 $/bbl); the reversion speed is poorly determined by 38 observations.'),
+  pv('Carbon-intensity benchmark', 'status of the carbon-intensity result; benchmark table', UPSTREAM_CI.source, 'unverified', 'Country values are read from a secondary reproduction of the supplementary table of the paper (the original was not accessible); the global mean of 10.3 g CO₂-eq/MJ is from the accepted manuscript. The earlier fixed thresholds of 20 and 40 kg/boe are replaced by the UK shelf figure of 28.8 kg CO₂e/boe (2022) and the world mean of 63 kg/boe.'),
+  pv('Unit costs with no open source', 'cost basis entries marked "engineering estimate"', { citation: 'none', url: '' }, 'unverified', `${COST_ENTRIES.filter((e) => !e.source).length} entries (insulation, pipe-in-pipe premium, heating cable, coating, welding, umbilical, manifold, jumpers, terminations, topsides equipment, arrestors, sleepers, labour, low-dosage inhibitor): order-of-magnitude values; the subsea scope they add up to is calibrated as a whole to the published curve.`),
+];
 
 export default {
   id: 'econ',
@@ -1810,16 +2597,17 @@ export default {
   short: 'Economics',
   icon: '💲',
   tagline: 'Turns pressure drop, temperature, hydrate and wax exposure, slugging, corrosion and downtime into cash flow, risk and ranked decisions.',
-  description: 'Builds the CAPEX and OPEX of the case line from parametric cost models, runs a fiscal cash flow (royalty and tax or production sharing) and reports NPV, IRR, payback, unit cost and break-evens. The flow kernel is solved for a set of insulation thicknesses, diameters and rates so that six flow-assurance strategies, the insulation thickness, the bore and the operating rate are optimised on lifecycle cost and NPV. Uncertainty is propagated by correlated Monte Carlo or Latin-hypercube sampling, and the decision is supported by decision trees, value of information, multi-criteria ranking, real options and mathematical programming.',
+  description: 'Builds the CAPEX and OPEX of the case line from a cost basis in which every number carries its basis year and its source (or is marked as an engineering estimate), escalates it to the evaluation year with a cost index, runs a fiscal cash flow (royalty and tax or production sharing, with published terms for 26 countries) and reports NPV, IRR, payback, unit cost and break-evens. The flow kernel is solved for a set of insulation thicknesses, diameters and rates so that six flow-assurance strategies, the insulation thickness, the bore and the operating rate are optimised on lifecycle cost and NPV. Price volatility and mean reversion are fitted to the price history by maximum likelihood, uncertainty is propagated by correlated Monte Carlo or Latin-hypercube sampling, and a hindcast freezes the information at a past decision year and scores the forecast against what happened. Decisions are supported by decision trees, value of information, multi-criteria ranking, real options, mathematical programming and Bayesian optimisation.',
   guide: [
-    'Run suites 1–6 first if you can: rates, line data, uptime, inhibitor demand, plug probability, failure probability and remaining life are then offered as linked values. The suite also works alone on the reference case.',
-    'Set the fiscal frame (discount rate, inflation, royalty, tax or production sharing, depreciation) and the production profile (plateau, decline, water cut, uptime).',
+    'Run suites 1–6 first if you can: rates, line data, uptime, inhibitor demand, plug probability, the managed failure probability, buckle arrestors, sleepers and artificial lift are then offered as linked values. The suite also works alone on the reference case.',
+    'Set the fiscal frame. Choose a country to use its published petroleum terms (the site page offers the country of the location), or enter royalty, tax or production-sharing terms by hand. Then set the production profile (plateau, decline, water cut, uptime, sales limits, turnarounds).',
     'Choose the flow-assurance strategy of the case. All six strategies are always compared on lifecycle cost, and the insulation thickness, bore and operating rate are optimised with the flow kernel.',
-    'Review the cost basis on the setup tab: reference costs, exponents and installation factors are editable; the parametric line-cost relationship can be fitted to past projects on the calibration tab.',
-    'Edit the distributions, correlations and scenarios, then read P10/P50/P90, probability of loss, CVaR, the tornado and the Sobol indices.',
-    'Use the convergence tab to confirm that the sample size and the lattice steps are large enough for the decision.',
+    'Review the cost basis on the setup tab. The results list every cost with its published value, basis year, source and the escalation factor applied; engineering estimates are marked as such and should be replaced by quotations.',
+    'Histories and calibration data (setup tab): price history, cost and consumer-price indices, a production history, failure records, tax history and predicted-against-actual records. Each has a switch that feeds its fitted result into the model; the fits are always reported.',
+    'Edit the distributions, correlations and scenarios, then read P10/P50/P90, probability of loss, CVaR, the tornado, the Morris screening and the Sobol indices. Read the hindcast before trusting the width of the forecast band.',
+    'Use the convergence tab to confirm that the sample size and the lattice steps are large enough for the decision, and the calibration tab to compare the engine with the published reference data.',
   ],
-  equationsNote: 'Screening-level (class 4–5) cost models in 2023 US dollars with editable reference costs; a single-field, single-line project; one price multiplier drives oil and gas together. The thermal and hydraulic response between the kernel solutions is interpolated (arrival temperature as an exponential in U and in 1/rate, friction as a power of rate). Cooldown uses a lumped thermal mass. Downtime volume marked as deferred is recovered in the last production year. The production-sharing option has one cost-oil cap and one profit split (no R-factor or sliding scale). Hazard is a constant rate plus a Weibull wear-out term; inspection acts through a virtual-age reduction. Real options assume a lognormal project value. The mixed-integer nonlinear problem (strategy × rate) is solved by enumerating the strategies with a continuous search inside each. Safety screening uses the limits entered here (cooldown, blockage frequency, injection capacity, erosional ratio, allowable pressure, failure probability, utilisation); it does not replace the checks of the engineering suites. Bayesian optimisation, time-series and maximum-likelihood calibration of price and cost histories are not implemented.',
+  equationsNote: 'Screening-level (class 4–5) cost models. The cost basis is dated and sourced where an open publication exists; unit costs with no open source (insulation, pipe-in-pipe premium, heating cable, umbilical, manifold and topsides equipment) are engineering estimates, and the subsea scope as a whole is calibrated by one factor to a published cost-against-distance curve for two-well deep-water tie-backs, which leaves about ±10 % at the calibration points and a mean error near 55 % against individual published contracts. A single-field, single-line project; one price multiplier drives oil and gas together in the simulation. Country fiscal regimes are reduced to a royalty, one marginal tax rate and, for production sharing, a cost-oil cap and a profit split or R-factor scale: price-dependent royalties, special participations, uplifts and immediate expensing are not modelled, and each regime states its simplification and the age of its source. The thermal and hydraulic response between the kernel solutions is interpolated (arrival temperature as an exponential in U and in 1/rate, friction as a power of rate); the Bayesian optimisation of thickness and bore interpolates friction, slug volume and erosion between the solved diameters. Cooldown uses a lumped thermal mass. Downtime volume marked as deferred is recovered in the last production year. Hazard is a constant rate plus a Weibull wear-out term with a virtual-age inspection effect, unless the integrity study supplies a managed probability, which is then used unchanged. Price processes are fitted to nominal annual averages; the mean-reverting simulation starts from the trend, while the hindcast starts from the price of its decision year. The hindcast moves the case of this run to a past year, so it tests the price model and its band, not the cost model. Real options assume a lognormal project value. Back-fitted factors are applied only on request. Safety screening uses the limits entered here; it does not replace the checks of the engineering suites.',
   implemented: IMPLEMENTED,
   referenceOnly: REFERENCE_ONLY,
   inputs: INPUTS,
@@ -1832,13 +2620,14 @@ export default {
     { name: 'Lattice steps', keys: ['nLattice'], min: 10, note: 'Binomial-lattice values converge to the continuous-time limit at first order in the time step, with the usual odd–even oscillation.', metrics: [{ label: 'Option to defer', unit: 'M$', get: (res) => res.outputs.optionValue / MM }, { label: 'Option to expand', unit: 'M$', get: (res) => res.outputs.optionExpand / MM }] },
   ],
   calibration: {
-    note: 'Benchmark and back-cast: fit the cost-estimating relationship for an installed pipeline — cost = [coefficient × (D/10 in)^exponent × length + day-rate factor × vessel spread × lay days + mobilisation] × unit number^log₂(learning rate) — to historical project costs normalised to the basis year and location, then check it on projects that were not used in the fit. The sample is synthetic: generated from the model with different parameters and 4 % noise.',
-    params: [{ key: 'cerCoef', label: 'Line cost at 10 in (M$/km)', lo: 0.1, hi: 3 }, { key: 'cerExp', label: 'Diameter exponent', lo: 0.5, hi: 2.5 }, { key: 'layFactor', label: 'Installation day-rate factor', lo: 0.4, hi: 3 }, { key: 'learnRate', label: 'Learning-curve rate (%)', lo: 70, hi: 100 }],
+    note: `Back-fit of the cost-estimating relationship for an installed line — cost = calibration factor × [coefficient × (D/10 in)^exponent × length + day-rate factor × vessel spread × lay days + mobilisation] × unit number^log₂(learning rate) — to published contract costs. The rows are deep-water Gulf of Mexico contracts (${KAISER_PROJECTS.source.citation}): published cost per mile × length, moved from 2014 to ${BASIS_YEAR} money with the cost index. The water depth of the individual contracts is not published; 1,500 m is entered for all of them. The eight earliest contracts of the table are the calibration set; the three latest and three flowlines quoted in the text of the paper (2007 dollars) are the validation set. Replace or extend the rows with your own project records.`,
+    params: [{ key: 'subseaCal', label: 'Calibration factor of the subsea scope', lo: 0.3, hi: 5 }, { key: 'cerExp', label: 'Diameter exponent', lo: 0.3, hi: 2.5 }, { key: 'layFactor', label: 'Installation day-rate factor', lo: 0.4, hi: 4 }],
     columns: [{ key: 'calD', label: 'Diameter', unit: 'in' }, { key: 'calL', label: 'Length', unit: 'km' }, { key: 'calDepth', label: 'Water depth', unit: 'm' }, { key: 'calUnit', label: 'Project sequence number', unit: '' }, { key: 'cost', label: 'Installed cost', unit: 'M$' }],
     targets: [{ key: 'cost', label: 'Installed cost', unit: 'M$' }],
     model: calModel,
-    sample: [{ calD: 8, calL: 12, calDepth: 300, calUnit: 1, cost: 13.15 }, { calD: 10, calL: 18, calDepth: 1350, calUnit: 1, cost: 17.96 }, { calD: 12, calL: 35, calDepth: 900, calUnit: 2, cost: 33.98 }, { calD: 16, calL: 60, calDepth: 150, calUnit: 1, cost: 75.58 }, { calD: 10, calL: 8, calDepth: 2000, calUnit: 3, cost: 10.77 }, { calD: 14, calL: 45, calDepth: 1100, calUnit: 2, cost: 44.71 }, { calD: 20, calL: 95, calDepth: 400, calUnit: 4, cost: 123.27 }, { calD: 6, calL: 6, calDepth: 600, calUnit: 1, cost: 8.87 }, { calD: 12, calL: 22, calDepth: 1800, calUnit: 5, cost: 22.13 }, { calD: 24, calL: 140, calDepth: 120, calUnit: 3, cost: 217.45 }, { calD: 18, calL: 70, calDepth: 750, calUnit: 6, cost: 89.94 }, { calD: 8, calL: 28, calDepth: 1500, calUnit: 2, cost: 20.9 }],
-    validationSample: [{ calD: 10, calL: 25, calDepth: 1000, calUnit: 2, cost: 22.41 }, { calD: 14, calL: 30, calDepth: 500, calUnit: 1, cost: 36.98 }, { calD: 16, calL: 80, calDepth: 1300, calUnit: 4, cost: 80.88 }, { calD: 8, calL: 15, calDepth: 250, calUnit: 3, cost: 12.26 }, { calD: 22, calL: 110, calDepth: 200, calUnit: 2, cost: 170.52 }, { calD: 12, calL: 50, calDepth: 1600, calUnit: 7, cost: 40.77 }],
+    sample: CAL_ROWS.slice(0, 8),
+    validationSample: CAL_ROWS.slice(8),
   },
   verify,
+  validationData: VALIDATION,
 };

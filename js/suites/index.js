@@ -19,7 +19,8 @@ export async function loadSuite(id) {
   if (cache.has(id)) return cache.get(id);
   const meta = byId(id);
   if (!meta) throw new Error('Unknown suite: ' + id);
-  const mod = (await meta.load()).default;
+  const ns = await meta.load(), mod = ns.default;
+  if (ns.PROVENANCE && !mod.provenance) { try { mod.provenance = ns.PROVENANCE; } catch { /* frozen module object */ } }
   cache.set(id, mod);
   return mod;
 }

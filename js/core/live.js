@@ -3,7 +3,8 @@
 // data stay fresh wherever the app is opened. Responses are treated as untrusted numbers/text only.
 import { clamp, mean, quantile } from './num.js';
 import { ATLAS } from '../data/atlas.js';
-import { PRICES } from '../data/prices.js';
+import { PRICES, MARKETS, COSTS, CORPORATE_TAX, ELECTRICITY, RATES, ISO3 } from '../data/prices.js';
+import { fiscalOf } from '../data/fiscal.js';
 
 export const SOURCES = [
   { id: 'place', name: 'Place and country', host: 'api.bigdatacloud.net', provider: 'BigDataCloud reverse geocoding', gives: 'Locality, country' },
@@ -16,13 +17,18 @@ export const SOURCES = [
   { id: 'energy', name: 'Grid carbon, renewables and carbon price', host: 'ourworldindata.org', provider: 'Our World in Data (Ember / Energy Institute / World Bank carbon-pricing series)', gives: 'Carbon intensity of electricity, renewable share of generation, national carbon price' },
   { id: 'prices', name: 'Oil and gas prices', host: 'raw.githubusercontent.com', provider: 'US EIA daily spot series (Brent, WTI, Henry Hub) from the open “datasets” collection; fallback: the EIA open-data service', gives: 'Latest Brent and WTI crude and Henry Hub gas prices, 30-day mean and one-year range' },
   { id: 'climate', name: 'Solar and wind climatology', host: 'power.larc.nasa.gov', provider: 'NASA POWER long-term climatology', gives: 'Monthly and annual solar irradiation, wind speed, air temperature' },
+  { id: 'fiscal', name: 'Corporate tax', host: 'sdmx.oecd.org', provider: 'OECD Tax Database, statutory corporate income tax rates (146 jurisdictions); fallback: Tax Foundation worldwide corporate tax rates', gives: 'Statutory corporate income tax rate and its year; the petroleum fiscal terms (royalty, petroleum tax, headline rate) come from the sourced table bundled with the app' },
+  { id: 'costs', name: 'Cost escalation', host: 'api.bls.gov', provider: 'US Bureau of Labor Statistics public data API (producer and consumer price indexes)', gives: 'Oil and gas field machinery and equipment price index (20 years, monthly) and its 5-year escalation, steel mill products index, US consumer price index' },
+  { id: 'markets', name: 'Regional gas and iron ore prices', host: 'api.imf.org', provider: 'IMF Primary Commodity Price System (monthly); fallback for European gas: Our World in Data (Energy Institute, annual)', gives: 'European (TTF) and Asian (Japan LNG) natural-gas prices, iron ore price as the steel-cost proxy' },
+  { id: 'rates', name: 'Bond yield and policy rate', host: 'api.imf.org', provider: 'IMF Monetary and Financial Statistics, interest rates; fallbacks: OECD long-term interest rates, BIS central-bank policy rates', gives: 'Government bond yield, Treasury bill yield, central-bank policy rate' },
+  { id: 'power', name: 'Industrial electricity price', host: 'ec.europa.eu', provider: 'Eurostat electricity prices for non-household consumers (Europe); US EIA average industrial retail price (United States)', gives: 'Electricity price for industry, where an open series exists' },
 ];
 export const EVIDENCE_SOURCES = [
   { name: 'OpenAlex', host: 'api.openalex.org', gives: 'Open index of the global research literature' },
   { name: 'Crossref', host: 'api.crossref.org', gives: 'DOI registry of scholarly and technical publications' },
 ];
 const GEOCODE_HOST = 'geocoding-api.open-meteo.com';
-const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu', 'api.eia.gov']);
+const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu', 'api.eia.gov', 'stats.bis.org', 'api.db.nomics.world']);
 
 /** GET text (CSV) from an allow-listed HTTPS host with a timeout and a size cap. */
 export async function getText(url, ms = 20000, maxChars = 400000) {
@@ -54,16 +60,18 @@ export async function searchPlace(q) {
   return (j.results || []).map((r) => ({ name: txt(r.name), admin: txt(r.admin1), country: txt(r.country), code: txt(r.country_code, 3), lat: num(r.latitude), lon: num(r.longitude) })).filter((r) => r.lat !== null && r.lon !== null);
 }
 
-// Indicative industrial electricity tariff ($/kWh) and grid carbon intensity (kgCO₂/kWh) by country.
-// These are hand-entered planning defaults — every value is editable in the economics suite. The grid-carbon
-// figure is replaced by the Our World in Data series (live, or the copy in the built-in atlas) whenever that is
-// available; the tariff stays as the indicative value because the only open global tariff series (World Bank,
-// 2019, small-business connection) is older and not an industrial rate — it is used for countries missing here.
+// Stand-by industrial electricity tariff ($/kWh) and grid carbon intensity (kgCO₂/kWh) by country: hand-entered
+// ESTIMATES, used only where no sourced figure exists and always labelled as estimates in the site data. The tariff
+// of every country with an open industrial series (Eurostat for Europe, US EIA for the United States — live, or the
+// dated snapshot in js/data/prices.js) comes from that series, so those countries carry null here. For the others
+// no open, cross-origin-readable industrial tariff series exists; the World Bank business tariff (2019, small
+// commercial connection) is used for countries missing from this table. The grid-carbon figure is replaced by the
+// Our World in Data series (live, or the copy in the built-in atlas) whenever that is available.
 // CURRENCY is a quick table for the common cases; the built-in atlas carries the full ISO 4217 list.
 const ENERGY = {
   AE: [0.08, 0.40], SA: [0.05, 0.57], QA: [0.04, 0.49], KW: [0.03, 0.57], BH: [0.07, 0.49], OM: [0.06, 0.44], IL: [0.11, 0.45], EG: [0.05, 0.43], MA: [0.10, 0.62], DZ: [0.04, 0.48], TN: [0.09, 0.47], LY: [0.03, 0.55],
-  ES: [0.13, 0.17], IT: [0.20, 0.30], GR: [0.16, 0.34], CY: [0.24, 0.60], MT: [0.15, 0.39], TR: [0.10, 0.42], PT: [0.13, 0.15], FR: [0.14, 0.06], GB: [0.24, 0.21], DE: [0.20, 0.36], NL: [0.17, 0.27],
-  US: [0.08, 0.37], MX: [0.11, 0.42], CL: [0.13, 0.30], PE: [0.08, 0.20], BR: [0.13, 0.10], AR: [0.07, 0.31], CA: [0.09, 0.12],
+  ES: [null, 0.17], IT: [null, 0.30], GR: [null, 0.34], CY: [null, 0.60], MT: [null, 0.39], TR: [null, 0.42], PT: [null, 0.15], FR: [null, 0.06], GB: [0.24, 0.21], DE: [null, 0.36], NL: [null, 0.27],
+  US: [null, 0.37], MX: [0.11, 0.42], CL: [0.13, 0.30], PE: [0.08, 0.20], BR: [0.13, 0.10], AR: [0.07, 0.31], CA: [0.09, 0.12],
   AU: [0.14, 0.55], NZ: [0.11, 0.11], CN: [0.09, 0.56], IN: [0.10, 0.71], PK: [0.14, 0.40], BD: [0.09, 0.57], SG: [0.17, 0.41], JP: [0.19, 0.46], KR: [0.11, 0.43], ID: [0.07, 0.68], MY: [0.09, 0.59], TH: [0.12, 0.47], VN: [0.08, 0.47], PH: [0.15, 0.61],
   ZA: [0.09, 0.71], NG: [0.07, 0.37], GH: [0.13, 0.30], KE: [0.16, 0.09], NA: [0.11, 0.06], TZ: [0.10, 0.34], SN: [0.17, 0.53], DJ: [0.25, 0.50], CV: [0.28, 0.55], IR: [0.02, 0.49], IQ: [0.06, 0.60], JO: [0.11, 0.39], YE: [0.15, 0.60],
 };
@@ -73,12 +81,163 @@ const CURRENCY = {
   ZA: 'ZAR', NG: 'NGN', GH: 'GHS', KE: 'KES', NA: 'NAD', TZ: 'TZS', SN: 'XOF', DJ: 'DJF', CV: 'CVE', IR: 'IRR', IQ: 'IQD', JO: 'JOD', YE: 'YER',
 };
 
-// Indicative headline tax on upstream petroleum profit (%), hand-entered planning defaults: the corporate rate plus the
-// petroleum-specific tax where one applies. Real fiscal terms depend on the licence or contract; the economics suite lets
-// every term be edited.
-const TAX = { NG: 50, AO: 50, GH: 35, EG: 40, DZ: 50, LY: 65, GQ: 35, GA: 35, CG: 35, CM: 38, CI: 25, SN: 30, MZ: 32, TZ: 30, NA: 35, ZA: 28, MR: 27, US: 21, CA: 27, MX: 30, BR: 34, AR: 35, CO: 35, GY: 25, SR: 36, TT: 55, VE: 50, EC: 25, PE: 30,
-  GB: 78, NO: 78, NL: 50, DK: 64, DE: 30, IT: 28, RO: 16, CY: 12.5, IL: 23, TR: 25, RU: 20, KZ: 20, AZ: 25, TM: 20, SA: 50, AE: 55, QA: 35, KW: 15, OM: 55, BH: 46, IQ: 35, IR: 25, CN: 25, IN: 40, ID: 40, MY: 38, BN: 55, TH: 50, VN: 32, PH: 25, AU: 58, NZ: 28, PG: 30, JP: 30, KR: 24 };
+// ---- economic feeds ------------------------------------------------------------------------------------
+// One function per open service; each returns plain numbers keyed by country or series. The connectors below
+// ask for one country, tools/prices.mjs asks for all of them to rewrite the bundled snapshot (js/data/prices.js),
+// so the live values and the offline fallback always come from the same series.
+const ym = (p) => txt(String(p ?? ''), 12).replace(/^(\d{4})-M(\d\d)$/, '$1-$2'); // "2026-M09" -> "2026-09"
+const csvRows = (csv) => { const [head, ...lines] = csv.trim().split(/\r?\n/).map((l) => l.split(',')); return lines.map((c) => Object.fromEntries(head.map((h, i) => [h.trim(), (c[i] ?? '').trim()]))); };
+const BLS_COST = 'PCU333132333132', BLS_STEEL = 'WPU1017', BLS_CPI = 'CUUR0000SA0';
+const IMF_RATES = { S13BOND_RT_PT_A_PT: 'bondYield', GSTBILY_RT_PT_A_PT: 'treasuryBillYield', MFS166_RT_PT_A_PT: 'policyRate' };
+const IMF_COMMODITIES = { PNGASEU: 'gasEurope', PNGASJP: 'gasAsia', PIORECR: 'ironOre' };
+/** Countries reported in the Eurostat non-household electricity price table (ISO-2 -> Eurostat code). */
+const EUROSTAT_GEO = Object.fromEntries('BE BG CZ DK DE EE IE ES FR HR IT CY LV LT LU HU MT NL AT PL PT RO SI SK FI SE IS LI NO BA ME MD MK GE AL RS TR UA XK'.split(' ').map((c) => [c, c]).concat([['GR', 'EL']]));
+export const SOURCE_NAMES = {
+  oecdCit: 'OECD Tax Database, combined statutory corporate income tax rate', taxFoundation: 'Tax Foundation, Worldwide Corporate Tax Rates', bls: 'US Bureau of Labor Statistics', imfPcps: 'IMF Primary Commodity Price System',
+  imfMfs: 'IMF Monetary and Financial Statistics', oecdRates: 'OECD long-term interest rates (10-year government bonds)', bis: 'BIS central-bank policy rates', eurostat: 'Eurostat, electricity prices for non-household consumers (nrg_pc_205)',
+  eia: 'US EIA, average retail price of electricity, industrial sector', owidGas: 'Our World in Data / Energy Institute Statistical Review, annual average',
+};
+export const feeds = {
+  /** US BLS public API (one request for several series): { seriesId: [[yyyy-mm, value], …] }, oldest first. */
+  async bls(ids, y0, y1) {
+    const j = await getJSON('https://api.bls.gov/publicAPI/v2/timeseries/data/', 20000, { seriesid: ids.join(','), startyear: String(y0), endyear: String(y1) });
+    if (j?.status !== 'REQUEST_SUCCEEDED') throw new Error(txt(String(j?.message?.[0] || 'Request not processed'), 90));
+    const out = {};
+    for (const s of j.Results?.series || []) out[txt(s.seriesID, 30)] = (s.data || []).filter((r) => /^M(0[1-9]|1[0-2])$/.test(r.period) && /^\d{4}$/.test(String(r.year)) && Number.isFinite(parseFloat(r.value))).map((r) => [`${r.year}-${r.period.slice(1)}`, parseFloat(r.value)]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    return out;
+  },
+  /** The same BLS series from the DBnomics mirror (complete history, refreshed less often than the BLS service itself). */
+  async blsMirror() {
+    const one = async (path) => { const j = await getJSON(`https://api.db.nomics.world/v22/series/BLS/${path}?observations=1&metadata=false`, 25000), d = j?.series?.docs?.[0] || {}; return (d.period || []).map((t, i) => [txt(String(t), 7), parseFloat(d.value?.[i])]).filter((r) => /^\d{4}-\d\d$/.test(r[0]) && Number.isFinite(r[1])); };
+    const [cost, steel, cpi] = await Promise.all([one('pc/' + BLS_COST), one('wp/' + BLS_STEEL), one('cu/' + BLS_CPI)]);
+    if (cost.length < 24) throw new Error('No index series returned');
+    return { [BLS_COST]: cost, [BLS_STEEL]: steel, [BLS_CPI]: cpi };
+  },
+  /**
+   * Twenty years of the three price indexes: { cost, steel, cpi } as [[yyyy-mm, value], …]. The key-less BLS service
+   * answers ten years per request and a limited number of requests a day, so the older decade comes from a second
+   * request or, failing that, from the mirror.
+   */
+  async indexes() {
+    const y = new Date().getUTCFullYear(), ids = [BLS_COST, BLS_STEEL, BLS_CPI];
+    const [a, b] = await Promise.allSettled([feeds.bls(ids, y - 9, y), feeds.bls(ids, y - 19, y - 10)]);
+    if (a.status !== 'fulfilled') throw a.reason;
+    const old = b.status === 'fulfilled' ? b.value : await feeds.blsMirror().catch(() => ({}));
+    const join = (id) => { const rec = a.value[id] || [], from = rec[0]?.[0] || '9999', lo = `${y - 19}-01`; return [...(old[id] || []).filter((r) => r[0] < from && r[0] >= lo), ...rec]; };
+    return { cost: join(BLS_COST), steel: join(BLS_STEEL), cpi: join(BLS_CPI) };
+  },
+  /** IMF data service (SDMX 2.1, XML): [{ country, indicator, obs: [[period, value], …] }]. */
+  async imf(flow, key, query) {
+    const xml = await getText(`https://api.imf.org/external/sdmx/2.1/data/${flow}/${key}?${query}`, 25000, 4e6), out = [];
+    const attr = (s, k) => (new RegExp(`\\s${k}="([^"]*)"`).exec(s) || [])[1] || '';
+    for (const m of xml.matchAll(/<Series(\s[^>]*[^/>])>([\s\S]*?)<\/Series>/g)) {
+      const obs = [...m[2].matchAll(/<Obs(\s[^>]*)>/g)].map((o) => [ym(attr(o[1], 'TIME_PERIOD')), parseFloat(attr(o[1], 'OBS_VALUE'))]).filter((o) => /^\d{4}(-\d\d)?$/.test(o[0]) && Number.isFinite(o[1])).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+      if (obs.length) out.push({ country: txt(attr(m[1], 'COUNTRY'), 8), indicator: txt(attr(m[1], 'INDICATOR'), 40), obs });
+    }
+    return out;
+  },
+  /** Monthly benchmark prices of the last ten years: { gasEurope, gasAsia, ironOre } as [[yyyy-mm, value], …] (US$/MMBtu, US$/MMBtu, US$/t). */
+  async commodities() {
+    const out = {};
+    for (const s of await feeds.imf('PCPS', `G001.${Object.keys(IMF_COMMODITIES).join('+')}.USD.M`, `startPeriod=${new Date().getUTCFullYear() - 10}-M01`)) if (IMF_COMMODITIES[s.indicator]) out[IMF_COMMODITIES[s.indicator]] = s.obs;
+    if (!Object.keys(out).length) throw new Error('No commodity series returned');
+    return out;
+  },
+  /** Latest government bond yield, Treasury bill yield and policy rate: { ISO3: { bondYield: [value, yyyy-mm], … } } (iso3 '' = every country). */
+  async imfRates(iso3 = '') {
+    const out = {};
+    for (const s of await feeds.imf('MFS_IR', `${iso3}.${Object.keys(IMF_RATES).join('+')}.M`, 'lastNObservations=1')) { const k = IMF_RATES[s.indicator], o = s.obs[s.obs.length - 1]; if (k && s.country && Math.abs(o[1]) < 200) (out[s.country] ??= {})[k] = [+o[1].toFixed(3), o[0]]; }
+    return out;
+  },
+  /** OECD data service, CSV rows as objects. */
+  async oecd(flow, key, query = 'lastNObservations=1') { return csvRows(await getText(`https://sdmx.oecd.org/public/rest/data/${flow}/${key}?${query}&format=csvfile`, 25000, 2e6)); },
+  /** Combined (central + sub-central) statutory corporate income tax rate: { ISO3: [rate %, year] } (iso3 '' = every jurisdiction). */
+  async corporateTax(iso3 = '') {
+    const out = {};
+    for (const r of await feeds.oecd('OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,', `${iso3}.A.CIT_C.ST.....`)) { const v = parseFloat(r.OBS_VALUE), y = parseInt(r.TIME_PERIOD, 10); if (/^[A-Z]{3}$/.test(r.REF_AREA) && v >= 0 && v <= 90 && y > 1990 && !(out[r.REF_AREA]?.[1] > y)) out[r.REF_AREA] = [v, y]; }
+    return out;
+  },
+  /** Tax Foundation table (2023 edition): [rate %, year] of one country (ISO-2) or null. */
+  async corporateTaxTF(code) {
+    const csv = await getText('https://raw.githubusercontent.com/TaxFoundation/worldwide-corporate-tax-rates/master/final_data/final_data_long.csv', 25000, 3e6); let hit = null;
+    for (const line of csv.split('\n')) { const c = line.split(',').map((x) => x.replace(/^"|"$/g, '')); const v = parseFloat(c[c.length - 7]), y = parseInt(c[c.length - 8], 10); if (c[0] === code && v >= 0 && v <= 90 && y > 1990 && !(hit?.[1] > y)) hit = [v, y]; }
+    return hit;
+  },
+  /** OECD long-term (10-year government bond) interest rate: { ISO3: [value %, yyyy-mm] }. */
+  async oecdBond(iso3 = '') {
+    const out = {};
+    for (const r of await feeds.oecd('OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0', `${iso3}.M.IRLT.PA.....`)) { const v = parseFloat(r.OBS_VALUE); if (/^[A-Z]{3}$/.test(r.REF_AREA) && /^\d{4}-\d\d$/.test(r.TIME_PERIOD) && Math.abs(v) < 200 && !(out[r.REF_AREA]?.[1] > r.TIME_PERIOD)) out[r.REF_AREA] = [+v.toFixed(3), r.TIME_PERIOD]; }
+    return out;
+  },
+  /** BIS central-bank policy rate of one country (ISO-2): [value %, yyyy-mm] or null. */
+  async bisPolicy(code) {
+    const csv = await getText(`https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/M.${encodeURIComponent(code)}?lastNObservations=1&format=csv`, 20000, 20000);
+    const m = /,(\d{4}-\d\d),(-?\d+(?:\.\d+)?),/.exec(csv.split(/\r?\n/)[1] || '');
+    return m && Math.abs(+m[2]) < 200 ? [+m[2], m[1]] : null;
+  },
+  /** Eurostat half-yearly electricity price for industry (band ID: 2 000–19 999 MWh a year, excluding VAT and other recoverable taxes), EUR/kWh: { ISO-2: [value, period] } (code '' = every reporting country). */
+  async eurostatPower(code = '') {
+    if (code && !EUROSTAT_GEO[code]) return {};
+    const j = await getJSON(`https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/nrg_pc_205?format=JSON&lang=EN&nrg_cons=MWH2000-19999&tax=X_VAT&currency=EUR&lastTimePeriod=4${code ? '&geo=' + EUROSTAT_GEO[code] : ''}`, 25000);
+    const gi = j?.dimension?.geo?.category?.index || {}, ti = j?.dimension?.time?.category?.index || {}, nt = Object.keys(ti).length, back = Object.fromEntries(Object.entries(EUROSTAT_GEO).map(([a, b]) => [b, a])), out = {};
+    if (!nt || (j.size || []).reduce((a, b) => a * b, 1) !== Object.keys(gi).length * nt) throw new Error('Unexpected table layout');
+    for (const [g, i] of Object.entries(gi)) for (const [t, k] of Object.entries(ti)) { const v = num(j.value?.[String(i * nt + k)]); if (back[g] && v !== null && v > 0 && v < 2 && !(out[back[g]]?.[1] > t)) out[back[g]] = [v, txt(t, 8)]; }
+    return out;
+  },
+  /** US average industrial retail electricity price, mean of the last twelve published months: [US$/kWh, 'yyyy-mm' of the latest month]. */
+  async eiaPower() {
+    const j = await getJSON('https://api.eia.gov/v2/electricity/retail-sales/data/?api_key=DEMO_KEY&frequency=monthly&data[0]=price&facets[sectorid][]=IND&facets[stateid][]=US&sort[0][column]=period&sort[0][direction]=desc&length=12');
+    const rows = (j?.response?.data || []).map((r) => [txt(r.period, 7), parseFloat(r.price)]).filter((r) => /^\d{4}-\d\d$/.test(r[0]) && r[1] > 0 && r[1] < 100);
+    if (rows.length < 6) throw new Error('No industrial price returned');
+    return [+(mean(rows.map((r) => r[1])) / 100).toFixed(4), rows[0][0]];
+  },
+  /** Annual average Netherlands TTF gas price (Energy Institute via Our World in Data), converted from US$/MWh: [US$/MMBtu, year]. */
+  async owidGasEurope() {
+    const csv = await getText('https://ourworldindata.org/grapher/natural-gas-prices.csv?csvType=full'); let hit = null;
+    for (const line of csv.split('\n')) { const c = line.split(','), v = parseFloat(c[c.length - 1]), y = parseInt(c[c.length - 2], 10); if (c[0] === 'Netherlands TTF' && v > 0 && y > 2000 && !(hit?.[1] > y)) hit = [+(v / 3.412142).toFixed(3), y]; }
+    return hit;
+  },
+};
 
+/** Site-data fields of the cost-escalation source from the three index series ([[yyyy-mm, value], …]); the indexes are re-based to a stated year. */
+export function costStats(cost = [], steel = [], cpi = []) {
+  const data = {}; if (cost.length < 24) return data;
+  const baseYear = +cost[cost.length - 1][0].slice(0, 4) - 9;
+  const rebase = (rows) => { const b = rows.filter((r) => +r[0].slice(0, 4) === baseYear).map((r) => r[1]); return b.length >= 6 ? rows.map((r) => [r[0], +((100 * r[1]) / mean(b)).toFixed(2)]) : null; };
+  const growth = (rows) => { const n = rows.length; return n > 60 && rows[n - 61][1] > 0 ? +(100 * ((rows[n - 1][1] / rows[n - 61][1]) ** 0.2 - 1)).toFixed(2) : null; }; // %/y over the last five years
+  const c = rebase(cost), s = rebase(steel), p = rebase(cpi), last = (rows) => rows[rows.length - 1], series = (rows) => ({ t: rows.map((r) => r[0]), v: rows.map((r) => r[1]) });
+  if (!c) return data;
+  Object.assign(data, { costIndex: last(c)[1], costIndexDate: last(c)[0], costIndexBase: `${baseYear} = 100`, costIndexName: `US producer price index, oil and gas field machinery and equipment (BLS series ${BLS_COST})`, costIndexSeries: series(c) });
+  const ce = growth(c); if (ce !== null) data.costEscalation = ce;
+  if (s) { Object.assign(data, { steelIndex: last(s)[1], steelIndexDate: last(s)[0], steelIndexBase: `${baseYear} = 100`, steelIndexName: `US producer price index, steel mill products (BLS series ${BLS_STEEL})` }); const g = growth(s); if (g !== null) data.steelEscalation = g; }
+  if (p) { Object.assign(data, { usCpi: last(p)[1], usCpiDate: last(p)[0], usCpiBase: `${baseYear} = 100`, usCpiName: `US consumer price index, all urban consumers, all items (BLS series ${BLS_CPI})`, usCpiSeries: series(p) }); const g = growth(p); if (g !== null) data.usInflation5y = g; }
+  return data;
+}
+const MARKET_INFO = {
+  gasEurope: ['gasPriceEurope', 'US$/MMBtu', 'Netherlands TTF day-ahead natural gas, monthly average'], gasAsia: ['gasPriceAsia', 'US$/MMBtu', 'LNG in Japan (Indonesian LNG import price), monthly average'],
+  ironOre: ['steelPrice', 'US$/t', 'iron ore fines 62% Fe, spot, CFR China (a proxy for steel cost, not a steel price)'],
+};
+/** Site-data fields of the regional-prices source from { gasEurope, gasAsia, ironOre } series. */
+export function marketStats(m = {}, source = SOURCE_NAMES.imfPcps) {
+  const data = {};
+  for (const [k, [key, unit, what]] of Object.entries(MARKET_INFO)) {
+    const rows = m[k]; if (!rows?.length) continue;
+    const last = rows[rows.length - 1]; if (!(last[1] > 0)) continue;
+    Object.assign(data, { [key]: +last[1].toFixed(3), [key + 'Date']: String(last[0]), [key + 'Unit']: unit, [key + 'What']: what, [key + 'Source']: source });
+    if (rows.length > 12) data[key + 'Series'] = { t: rows.map((r) => r[0]), v: rows.map((r) => +r[1].toFixed(3)) };
+  }
+  return data;
+}
+/** Benchmark gas region of a point: the Americas price off Henry Hub, Europe–Africa–Middle East off the European hub, Asia–Pacific off LNG delivered to Japan. */
+export const gasRegion = (lon) => (lon < -30 ? 'americas' : lon < 60 ? 'europe' : 'asia');
+const freshMonth = (p, months = 36) => { const t = Date.parse(String(p).length === 4 ? p + '-12-01' : p + '-01'); return Number.isFinite(t) && Date.now() - t < months * 30.5 * 24 * 3600e3; };
+/** Interest-rate fields from { bondYield: [v, period], treasuryBillYield, policyRate }; observations older than three years are ignored. */
+function rateFields(r = {}, source) {
+  const data = {};
+  for (const k of ['bondYield', 'treasuryBillYield', 'policyRate']) if (r[k] && Number.isFinite(r[k][0]) && freshMonth(r[k][1])) { data[k] = r[k][0]; data[k + 'Date'] = String(r[k][1]); data[k + 'Source'] = source; }
+  return data;
+}
+const POWER_BASIS = { eurostat: 'industrial consumers using 2 000–19 999 MWh a year, excluding VAT and other recoverable taxes', eia: 'average revenue per kWh sold to industrial customers, mean of twelve months' };
 const connectors = {
   async place(lat, lon) {
     const j = await getJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
@@ -86,9 +245,9 @@ const connectors = {
     if (!code) { // open sea: the nearest country (from the bundled outlines) supplies the national context — prices, tax, currency
       try { const p = await (await loadAtlas()).atlasPlace(lat, lon); if (p?.countryCode) { code = p.countryCode; country = p.country; offshoreKm = p.offshoreKm ?? null; } } catch { /* stays without a country */ }
     }
-    const e = ENERGY[code];
+    const e = ENERGY[code]; // the tariff and the tax rate are no longer taken from hand-entered tables here: see the power and fiscal sources
     return { meta: { name: txt(j.city || j.locality || j.principalSubdivision || ''), country, countryCode: code, ...(offshoreKm ? { offshoreKm } : {}) },
-      data: { ...(e ? { electricityPrice: e[0], gridCarbon: e[1] } : {}), currency: CURRENCY[code] || 'USD', ...(TAX[code] ? { taxRate: TAX[code] } : {}) } };
+      data: { ...(e ? { gridCarbon: e[1] } : {}), currency: CURRENCY[code] || 'USD' } };
   },
   async weather(lat, lon) {
     const j = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,shortwave_radiation&daily=shortwave_radiation_sum,temperature_2m_max,temperature_2m_min&hourly=soil_temperature_54cm&wind_speed_unit=ms&past_days=7&forecast_days=7&timezone=GMT`);
@@ -211,13 +370,67 @@ const connectors = {
     if (rate === null) throw new Error('Currency not listed');
     return { data: { currency: cur, fxPerUSD: rate, fxDate: txt(j.time_last_update_utc, 40) } };
   },
+  async fiscal(lat, lon, site) {
+    const code = site.countryCode, iso3 = site.data?.iso3 || ISO3[code];
+    if (!code) throw new Error('Country unknown');
+    let hit = null, source = SOURCE_NAMES.oecdCit;
+    try { if (iso3) hit = (await feeds.corporateTax(iso3))[iso3] || null; } catch { /* the second table is tried below */ }
+    if (!hit) { hit = await feeds.corporateTaxTF(code); source = SOURCE_NAMES.taxFoundation; }
+    if (!hit) throw new Error('Country not listed');
+    if (source === SOURCE_NAMES.taxFoundation && CORPORATE_TAX.rows[code]?.[1] > hit[1]) throw new Error('OECD table not reachable; the bundled copy is newer than the second source'); // the dated snapshot then stands in
+    return { data: { corporateTaxRate: hit[0], corporateTaxYear: String(hit[1]), corporateTaxSource: source } };
+  },
+  async costs() {
+    let x, source = SOURCE_NAMES.bls;
+    try { x = await feeds.indexes(); }
+    catch (e) { // daily request limit of the key-less service reached, or unreachable: the mirror, unless the bundled snapshot is newer
+      const m = await feeds.blsMirror().catch(() => null), lo = `${new Date().getUTCFullYear() - 19}-01`, cut = (id) => (m[id] || []).filter((r) => r[0] >= lo), end = (rows) => rows?.[rows.length - 1]?.[0] || '';
+      if (!m || end(m[BLS_COST]) < end(COSTS.cost)) throw e;
+      x = { cost: cut(BLS_COST), steel: cut(BLS_STEEL), cpi: cut(BLS_CPI) }; source = SOURCE_NAMES.bls + ' (DBnomics mirror)';
+    }
+    const data = costStats(x.cost, x.steel, x.cpi);
+    if (data.costIndex == null) throw new Error('No index series returned');
+    return { data: { ...data, costIndexSource: source } };
+  },
+  async markets() {
+    let data = {};
+    try { data = marketStats(await feeds.commodities()); } catch { /* the annual series below still gives the European price */ }
+    if (data.gasPriceEurope == null) { const g = await feeds.owidGasEurope(); if (g) Object.assign(data, { gasPriceEurope: g[0], gasPriceEuropeDate: String(g[1]), gasPriceEuropeUnit: 'US$/MMBtu', gasPriceEuropeWhat: 'Netherlands TTF natural gas, annual average', gasPriceEuropeSource: SOURCE_NAMES.owidGas }); }
+    if (!Object.keys(data).length) throw new Error('No price series reachable');
+    return { data };
+  },
+  async rates(lat, lon, site) {
+    const code = site.countryCode, iso3 = site.data?.iso3 || ISO3[code];
+    if (!code) throw new Error('Country unknown');
+    let data = {};
+    try { if (iso3) data = rateFields((await feeds.imfRates(iso3))[iso3], SOURCE_NAMES.imfMfs); } catch { /* fallbacks below */ }
+    const [b, p] = await Promise.allSettled([data.bondYield == null && iso3 ? feeds.oecdBond(iso3) : null, data.policyRate == null ? feeds.bisPolicy(code) : null]);
+    if (b.status === 'fulfilled' && b.value?.[iso3]) data = { ...rateFields({ bondYield: b.value[iso3] }, SOURCE_NAMES.oecdRates), ...data };
+    if (p.status === 'fulfilled' && p.value) data = { ...rateFields({ policyRate: p.value }, SOURCE_NAMES.bis), ...data };
+    if (!Object.keys(data).length) throw new Error('No interest rates published for this country');
+    return { data };
+  },
+  async power(lat, lon, site) {
+    const code = site.countryCode;
+    if (!code) throw new Error('Country unknown');
+    if (code === 'US') { const r = await feeds.eiaPower(); return { data: { electricityPrice: r[0], electricityPriceDate: r[1], electricityPriceSource: SOURCE_NAMES.eia, electricityPriceBasis: POWER_BASIS.eia } }; }
+    if (!EUROSTAT_GEO[code]) throw new Error('No open industrial tariff series for this country');
+    const r = (await feeds.eurostatPower(code))[code];
+    if (!r) throw new Error('No price published for this country');
+    let eur = null; // euro per US dollar: today's rate, or the one bundled with the snapshot
+    try { eur = num((await getJSON('https://open.er-api.com/v6/latest/USD'))?.rates?.EUR); } catch { /* bundled rate */ }
+    if (!(eur > 0.3 && eur < 3)) eur = ELECTRICITY.eurPerUSD;
+    return { data: { electricityPrice: +(r[0] / eur).toFixed(4), electricityPriceDate: r[1], electricityPriceEUR: r[0], electricityPriceSource: SOURCE_NAMES.eurostat, electricityPriceBasis: POWER_BASIS.eurostat } };
+  },
 };
+/** One live source, straight from the network (no device cache, no atlas): { data, meta? }. Used by the tests and tools. */
+export const fetchSource = (id, lat, lon, site = {}) => connectors[id](lat, lon, { data: {}, ...site });
 
 // ---- response cache ---------------------------------------------------------------------------------
 // Slow-changing answers (relief, climatologies, national indicators) are kept on the device so that a
 // repeat fetch of the same place is instant; fast-changing ones (weather, sea state) are kept briefly.
 const CACHE_KEY = 'hydraslug.live.v1', H = 3600e3;
-const TTL = { place: 30 * 24 * H, weather: 0.5 * H, marine: 0.5 * H, bathy: 90 * 24 * H, salinity: 90 * 24 * H, economy: 7 * 24 * H, fx: 12 * H, energy: 7 * 24 * H, climate: 90 * 24 * H, prices: 6 * H };
+const TTL = { place: 30 * 24 * H, weather: 0.5 * H, marine: 0.5 * H, bathy: 90 * 24 * H, salinity: 90 * 24 * H, economy: 7 * 24 * H, fx: 12 * H, energy: 7 * 24 * H, climate: 90 * 24 * H, prices: 6 * H, fiscal: 30 * 24 * H, costs: 7 * 24 * H, markets: 24 * H, rates: 7 * 24 * H, power: 30 * 24 * H };
 let memCache = null;
 function cacheAll() {
   if (memCache) return memCache;
@@ -234,7 +447,9 @@ function cachePut(key, v) {
 }
 /** Cache key of a connector: grid-cell for site data, country for national data. */
 function keyOf(id, lat, lon, site) {
-  if (id === 'economy' || id === 'energy') return site.countryCode ? `${id}:${site.countryCode}` : null;
+  if (id === 'economy' || id === 'energy' || id === 'fiscal' || id === 'rates' || id === 'power') return site.countryCode ? `${id}:${site.countryCode}` : null;
+  if (id === 'costs' || id === 'markets') return `${id}:world`;
+  if (id === 'place') return `place2:${Math.round(lat * 100)}:${Math.round(lon * 100)}`; // answers stored by earlier builds carried hand-entered tariff and tax figures
   if (id === 'fx') return `fx:${site.data?.currency || site.countryCode || 'USD'}`;
   if (id === 'prices') return 'prices:world';
   const r = id === 'salinity' ? 4 : id === 'climate' ? 2 : id === 'bathy' ? 250 : id === 'place' ? 100 : 20; // cells per degree
@@ -254,6 +469,7 @@ const ATLAS_SOURCE = {
   place: ['nations', ['country']], economy: ['nations', ['inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'renewableElectricity', 'electricityPriceWB', 'freshwaterPerCapita', 'safeWaterAccess']],
   fx: ['fx', ['fxPerUSD']], energy: ['nations', ['gridCarbon', 'renewableShare']], weather: ['climate', ['airTemp', 'windSpeed', 'ghiDaily', 'elevation']],
   marine: ['coast', ['tideRange', 'waveHeight', 'currentSpeed', 'tide', 'sst']], bathy: ['relief', ['bathy', 'depth']], salinity: ['ocean', ['salinity', 'salinityMonthly']], climate: ['climate', ['ghiAnnual', 'windAnnual', 'airTempAnnual']], prices: ['prices', ['oilPrice', 'gasPrice']],
+  fiscal: ['fiscal', ['corporateTaxRate']], costs: ['costs', ['costIndex']], markets: ['markets', ['gasPriceEurope', 'gasPriceAsia', 'steelPrice']], rates: ['rates', ['bondYield', 'policyRate', 'treasuryBillYield']], power: ['power', ['electricityPrice']],
 };
 /** Plain-language name of every site-data field the atlas can supply (used for labels and the notice on the site page). */
 export const ATLAS_LABELS = {
@@ -263,6 +479,8 @@ export const ATLAS_LABELS = {
   tideRange: 'tidal range', tide: 'tide series', currentSpeed: 'mean current', currentMax: 'peak current', currentDir: 'current direction', waveHeight: 'wave height', wavePeriod: 'wave period', waveDir: 'wave direction',
   oilPrice: 'oil price', oilPriceWTI: 'WTI oil price', gasPrice: 'gas price', seabedTemp: 'seabed temperature', tempProfile: 'sea temperature profile',
   ghiAnnual: 'solar resource', ghiDaily: 'solar resource', windAnnual: 'long-term wind', airTempAnnual: 'long-term air temperature', airTemp: 'air temperature', windSpeed: 'wind speed',
+  corporateTaxRate: 'corporate tax rate', taxRate: 'tax rate', costIndex: 'equipment cost index', costEscalation: 'cost escalation', steelIndex: 'steel price index', usCpi: 'US consumer price index', usInflation5y: 'US inflation (5-year)',
+  gasPriceEurope: 'European gas price', gasPriceAsia: 'Asian LNG price', gasPriceRegional: 'regional gas price', steelPrice: 'iron ore price', bondYield: 'government bond yield', treasuryBillYield: 'Treasury bill yield', policyRate: 'central-bank policy rate',
 };
 const month = () => new Date().getUTCMonth();
 
@@ -290,7 +508,7 @@ export async function atlasFill(site, status = {}, ctx = {}) {
       if (!site.countryCode) return;
       const eco = ['inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'renewableElectricity', 'freshwaterPerCapita', 'safeWaterAccess', 'electricityPriceWB'];
       const wantEco = ready('economy') && missing(...eco), wantEn = ready('energy') && (!d.gridCarbonLive || missing('renewableShare')), wantFx = ready('fx') && missing('fxPerUSD');
-      if (!wantEco && !wantEn && !wantFx && !missing('currency', 'electricityPrice')) return;
+      if (!wantEco && !wantEn && !wantFx && !missing('currency')) return;
       const n = await A.atlasNational(site.countryCode);
       if (!n) return;
       if (!site.country) site.country = n.countryName;
@@ -302,8 +520,7 @@ export async function atlasFill(site, status = {}, ctx = {}) {
       }
       if (wantFx) { const r = d.currency === n.currency ? n : await A.atlasRate(d.currency); if (r?.fxPerUSD > 0) { put('fx', 'fxPerUSD', r.fxPerUSD); if (mark.has('fxPerUSD')) d.fxDate = r.fxDate; } }
       const e = ENERGY[site.countryCode];
-      if (e) { put('nations', 'electricityPrice', e[0], 'indicative industrial tariff (hand-entered planning default)'); if (ready('energy') && d.gridCarbon == null) put('nations', 'gridCarbon', e[1], 'indicative planning default'); }
-      else if (ready('economy') && mark.has('electricityPriceWB')) put('nations', 'electricityPrice', d.electricityPriceWB, `World Bank business tariff, ${d.electricityPriceWBYear}`);
+      if (e && ready('energy') && d.gridCarbon == null) put('nations', 'gridCarbon', e[1], 'estimate: hand-entered planning default');
     });
     await part(async () => { // sea-surface salinity and temperature
       const wantS = ready('salinity') && missing('salinity', 'salinityMonthly', 'sstMonthly'), wantT = ready('salinity', 'marine') && missing('sst');
@@ -358,6 +575,33 @@ export async function atlasFill(site, status = {}, ctx = {}) {
     put('prices', 'oilPriceWTI', PRICES.wti, note); put('prices', 'gasPrice', PRICES.henryHub, note); if (mark.has('gasPrice')) d.gasPriceDate = PRICES.date;
     vintage.prices = PRICES.date;
   }
+  // ---- dated snapshot bundled with the build (js/data/prices.js, rewritten by tools/prices.mjs from the live series) ----
+  const code = site.countryCode, tag = (k) => mark.has(k);
+  if (ready('costs') && missing('costIndex')) {
+    const c = costStats(COSTS.cost, COSTS.steel, COSTS.cpi), note = `index of ${c.costIndexDate}, snapshot of ${COSTS.retrieved} bundled with this build`;
+    put('costs', 'costIndex', c.costIndex, note);
+    if (tag('costIndex')) { for (const k of ['costIndexDate', 'costIndexBase', 'costIndexName', 'costIndexSeries']) d[k] = c[k]; d.costIndexSource = SOURCE_NAMES.bls; put('costs', 'costEscalation', c.costEscalation, `five years to ${c.costIndexDate}`); vintage.costs = COSTS.retrieved; }
+    put('costs', 'steelIndex', c.steelIndex, note); if (tag('steelIndex')) for (const k of ['steelIndexDate', 'steelIndexBase', 'steelIndexName', 'steelEscalation']) d[k] = c[k];
+    put('costs', 'usCpi', c.usCpi, note); if (tag('usCpi')) { for (const k of ['usCpiDate', 'usCpiBase', 'usCpiName', 'usCpiSeries']) d[k] = c[k]; put('costs', 'usInflation5y', c.usInflation5y, `five years to ${c.usCpiDate}`); }
+  }
+  if (ready('markets') && missing('gasPriceEurope', 'gasPriceAsia', 'steelPrice')) {
+    const m = marketStats(Object.fromEntries(Object.entries(MARKETS.rows).map(([k, v]) => [k, [[v[1], v[0]]]])));
+    for (const key of ['gasPriceEurope', 'gasPriceAsia', 'steelPrice']) { put('markets', key, m[key], `monthly average of ${m[key + 'Date']}, bundled with this build`); if (tag(key)) { for (const x of ['Date', 'Unit', 'What', 'Source']) d[key + x] = m[key + x]; delete d[key + 'Series']; vintage.markets = MARKETS.retrieved; } }
+  }
+  if (code && ready('place', 'fiscal') && missing('corporateTaxRate')) {
+    const r = CORPORATE_TAX.rows[code];
+    if (r) { put('fiscal', 'corporateTaxRate', r[0], `statutory rate of ${r[1]}, snapshot of ${CORPORATE_TAX.retrieved} bundled with this build`); if (tag('corporateTaxRate')) { d.corporateTaxYear = String(r[1]); d.corporateTaxSource = SOURCE_NAMES.oecdCit; vintage.fiscal = CORPORATE_TAX.retrieved; } }
+  }
+  if (code && ready('place', 'rates') && missing('bondYield', 'policyRate', 'treasuryBillYield')) {
+    const r = rateFields(RATES.rows[code], SOURCE_NAMES.imfMfs);
+    for (const k of ['bondYield', 'treasuryBillYield', 'policyRate']) { put('rates', k, r[k], `value of ${r[k + 'Date']}, bundled with this build`); if (tag(k)) { d[k + 'Date'] = r[k + 'Date']; d[k + 'Source'] = r[k + 'Source']; vintage.rates = RATES.retrieved; } }
+  }
+  if (code && ready('place', 'power') && (d.electricityPrice == null || mark.has('electricityPrice'))) { // sourced snapshot, then the hand-entered estimate, then the World Bank business tariff
+    const r = ELECTRICITY.rows[code], e = ENERGY[code], src = (date, source, basis) => { if (date) d.electricityPriceDate = date; else delete d.electricityPriceDate; d.electricityPriceSource = source; d.electricityPriceBasis = basis; delete d.electricityPriceEUR; };
+    if (r) { put('power', 'electricityPrice', r[0], `industrial price of ${r[1]}, snapshot of ${ELECTRICITY.retrieved} bundled with this build`); if (mark.get('electricityPrice') === 'power') { src(r[1], code === 'US' ? SOURCE_NAMES.eia : SOURCE_NAMES.eurostat, code === 'US' ? POWER_BASIS.eia : POWER_BASIS.eurostat); vintage.power = ELECTRICITY.retrieved; } }
+    else if (e && e[0] != null) { put('estimate', 'electricityPrice', e[0], 'ESTIMATE: hand-entered planning default — no open industrial tariff series exists for this country'); if (mark.get('electricityPrice') === 'estimate') src('', 'estimate (hand-entered planning default)', 'indicative industrial tariff'); }
+    else if (ready('economy') && d.electricityPriceWB != null) { put(mark.has('electricityPriceWB') ? 'nations' : 'derived', 'electricityPrice', d.electricityPriceWB, `World Bank business tariff of ${d.electricityPriceWBYear} (small commercial connection, not an industrial rate)`); src(String(d.electricityPriceWBYear || ''), 'World Bank, Doing Business: price of electricity', 'small commercial connection, not an industrial rate'); }
+  }
   // last resort (also when the atlas modules are unavailable): the small table shipped with the core
   if (ready('salinity') && d.salinity == null) {
     const at = A ? null : atlasSite(lat, lon), reg = regionalSalinity(lat, lon), enclosed = reg !== 35.5 && reg !== 34.3;
@@ -368,11 +612,11 @@ export async function atlasFill(site, status = {}, ctx = {}) {
   if (ready('climate', 'weather') && d.ghiAnnual == null && d.ghiDaily == null) put('core', 'ghiDaily', solarEstimate(lat), 'estimate from latitude');
   // dates of the bundled data, and the per-source status
   const sets = new Set(mark.values());
-  if (A) for (const s of sets) if (s !== 'core' && s !== 'derived' && vintage[s] === undefined) Object.assign(vintage, await A.atlasVintage([s === 'fx' ? 'nations' : s]).catch(() => ({})));
+  if (A) for (const s of sets) if (s !== 'core' && s !== 'derived' && s !== 'estimate' && vintage[s] === undefined) Object.assign(vintage, await A.atlasVintage([s === 'fx' ? 'nations' : s]).catch(() => ({})));
   for (const k of [...mark.keys()]) if (mark.get(k) === 'derived') mark.delete(k); // computed from live climatology: not atlas data
   for (const [id, [set, keys]] of Object.entries(ATLAS_SOURCE)) {
     const st = status[id];
-    if (!st || st.ok || st.atlas || !keys.some((k) => mark.has(k))) continue;
+    if (!st || st.ok || st.atlas || !keys.some((k) => mark.has(k) && mark.get(k) !== 'estimate')) continue;
     status[id] = { ok: false, atlas: true, message: `built-in atlas (${vintage[set] || vintage.nations || 'bundled'})`, reason: st.message, at: st.at };
     ctx.onStatus?.(id, 'atlas', status[id].message);
   }
@@ -452,7 +696,17 @@ export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}
     const d = site.data, mk = ctx.mark, derive = (k, from, v) => { d[k] = v; if (mk.has(from)) mk.set(k, mk.get(from)); else mk.delete(k); };
     if (d.sst == null && d.sstMonthly && d.sstMonthly[month()]) derive('sst', 'sstMonthly', d.sstMonthly[month()]);
     if (d.ghiAnnual != null && (d.ghiDaily == null || mk.has('ghiDaily') || !mk.has('ghiAnnual'))) derive('ghiDaily', 'ghiAnnual', d.ghiAnnual); // the long-term mean is the better design basis than this week's weather
-    if (d.electricityPrice == null && d.electricityPriceWB != null) derive('electricityPrice', 'electricityPriceWB', d.electricityPriceWB);
+    // Headline tax rate: the sourced petroleum fiscal table bundled with the app, else the statutory corporate income tax rate.
+    const f = fiscalOf(site.countryCode);
+    if (f) {
+      for (const [k, v] of [['fiscalRegime', f.regime], ['royaltyRate', f.royalty], ['petroleumTaxRate', f.petroleumTax], ['upstreamCorporateTax', f.corporateTax], ['marginalTake', f.marginalTake], ['fiscalNote', f.note], ['fiscalYear', String(f.year)], ['fiscalSource', f.source.citation + (f.source2 ? '; ' + f.source2.citation : '')], ['fiscalUrl', f.source.url]]) if (v != null && v !== '') d[k] = v;
+    }
+    if (f && f.headline != null) { d.taxRate = f.headline; d.taxRateYear = String(f.year); d.taxRateSource = f.source.citation; d.taxRateBasis = f.basis; mk.delete('taxRate'); }
+    else if (d.corporateTaxRate != null) { d.taxRate = d.corporateTaxRate; mk.delete('taxRate'); d.taxRateYear = d.corporateTaxYear; d.taxRateSource = d.corporateTaxSource; d.taxRateBasis = 'statutory corporate income tax (no petroleum-specific rate on file for this country)' + (mk.has('corporateTaxRate') ? ', from the snapshot bundled with this build' : ''); }
+    else if (d.taxRate != null && !d.taxRateSource) delete d.taxRate; // a figure stored by an earlier build, without a source
+    // Regional gas benchmark nearest the site.
+    const reg = gasRegion(site.lon), gk = reg === 'americas' ? 'gasPrice' : reg === 'europe' ? 'gasPriceEurope' : 'gasPriceAsia';
+    if (d[gk] != null) { derive('gasPriceRegional', gk, d[gk]); d.gasPriceRegionalDate = d[gk + 'Date']; d.gasPriceRegionalName = reg === 'americas' ? 'US Henry Hub' : reg === 'europe' ? 'Europe (Netherlands TTF)' : 'Asia (LNG delivered to Japan)'; }
     if (d.bathy && d.bathy.elev?.length > 4) { // seabed / ground slope at the site from the relief grid (central differences over about 1 km)
       const b = d.bathy, n = b.lat.length, m = b.lon.length, i = Math.floor(n / 2), j = Math.floor(m / 2), k = Math.max(1, Math.round(n / 28));
       const dy = (b.lat[i + k] - b.lat[i - k]) * 110540, dx = (b.lon[j + k] - b.lon[j - k]) * 111320 * Math.cos((site.lat * Math.PI) / 180);
@@ -477,8 +731,8 @@ export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}
     await atlasFill(site, status, ctx); finish(); await deep();
     return snapshot();
   }
-  const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy'))])); // these need the country
-  await Promise.all([national, run('prices'), ...['weather', 'marine', 'salinity', 'climate'].map(run), run('bathy').then(deep).then(() => onData(snapshot()))]);
+  const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy')), run('fiscal'), run('rates'), run('power')])); // these need the country
+  await Promise.all([national, run('prices'), run('costs'), run('markets'), ...['weather', 'marine', 'salinity', 'climate'].map(run), run('bathy').then(deep).then(() => onData(snapshot()))]);
   await atlasFill(site, status, ctx); finish(); await deep();
   return snapshot();
 }

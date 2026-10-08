@@ -4,7 +4,7 @@
 const VERSION = '__VERSION__';
 const SHELL = 'hydraslug-shell-' + VERSION, DATA = 'hydraslug-data-v1', TILES = 'hydraslug-tiles-v1';
 const FILES = __FILES__;
-const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org', 'raw.githubusercontent.com', 'api.eia.gov'];
+const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org', 'raw.githubusercontent.com', 'api.eia.gov', 'sdmx.oecd.org', 'api.bls.gov', 'api.imf.org', 'ec.europa.eu', 'stats.bis.org', 'api.db.nomics.world'];
 
 const tell = async (msg) => { for (const c of await self.clients.matchAll({ includeUncontrolled: true })) c.postMessage(msg); };
 

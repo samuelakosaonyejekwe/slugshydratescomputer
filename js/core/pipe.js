@@ -3,7 +3,9 @@
 // drift flux, mechanistic stratified / slug unit cell), slug closures, severe-slugging criteria, sea-temperature
 // profile and a steady-state marching solver for pressure and temperature along an elevation profile.
 // SI units throughout except pressure in bara and temperature in °C at the interface of marchSteady.
+// Where each constant set was checked against an openly readable source is listed in PROVENANCE of js/suites/s03_flow.js.
 import { clamp, brent, interp1 } from './num.js';
+import { density as swDensity, viscosity as swViscosity, cp as swCp, conductivityThermal as swConductivity } from './props.js';
 
 export const G = 9.80665;
 
@@ -32,12 +34,25 @@ export function hInside(Re, Pr, k, D) {
   const f = frictionFactor(Re, 0, 'haaland'), Nu = ((f / 8) * (Re - 1000) * Pr) / (1 + 12.7 * Math.sqrt(f / 8) * (Pr ** (2 / 3) - 1));
   return (Math.max(Nu, 3.66) * k) / D;
 }
-/** Outside film coefficient for cross-flow over a cylinder (Churchill–Bernstein). medium: 'seawater' | 'air'. */
-export function hOutside(v, Do, medium = 'seawater', T = 4) {
-  const p = medium === 'air' ? { rho: 1.2, mu: 1.8e-5, k: 0.026, Pr: 0.71 } : { rho: 1027, mu: 1.9e-3 * Math.exp(-0.027 * T) + 3.5e-4, k: 0.57, Pr: 13.4 * Math.exp(-0.027 * T) + 2 };
-  const Re = Math.max((p.rho * Math.max(v, 0.01) * Do) / p.mu, 1), Nu = 0.3 + ((0.62 * Math.sqrt(Re) * p.Pr ** (1 / 3)) / (1 + (0.4 / p.Pr) ** (2 / 3)) ** 0.25) * (1 + (Re / 282000) ** 0.625) ** 0.8;
-  return (Nu * p.k) / Do;
+/**
+ * Outside film coefficient (W/m²/K) of a cylinder in cross-flow (Churchill & Bernstein, 1977). medium: 'seawater' | 'air';
+ * T = ambient temperature (°C). Seawater properties from core/props.js at 35 g/kg (Sharqawy et al.); air at 1 atm, 20 °C.
+ * With dT (surface minus ambient temperature, K) the free convection of a horizontal cylinder (Churchill & Chu, 1975) is
+ * combined with the forced convection as Nu³ = Nu_forced³ + Nu_free³; dT = 0 (default) gives forced convection alone.
+ */
+export function hOutside(v, Do, medium = 'seawater', T = 4, dT = 0) {
+  let p;
+  if (medium === 'air') p = { rho: 1.2, mu: 1.8e-5, k: 0.026, Pr: 0.71, beta: 1 / (T + 273.15) };
+  else { const rho = swDensity(T, 35), mu = swViscosity(T, 35), k = swConductivity(T, 35); p = { rho, mu, k, Pr: (swCp(T, 35) * mu) / k, beta: Math.max((swDensity(T - 0.5, 35) - swDensity(T + 0.5, 35)) / rho, 1e-6) }; }
+  const NuF = nuCrossFlow(Math.max((p.rho * Math.max(v, 0.01) * Do) / p.mu, 1), p.Pr);
+  if (!(Math.abs(dT) > 0)) return (NuF * p.k) / Do;
+  const NuN = nuFreeCylinder(((G * p.beta * Math.abs(dT) * Do ** 3 * p.rho * p.rho) / (p.mu * p.mu)) * p.Pr, p.Pr);
+  return (Math.cbrt(NuF ** 3 + NuN ** 3) * p.k) / Do;
 }
+/** Nusselt number of a cylinder in cross-flow (Churchill & Bernstein, 1977). */
+export const nuCrossFlow = (Re, Pr) => 0.3 + ((0.62 * Math.sqrt(Re) * Pr ** (1 / 3)) / (1 + (0.4 / Pr) ** (2 / 3)) ** 0.25) * (1 + (Re / 282000) ** 0.625) ** 0.8;
+/** Nusselt number of free convection around a horizontal cylinder (Churchill & Chu, 1975); Ra = Gr Pr on the diameter. */
+export const nuFreeCylinder = (Ra, Pr) => (0.6 + (0.387 * Ra ** (1 / 6)) / (1 + (0.559 / Pr) ** (9 / 16)) ** (8 / 27)) ** 2;
 /**
  * Overall heat-transfer coefficient referred to the inner diameter (W/m²/K).
  * { id, wt, kWall, layers: [{ t (m), k (W/m/K) }], hIn, hOut, burial: { depth (m to pipe centre), kSoil } | null }
@@ -93,7 +108,7 @@ export function flowPattern({ vsl, vsg, rhoL, rhoG, muL, muG, sigma = 0.02, D, t
     const vDB = 4 * ((D ** 0.429 * (sigma / rhoL) ** 0.089) / (muL / rhoL) ** 0.072) * ((G * dRho) / rhoL) ** 0.446;
     if (vm >= vDB && vsg / vm < 0.52) return { pattern: 'dispersed bubble' };
     const vBub = 1.53 * ((G * sigma * dRho) / (rhoL * rhoL)) ** 0.25;
-    if (D > 19 * Math.sqrt((sigma * dRho) / (rhoL * rhoL * G)) && vsg < (vsl + 1.15 * vBub * Math.sin(theta)) / 3) return { pattern: 'bubble' };
+    if (D > 19 * Math.sqrt((sigma * dRho) / (rhoL * rhoL * G)) && vsg < (vsl + 0.75 * vBub * Math.sin(theta)) / 3) return { pattern: 'bubble' }; // α = 0.25: vsl = 3 vsg − 0.75 v∞ sinθ (0.75 × 1.53 = 1.15)
     return { pattern: vsg > 0.6 * vAnn ? 'churn' : 'slug' };
   }
   const st = stratifiedLevel({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta }), g = st.geom, cosT = Math.max(Math.cos(theta), 0.02);
@@ -131,18 +146,23 @@ export function slugLength(D, vm = 3, model = 'scott') {
   return D < 0.1 ? 32 * D : Math.max(32 * D, Math.exp(-26.6 + 28.5 * (Math.log(D) + 3.67) ** 0.1)); // D and length in metres
 }
 /**
- * Hydrodynamic slug unit-cell summary at one location.
- * Returns { vt, C0, vd, holdupSlug, holdupFilm, holdup (unit average), freq (1/s), length (m, developed-slug correlation), lengthFromFreq (m, consistent with freq), lengthMax, unitLength, slugFraction, volume (m³ liquid per slug), period (s) }.
+ * Hydrodynamic slug unit-cell summary at one location. The unit cell obeys freq × unitLength = vt and length = slugFraction × unitLength,
+ * so only one of slug length and slug frequency can come from a correlation; the other is derived:
+ *   basis 'length' (default): the developed-slug length correlation (lengthModel) is kept and freq = slugFraction · vt / length;
+ *   basis 'frequency': the frequency correlation (freqModel) is kept and length = slugFraction · vt / freq.
+ * The value of the correlation that was not used is still reported (freqCorrelation, lengthCorrelation) for comparison.
+ * Returns { vt, C0, vd, holdupSlug, holdupFilm, holdup (unit average), freq (1/s), period (s), length (m), lengthFromFreq (= length, kept for older callers),
+ *           lengthMax (1-in-1000 slug of a log-normal distribution, σ = 0.5), unitLength, slugFraction, volume (m³ liquid per slug), freqCorrelation, lengthCorrelation, basis }.
  */
-export function slugUnit({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, freqModel = 'zabaras', lengthModel = 'scott' }) {
+export function slugUnit({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, freqModel = 'zabaras', lengthModel = 'scott', basis = 'length', sigma = 0.02 }) {
   const vm = vsl + vsg, A = (Math.PI * D * D) / 4, { vt, C0, vd } = slugVelocity(vm, D, theta), HLS = slugBodyHoldup(vm);
-  const vGb = 1.2 * vm + 1.53 * ((G * 0.02 * Math.max(rhoL - rhoG, 1)) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * Math.sin(Math.max(theta, 0));
+  const vGb = 1.2 * vm + 1.53 * ((G * sigma * Math.max(rhoL - rhoG, 1)) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * Math.sin(Math.max(theta, 0));
   const holdup = clamp((vt * HLS + vGb * (1 - HLS) - vsg) / vt, vsl / Math.max(vm, 1e-9), 1);
   let HLF = clamp(stratifiedLevel({ vsl: Math.max(vsl * 0.3, 1e-4), vsg, rhoL, rhoG, muL, muG, D, theta: Math.min(theta, 0.15) }).holdup, 0.01, 0.9 * HLS);
   HLF = Math.min(HLF, holdup * 0.98);
-  const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), length = slugLength(D, vm, lengthModel);
-  const fModel = slugFrequency(vsl, vm, D, theta, freqModel), unitLength = length / beta, freq = fModel > 0 ? fModel : vt / unitLength;
-  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, freq, length, lengthFromFreq: freq > 0 ? (beta * vt) / freq : length, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength, slugFraction: beta, volume: length * A * HLS, period: freq > 0 ? 1 / freq : Infinity };
+  const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), lengthCorrelation = slugLength(D, vm, lengthModel), freqCorrelation = slugFrequency(vsl, vm, D, theta, freqModel);
+  const useF = basis === 'frequency' && freqCorrelation > 0, length = useF ? (beta * vt) / freqCorrelation : lengthCorrelation, freq = useF ? freqCorrelation : (beta * vt) / length;
+  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, freq, length, lengthFromFreq: length, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength: length / beta, slugFraction: beta, volume: length * A * HLS, period: freq > 0 ? 1 / freq : Infinity, freqCorrelation, lengthCorrelation, basis: useF ? 'frequency' : 'length' };
 }
 /**
  * Severe (riser-induced) slugging screening. Bøe criterion and the Pots number.
@@ -173,7 +193,7 @@ function beggsBrill(p) {
     else if (r === 'intermittent') C = (1 - lam) * Math.log(2.96 * lam ** 0.305 * NLv ** -0.4473 * Fr ** 0.0978);
     C = Math.max(C, 0);
     const a18 = 1.8 * theta, psi = 1 + C * (Math.sin(a18) - Math.sin(a18) ** 3 / 3);
-    return clamp(H0 * psi * (up ? 0.924 : 0.685), up ? lam : 1e-4, 1); // Payne et al. corrections
+    return clamp(H0 * psi * (theta > 0 ? 0.924 : theta < 0 ? 0.685 : 1), up ? lam : 1e-4, 1); // Payne et al. (1979) factors for uphill and downhill flow; the horizontal correlation is not rescaled
   };
   let holdup;
   if (reg === 'transition') { const Aw = (L3 - Fr) / (L3 - L2); holdup = Aw * HL('segregated') + (1 - Aw) * HL('intermittent'); } else holdup = HL(reg);
@@ -212,6 +232,8 @@ function mechanistic(p) {
  * Two-phase holdup and pressure gradient at one location.
  * p: { vsl, vsg, rhoL, rhoG, muL, muG, sigma, D, theta (rad, + up), rough (m), P (Pa), fModel }
  * model: 'beggsBrill' | 'driftFlux' | 'mechanistic' | 'homogeneous'
+ * p.label = false skips the mechanistic flow-pattern label of the 'beggsBrill' and 'driftFlux' models (the costly part of a call:
+ * the stratified equilibrium level has to be solved); the correlation's own regime name is then returned. Numbers are unaffected.
  * Returns { holdup, fric, grav, acc (Pa/m, positive = pressure falls in the flow direction), dpdx (total), regime, tauW (Pa) }.
  */
 export function gradient(p, model = 'beggsBrill') {
@@ -220,12 +242,14 @@ export function gradient(p, model = 'beggsBrill') {
   if (vm <= 1e-9) { const liquid = q.vsg <= 1e-12; r = { holdup: liquid ? 1 : 0, fric: 0, grav: (liquid ? q.rhoL : q.rhoG) * G * Math.sin(q.theta), acc: 0, regime: 'static', tauW: 0 }; }
   else if (q.vsg <= 1e-9 * vm || q.vsl <= 1e-9 * vm) {
     const liquid = q.vsg <= 1e-9 * vm, rho = liquid ? q.rhoL : q.rhoG, mu = liquid ? q.muL : q.muG, f = frictionFactor((rho * vm * q.D) / mu, q.rough / q.D, q.fModel), fric = (f * rho * vm * vm) / (2 * q.D);
-    r = { holdup: liquid ? 1 : 0, fric, grav: rho * G * Math.sin(q.theta), acc: 0, regime: liquid ? 'single-phase liquid' : 'single-phase gas', tauW: (fric * q.D) / 4 };
+    const grav = rho * G * Math.sin(q.theta), Ek = liquid ? 0 : clamp((rho * vm * vm) / Math.max(q.P, 1e4), 0, 0.6); // gas expansion: dv/v = −dP/P (isothermal ideal-gas estimate)
+    r = { holdup: liquid ? 1 : 0, fric, grav, acc: ((fric + grav) * Ek) / (1 - Ek), regime: liquid ? 'single-phase liquid' : 'single-phase gas', tauW: (fric * q.D) / 4 };
   } else if (model === 'homogeneous') {
     const lam = q.vsl / vm, rho = q.rhoL * lam + q.rhoG * (1 - lam), mu = q.muL * lam + q.muG * (1 - lam), f = frictionFactor((rho * vm * q.D) / mu, q.rough / q.D, q.fModel), fric = (f * rho * vm * vm) / (2 * q.D);
-    r = { holdup: lam, fric, grav: rho * G * Math.sin(q.theta), acc: 0, regime: 'homogeneous', tauW: (fric * q.D) / 4 };
+    const grav = rho * G * Math.sin(q.theta), Ek = clamp((rho * vm * q.vsg) / Math.max(q.P, 1e4), 0, 0.6);
+    r = { holdup: lam, fric, grav, acc: ((fric + grav) * Ek) / (1 - Ek), regime: 'homogeneous', tauW: (fric * q.D) / 4 };
   } else r = model === 'driftFlux' ? driftFlux(q) : model === 'mechanistic' ? mechanistic(q) : beggsBrill(q);
-  if (model === 'beggsBrill' || model === 'driftFlux') { try { const fp = flowPattern(q).pattern; if (!fp.startsWith('single')) r.regime = fp; } catch { /* keep the correlation's own regime label */ } }
+  if (q.label !== false && (model === 'beggsBrill' || model === 'driftFlux')) { try { const fp = flowPattern(q).pattern; if (!fp.startsWith('single')) r.regime = fp; } catch { /* keep the correlation's own regime label */ } }
   r.dpdx = r.fric + r.grav + r.acc;
   return r;
 }
@@ -245,34 +269,44 @@ export function discretise(profile, n = 200) {
  * Steady-state pressure and temperature along a pipe by marching from the inlet (shooting on the inlet pressure
  * when the outlet pressure is the boundary condition).
  * o: { fm (fluidModel), profile: { x[], z[] }, id (m), rough (m), U (W/m²/K on ID) | uOf(s), tAmb (°C) | tAmbOf(s, z), tIn (°C),
- *      pOut (bara) | pIn (bara), mScale (rate multiplier), model, fModel, n, idOf(s) (effective inner diameter), roughOf(s) }
+ *      pOut (bara) | pIn (bara), mScale (rate multiplier), model, fModel, n, idOf(s) (effective inner diameter), roughOf(s),
+ *      energy: 'enthalpy' (default: flowing enthalpy + potential + kinetic energy balance, temperature from H(P, T) of the fluid model, so
+ *      flashing, latent heat and the Joule–Thomson effect are included) | 'cpjt' (frozen heat capacities and Joule–Thomson coefficients) }
  * Returns { ok, s, x, z, theta, P, T, holdup, vsl, vsg, vm, rhoM, dpdx, regime, tauW, tAmb, tHyd, subcooling, qG, qL,
- *           pIn, pOut, tOut, dpFric, dpGrav, liquidInventory (m³), volume (m³), residence (s), heatLoss (W), mdot }.
+ *           pIn, pOut, tOut, dpFric, dpGrav, liquidInventory (m³), volume (m³), residence (s), heatLoss (W), mdot, energy (the form used) }.
  */
 export function marchSteady(o) {
   const { fm, profile, id, rough = 4.5e-5, tIn = 70, mScale = 1, model = 'beggsBrill', fModel = 'colebrook', n = 200 } = o, grid = discretise(profile, n);
   const uOf = typeof o.uOf === 'function' ? o.uOf : () => o.U ?? 3, tAmbOf = typeof o.tAmbOf === 'function' ? o.tAmbOf : () => o.tAmb ?? 4;
   const dOf = typeof o.idOf === 'function' ? o.idOf : () => id, rOf = typeof o.roughOf === 'function' ? o.roughOf : () => rough;
-  const mdot = (fm.rates.mHC + fm.rates.mW) * mScale;
-  const state = (P, T, i) => {
-    const sMid = 0.5 * (grid.s[i] + grid.s[i + 1]), D = Math.max(dOf(sMid), 0.01), A = (Math.PI * D * D) / 4, pr = fm.at(P, T, mScale);
-    const vsg = pr.qG / A, vsl = pr.qL / A, gr = gradient({ vsl, vsg, rhoL: pr.rhoL, rhoG: pr.rhoG, muL: pr.muL, muG: pr.muG, sigma: pr.sigma, D, theta: grid.theta[i], rough: rOf(sMid), P: P * 1e5, fModel }, model);
+  const mdot = (fm.rates.mHC + fm.rates.mW) * mScale, hFlow = (pr) => pr.mG * pr.hG + pr.mO * pr.hO + pr.mW * pr.hW;
+  const state = (P, T, i, label) => {
+    const sMid = 0.5 * (grid.s[i] + grid.s[i + 1]), D = Math.max(dOf(sMid), 0.01), A = (Math.PI * D * D) / 4, pr = fm.at(P, T, mScale), sinT = Math.sin(grid.theta[i]);
+    const vsg = pr.qG / A, vsl = pr.qL / A, vm = vsl + vsg, gr = gradient({ vsl, vsg, rhoL: pr.rhoL, rhoG: pr.rhoG, muL: pr.muL, muG: pr.muG, sigma: pr.sigma, D, theta: grid.theta[i], rough: rOf(sMid), P: P * 1e5, fModel, label }, model);
     const mCp = pr.mG * pr.cpG + pr.mO * pr.cpO + pr.mW * pr.cpW, jt = mCp > 0 ? (pr.mG * pr.cpG * pr.jtG + pr.mO * pr.cpO * pr.jtO - (pr.mW / pr.rhoW)) / mCp : 0;
     const ta = tAmbOf(sMid, 0.5 * (grid.z[i] + grid.z[i + 1])), U = uOf(sMid), q = U * Math.PI * D * (T - ta); // W/m
-    const dTds = mCp > 0 ? -q / mCp - jt * gr.dpdx - (mdot * G * Math.sin(grid.theta[i])) / mCp : 0;
-    return { pr, gr, vsg, vsl, D, A, ta, q, dPds: -gr.dpdx / 1e5, dTds };
+    const dTds = mCp > 0 ? -q / mCp - jt * gr.dpdx - (mdot * G * sinT) / mCp : 0, H = gr.holdup;
+    const ke = H > 1e-6 && H < 1 - 1e-6 ? 0.5 * (pr.mG * (vsg / (1 - H)) ** 2 + (pr.mO + pr.mW) * (vsl / H) ** 2) : 0.5 * mdot * vm * vm; // kinetic-energy flow (W)
+    return { pr, gr, vsg, vsl, D, A, ta, q, mCp, sinT, ke, dPds: -gr.dpdx / 1e5, dTds };
   };
-  const run = (pIn) => {
-    const P = [pIn], T = [tIn], cells = [];
-    let ok = true;
+  const run = (pIn, label = false) => {
+    const P = [pIn], T = [tIn], cells = [], pr0 = fm.at(pIn, tIn, mScale), enth = o.energy !== 'cpjt' && Number.isFinite(hFlow(pr0));
+    let ok = true, Hf = enth ? hFlow(pr0) : 0;
     for (let i = 0; i < grid.n; i++) {
-      const a = state(P[i], T[i], i), Pm = P[i] + 0.5 * grid.ds * a.dPds, Tm = T[i] + 0.5 * grid.ds * a.dTds;
+      const a = state(P[i], T[i], i, false), Pm = P[i] + 0.5 * grid.ds * a.dPds, Tm = T[i] + 0.5 * grid.ds * a.dTds;
       if (!(Pm > 1.0)) { ok = false; break; }
-      const b = state(Pm, Tm, i), Pn = P[i] + grid.ds * b.dPds, Tn = T[i] + grid.ds * b.dTds;
+      const b = state(Pm, Tm, i, label), Pn = P[i] + grid.ds * b.dPds;
+      let Tn = T[i] + grid.ds * b.dTds;
       if (!(Pn > 1.0) || !Number.isFinite(Tn)) { ok = false; break; }
+      if (enth && b.mCp > 0) { // energy balance over the cell, then the temperature that carries the remaining enthalpy flow at the new pressure
+        Hf -= grid.ds * (b.q + mdot * G * b.sinT) + 2 * (b.ke - a.ke);
+        let t0 = Tn, f0 = hFlow(fm.at(Pn, t0, mScale)) - Hf, slope = b.mCp;
+        for (let k = 0; k < 8 && Math.abs(f0) > 2e-5 * b.mCp; k++) { const t1 = clamp(t0 - f0 / slope, t0 - 25, t0 + 25), f1 = hFlow(fm.at(Pn, t1, mScale)) - Hf; if (Math.abs(t1 - t0) > 1e-9 && (f1 - f0) / (t1 - t0) > 0.2 * b.mCp) slope = (f1 - f0) / (t1 - t0); t0 = t1; f0 = f1; }
+        Tn = t0;
+      }
       P.push(Pn); T.push(clamp(Tn, -60, 250)); cells.push(b);
     }
-    return { ok, P, T, cells };
+    return { ok, P, T, cells, enth };
   };
   let sol, pIn = o.pIn;
   if (o.pOut !== undefined && o.pOut !== null && o.pIn === undefined) {
@@ -283,9 +317,9 @@ export function marchSteady(o) {
     for (let k = 0; k < 60 && hi - lo > 1e-6 * hi; k++) { const m = 0.5 * (lo + hi); if (res(m) < 0) lo = m; else hi = m; }
     pIn = hi;
   }
-  sol = run(pIn);
+  sol = run(pIn, o.label !== false); // the flow-pattern label is evaluated once, on the converged march
   if (!sol.ok) return { ok: false, reason: 'The inlet pressure is too low to push this rate to the outlet.' };
-  const N = grid.n, out = { ok: true, s: grid.s, x: grid.x, z: grid.z, theta: grid.theta.concat(grid.theta[N - 1]), P: sol.P, T: sol.T, mdot, pIn: sol.P[0], pOut: sol.P[N], tOut: sol.T[N], ds: grid.ds, length: grid.length };
+  const N = grid.n, out = { ok: true, s: grid.s, x: grid.x, z: grid.z, theta: grid.theta.concat(grid.theta[N - 1]), P: sol.P, T: sol.T, mdot, pIn: sol.P[0], pOut: sol.P[N], tOut: sol.T[N], ds: grid.ds, length: grid.length, energy: sol.enth ? 'enthalpy' : 'cpjt' };
   const col = (fn) => { const a = sol.cells.map(fn); a.push(a[a.length - 1]); return a; };
   out.holdup = col((c) => c.gr.holdup); out.vsl = col((c) => c.vsl); out.vsg = col((c) => c.vsg); out.vm = col((c) => c.vsl + c.vsg); out.dpdx = col((c) => c.gr.dpdx); out.regime = col((c) => c.gr.regime); out.tauW = col((c) => c.gr.tauW);
   out.rhoM = col((c) => c.pr.rhoL * c.gr.holdup + c.pr.rhoG * (1 - c.gr.holdup)); out.tAmb = col((c) => c.ta); out.qG = col((c) => c.pr.qG); out.qL = col((c) => c.pr.qL); out.rhoL = col((c) => c.pr.rhoL); out.rhoG = col((c) => c.pr.rhoG); out.muL = col((c) => c.pr.muL); out.wcut = col((c) => c.pr.wcut);

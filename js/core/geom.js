@@ -5,6 +5,16 @@
 // Everything is parsed locally; file content is treated as data only and is never executed.
 import { LIMITS as IO_LIMITS, checkFile, parseSTL, parseOBJ, parseDXF, parseGeoJSON, parseDelimited, tableFromRows, sliceMesh, polylinesToSegments, rasterize } from './io.js';
 import { rng } from './num.js';
+import { openHDF5, hdf5Offset, isNumeric, typeName } from './hdf5.js';
+import { openSQLite } from './sqlite.js';
+import { parseDGN } from './fmt_dgn.js';
+import { parseE57 } from './fmt_e57.js';
+import { parseLAZ, isLAZ } from './fmt_laz.js';
+import { recognisePipes, angularExtent } from './fmt_brep.js';
+import { parseSAT, parseSAB, isSAB } from './fmt_acis.js';
+import { parseXT, parseXB, xtKind } from './fmt_xt.js';
+import { parseDWG } from './fmt_dwg.js';
+import { parseJT, isJT } from './fmt_jt.js';
 
 export const GEOM_LIMITS = { ...IO_LIMITS, points: 2e6, voxels: 64e6, grid: 4e6, cells: 2e6, xmlNodes: 2e6, inflated: 512e6 };
 const L = GEOM_LIMITS;
@@ -18,9 +28,9 @@ export const FORMATS = Object.freeze([
   // CAD / solid
   F('step stp p21', 'STEP (ISO 10303)', 'cad', 'partial', 'AP203, AP214 and AP242 files: reads AP242 tessellated faces, faceted B-reps and ADVANCED_FACEs on planes, cylinders and cones (line, circle, ellipse and B-spline edges); other surface types are skipped and counted, and assembly placements are not applied.', 'For free-form surfaces export AP242 with tessellation, or STL.'),
   F('iges igs', 'IGES', 'cad', 'partial', 'Reads the curve wireframe (entities 100, 106, 110, 112, 116, 126 with their 124 transformations) projected onto its dominant plane; trimmed surfaces and solids are not tessellated.', 'For solids export STEP (AP214 or AP242) or STL.'),
-  C('x_t x_b xmt_txt xmt_bin', 'Parasolid', 'cad', 'Parasolid text (.x_t) and binary (.x_b) need the Parasolid kernel. In the authoring CAD package (NX, SOLIDWORKS, Solid Edge, Onshape) export STEP AP242 for the exact shape or STL for a faceted one; for a pipeline keep the centreline as a CSV of x, y, z instead.'),
-  C('sat sab', 'ACIS SAT/SAB', 'cad', 'ACIS text (.sat) and binary (.sab) need the ACIS kernel. Open the file in an ACIS-based package (AutoCAD: ACISIN then EXPORT, Inventor, SpaceClaim, BricsCAD) and export STEP AP214/AP242 or STL.'),
-  C('jt', 'JT', 'cad', 'JT stores compressed B-rep and tessellation (ISO 14306). Export the JT model as STEP AP242 or STL from NX or Teamcenter Visualization, or convert it with the JT Open Toolkit.'),
+  F('x_t x_b xmt_txt xmt_bin', 'Parasolid', 'cad', 'partial', 'Text transmit files (.x_t) of Parasolid 13 and later, read through the base schema and the field edits embedded in each file: bodies with their region / shell / face / loop / fin / edge / vertex topology in metres; line, circle, ellipse and intersection-curve edges; faces on planes, cylinders and cones are tessellated, toroidal and spherical faces are filled over the parametric rectangle of their boundary. Cylinders and tori are also read as pipe runs and bends: a model recognised as a pipe, jumper or spool is returned as its 3-D centreline with stats.pipeRuns and stats.diameters (opts.prefer = "mesh" | "centreline" | "wireframe" overrides). B-spline, offset, swept, spun and blend surfaces are skipped and counted, B-curve edges become chords, and instance placements of assemblies are not applied. Binary files (.x_b) and files of modellers before version 13 are rejected.', 'Export a binary or pre-version-13 file as Parasolid text (.x_t) from a current CAD package, and free-form shapes as STEP AP242 with tessellation or as STL.'),
+  F('sat sab', 'ACIS SAT/SAB', 'cad', 'partial', 'Text ACIS files (.sat) of releases 1.x to 3x, including the ShapeManager flavour of Autodesk products: the entity table with body / lump / shell / face / loop / coedge / edge / vertex topology and the body transform; straight and elliptical edges; faces on planes, cylinders and cones are tessellated, toroidal and spherical faces are filled over the parametric rectangle of their boundary. Cylinders and tori are also read as pipe runs and bends (axis, length, diameters, bend radius and angle): a model recognised as a pipe, jumper or spool is returned as its 3-D centreline with stats.pipeRuns and stats.diameters (opts.prefer = "mesh" | "centreline" | "wireframe" overrides). Spline surfaces are skipped and counted, edges on procedural curves become chords, and a model without analytic faces is returned as its wireframe. Binary .sab files are not read.', 'Save a binary .sab model as text ACIS (.sat), and export free-form shapes as STEP AP242 with tessellation or as STL.'),
+  F('jt', 'JT', 'cad', 'convert', 'Recognised, not read: the header, table of contents and segment headers of JT 8, 9 and 10 files are parsed, so the error message lists what the file holds (scene graph, shape LODs, B-rep, PMI), but the tessellation itself sits in the JT codecs (bit-length, Huffman and arithmetic coded index streams, quantised or topologically compressed vertices) and the exact shape in JT or Parasolid B-rep segments, none of which is decoded.', 'JT keeps its tessellation in proprietary-style compression codecs (ISO 14306) that are not decoded here. Export the JT model as STEP AP242 or STL from NX or Teamcenter Visualization, or convert it with the JT Open Toolkit.'),
   C('3dxml', '3DXML', 'cad', 'Export from CATIA / 3DEXPERIENCE as STEP AP214/AP242 or STL.'),
   C('prc', 'PRC', 'cad', 'Export the PRC model as STEP or STL from the authoring CAD package.'),
   C('vda', 'VDA-FS', 'cad', 'Convert VDA-FS to STEP or IGES in your CAD package.'),
@@ -63,17 +73,17 @@ export const FORMATS = Object.freeze([
   F('dat tec plt', 'Tecplot ASCII', 'mesh', 'partial', 'Finite-element zones (triangle, quadrilateral, tetrahedron, brick) and ordered I/J/K zones with nodal coordinates; binary .plt is not read.', 'Save the data set from Tecplot as ASCII (.dat).'),
   F('p3d x', 'Plot3D grid (ASCII)', 'mesh', 'partial', 'Formatted single- or multi-block structured grids without IBLANK; a .xyz file is read as Plot3D only when its header looks like one.', 'Write the Plot3D grid formatted (ASCII), whole, without IBLANK.'),
   F('foam', 'OpenFOAM polyMesh', 'mesh', 'partial', 'ASCII points + faces + owner (+ neighbour) files passed together (opts.companion); the boundary surface is built from faces without a neighbour.', 'Select the polyMesh "points" file together with "faces", "owner" and "neighbour" (ASCII; run foamFormatConvert first if binary).'),
-  C('cgns', 'CGNS', 'mesh', 'CGNS is an HDF5 / ADF binary container. Convert it to VTK .vtu, Gmsh .msh (ASCII 2.2), SU2 or UNV: meshio convert in.cgns out.vtu, or ParaView File > Save Data (.vtu, ASCII or appended).'),
-  C('e exo ex2 exii g', 'Exodus II', 'mesh', 'Exodus II is a NetCDF-4 / HDF5 container. Convert it to VTK .vtu, Gmsh .msh (ASCII) or UNV: meshio convert in.exo out.vtu, or ParaView File > Save Data.'),
-  C('med rmed', 'Salome MED', 'mesh', 'MED is an HDF5 container. In Salome (Mesh module) export the mesh as UNV or as Gmsh .msh, or run meshio convert in.med out.vtu.'),
+  F('cgns', 'CGNS', 'mesh', 'partial', 'HDF5-flavoured CGNS files: every zone of every base with its GridCoordinates (Cartesian, or cylindrical R / Theta converted); structured zones give their block boundaries, unstructured Elements_t sections of BAR, TRI, QUAD, TETRA, PYRA, PENTA and HEXA elements (higher-order ones reduced to their corner nodes), MIXED sections and NGON_n / NFACE_n polyhedra (reduced to their boundary faces) give the boundary surface, outline or line work. Internal links are followed. ADF-flavoured files, links to other files, solutions, boundary-condition patches and zone connectivity are not read.', 'Convert an ADF-flavoured file to HDF5 with the CGNS tools: cgnsconvert -h in.cgns out.cgns (or adf2hdf in.cgns out.cgns).'),
+  F('e exo ex2 exii g', 'Exodus II', 'mesh', 'partial', 'Classic NetCDF (CDF-1, 64-bit-offset CDF-2, CDF-5) and NetCDF-4 / HDF5 files: nodal coordinates (coordx / coordy / coordz or coord) and every connect<N> element block typed by its elem_type attribute (HEX, TETRA, WEDGE, PYRAMID, QUAD / SHELL, TRI, BAR / BEAM / TRUSS; higher-order elements reduced to their corner nodes). Polyhedral NSIDED / NFACED blocks, sphere elements, node and side sets and result variables are not read.', 'For a mesh that relies on polyhedral blocks convert it to VTK .vtu: meshio convert in.exo out.vtu, or ParaView File > Save Data.'),
+  F('med rmed', 'Salome MED', 'mesh', 'partial', 'MED 2.x to 4.x (HDF5): the node coordinates and element connectivity of one unstructured mesh (opts.mesh = name, default the first; the first computation step): SE2, TR3, QU4, TE4, PY5, PE6, HE8, their quadratic variants reduced to corner nodes, and polygons (POG). Structured grids, polyhedra (POE), families / groups and result fields are not read.', 'For a structured or polyhedral MED mesh export UNV or Gmsh .msh from Salome, or run meshio convert in.med out.vtu.'),
   C('case', 'EnSight Gold', 'mesh', 'EnSight cases span several binary files. Export as VTK .vtu, Gmsh .msh or Tecplot ASCII.'),
   // 2-D drawings
   F('dxf', 'DXF', 'drawing', 'partial', 'ASCII DXF: LINE, LWPOLYLINE, POLYLINE, CIRCLE, ARC, ELLIPSE, SPLINE and 3DFACE; bulges, blocks/inserts and hatches are ignored.', 'Save the drawing as ASCII DXF with blocks exploded.'),
   F('svg', 'SVG', 'drawing', 'partial', 'path, polygon, polyline, rect, circle, ellipse and line with nested transform attributes; curves are flattened and the y axis is flipped to point up. <use> references, viewBox scaling, CSS transforms and text are ignored.', 'Convert text and <use> clones to plain paths (Inkscape: Object to Path) before exporting.'),
   F('hpgl hpg plt', 'HPGL plot file', 'drawing', 'partial', 'Pen moves PU / PD / PA / PR plus CI circles and AA arcs, converted from plotter units to millimetres.'),
   F('xy', 'x-y polyline', 'drawing', 'full', 'Two numeric columns per row; blank lines separate polylines.'),
-  C('dwg', 'AutoCAD DWG', 'drawing', 'DWG is a closed binary format. Save the drawing as ASCII DXF (AutoCAD: SAVEAS, DXF, ASCII; or batch-convert with the free ODA File Converter, output "DXF ASCII") with blocks exploded.'),
-  C('dgn', 'MicroStation DGN', 'drawing', 'DGN (V7 / V8) is a binary design file. In MicroStation use File > Export > DWG/DXF and choose DXF, or ogr2ogr -f DXF out.dxf in.dgn for V7 files; export 3-D pipe routes as a CSV of x, y, z.'),
+  F('dwg', 'AutoCAD DWG', 'drawing', 'partial', 'AutoCAD R13, R14, 2000, 2004, 2010, 2013 and 2018 drawings (AC1012, AC1014, AC1015, AC1018, AC1024, AC1027, AC1032): model-space LINE, LWPOLYLINE and POLYLINE (bulges as arcs, 2-D and 3-D), ARC, CIRCLE, ELLIPSE, SPLINE, POINT and 3DFACE, block references (INSERT / MINSERT with scale, rotation and extrusion, nested), layer names, 3-D coordinates, and the drawing unit $INSUNITS of 2000 drawings. Text, dimensions, hatches, leaders, solids and ACIS bodies, meshes, attributes, paper space and invisible entities are skipped; the drawing unit of 2004 and later drawings is not read. AutoCAD 2007 drawings (AC1021, a Reed-Solomon coded layout of their own) and releases before R13 are rejected.', 'Save a 2007 or pre-R13 drawing as ASCII DXF (AutoCAD: SAVEAS, DXF; or the free ODA File Converter, output "ASCII DXF"), or re-save it in the 2010 or a later DWG format.'),
+  F('dgn', 'MicroStation DGN', 'drawing', 'partial', 'MicroStation V7 design files (ISFF), 2-D and 3-D: lines, line strings, shapes, curves, arcs and ellipses (flattened), complex chains and shapes joined into one polyline, B-spline curves as their control polygon, point strings; coordinates in master units from the design-file header with the global origin applied, element levels kept, cell components read in place. Text, tags, dimensions, surfaces and solids are skipped, shared cells are not expanded. V8 design files (OLE2 compound documents with an unpublished element stream) and cell libraries are rejected with an explanation.', 'Save a V8 design file as V7 (MicroStation: File > Save As, "MicroStation V7 DGN") or export it as DXF.'),
   C('eps ai pdf', 'EPS / AI / PDF vector drawing', 'drawing', 'Convert the vector drawing to SVG or DXF (for example with Inkscape).'),
   C('gbr ger', 'Gerber', 'drawing', 'Export the layer as DXF or SVG from your PCB/CAM tool.'),
   C('idf emn', 'IDF board outline', 'drawing', 'Export the outline as DXF or STEP.'),
@@ -86,16 +96,17 @@ export const FORMATS = Object.freeze([
   F('asc', 'ESRI ASCII grid', 'gis', 'full', 'Header + row-major elevations; an .asc without that header is read as an ASCII point list.'),
   F('grd', 'Surfer grid', 'gis', 'full', 'Surfer ASCII (DSAA), Surfer 6 binary (DSBB) and Surfer 7 binary (DSRB); NetCDF .grd files are passed to the NetCDF reader.'),
   F('tif tiff', 'GeoTIFF / TIFF', 'gis', 'partial', 'Classic TIFF, strips or tiles, 1/8/16/32-bit integer and 32/64-bit float, uncompressed, Deflate, LZW or PackBits with predictors 1-3; a georeferenced or float page becomes a DEM, 8/16-bit pages become a 2-D or (multi-page) 3-D voxel image. BigTIFF and JPEG-in-TIFF are not read.', 'Rewrite the raster as a classic (non-BigTIFF) TIFF with Deflate or LZW compression, e.g. gdal_translate -co BIGTIFF=NO -co COMPRESS=DEFLATE.'),
-  F('nc cdf', 'NetCDF classic', 'gis', 'partial', 'CDF-1, CDF-2 and CDF-5 files: the first 2-D (or first slice of a higher-dimensional) numeric variable with its coordinate variables becomes a grid. NetCDF-4 (HDF5) is not read.', 'Convert NetCDF-4 to classic format: nccopy -k classic in.nc out.nc (or gdal_translate to GeoTIFF).'),
+  F('nc cdf', 'NetCDF classic', 'gis', 'partial', 'CDF-1, CDF-2 and CDF-5 files: the first 2-D (or first slice of a higher-dimensional) numeric variable with its coordinate variables becomes a grid. A NetCDF-4 file under these extensions is passed to the NetCDF-4 reader.'),
+  F('nc4', 'NetCDF-4 (HDF5)', 'gis', 'partial', 'NetCDF-4 files (HDF5 container, also under .nc): the first 2-D (or first slice of a higher-dimensional) numeric variable with the coordinate variables of its dimension scales becomes a grid, with scale_factor / add_offset / _FillValue applied; contiguous, chunked, deflated and shuffled storage. Without a gridded variable the file is read as plain HDF5. Szip and third-party compression filters, user-defined compound variables and groups other than through their full path are not read.', 'Rewrite a file compressed with another filter: nccopy -d 4 in.nc out.nc (deflate), or nccopy -k classic in.nc out.nc.'),
   F('bil bip bsq', 'ENVI / ESRI band raster', 'gis', 'full', 'First band of a BIL/BIP/BSQ raster described by its .hdr companion (opts.companion).', 'Supply the .hdr header file together with the raster.'),
   F('mif', 'MapInfo MIF', 'gis', 'partial', 'REGION, PLINE, LINE, RECT and POINT objects.'),
   F('landxml', 'LandXML', 'gis', 'partial', 'LandXML 1.x (also recognised in .xml): Alignments and PlanFeatures CoordGeom (Line, Curve, IrregularLine; Spiral as its chord) as polylines with elevations from Profile / ProfAlign PVIs or 3-D points, Surfaces (Pnts + Faces TIN) as a mesh, CgPoints as points and PipeNetworks (Structs + Pipes) as a network. One content class is returned per import (opts.prefer = "alignment" | "surface" | "points" | "network"); vertical curves are joined by straight grades and cross-sections, parcels and grade models are ignored.'),
   F('dem dtm dsm', 'DEM / DTM / DSM elevation model', 'gis', 'partial', 'Text elevation models only: an ESRI ASCII grid, a USGS ASCII DEM (record A + profiles, resampled onto a regular grid) or rows of x y z. Binary DEM flavours (SRTM .hgt, BIL, ERDAS, DTED, SDTS) are rejected.', 'Convert a binary elevation model to GeoTIFF or ESRI ASCII grid: gdal_translate -of AAIGrid in.dem out.asc (or -of GTiff -co COMPRESS=DEFLATE).'),
   F('sgy segy', 'SEG-Y seismic', 'points', 'partial', 'Textual header (EBCDIC or ASCII), binary header and per-trace CDP / source coordinates with the coordinate scalar become trace positions; water depth at source gives z. For IBM-float (1) and IEEE-float (5) samples of small files the first strong arrival of each trace is picked as a seabed two-way time and converted with 1500 m/s: an estimate, not an interpreted horizon. Other sample formats give positions only; SEG-Y rev 2 extended trace headers are skipped.', 'For an interpreted seabed or horizon export it from the interpretation package as XYZ, ESRI ASCII grid or GeoTIFF.'),
   F('las', 'LAS point cloud', 'points', 'full', 'LAS 1.0-1.4 uncompressed, point formats 0-10, scaled to real coordinates and evenly sub-sampled above the point limit.'),
-  C('laz', 'LAZ (compressed LAS)', 'points', 'LAZ is arithmetic-coded LAS. Decompress LAZ to LAS: laszip -i in.laz -o out.las, pdal translate in.laz out.las, or CloudCompare Save As LAS.'),
-  C('e57', 'ASTM E57', 'points', 'E57 packs XML and compressed binary scan sections. Export the scan as LAS, PTS, PLY or XYZ: CloudCompare File > Save As, or pdal translate in.e57 out.las.'),
-  C('gpkg', 'GeoPackage', 'gis', 'GeoPackage is an SQLite database. Export the vector layer as GeoJSON (ogr2ogr -f GeoJSON route.geojson in.gpkg layer_name, or QGIS Export > Save Features As) and a raster as GeoTIFF (gdal_translate in.gpkg out.tif).'),
+  F('laz', 'LAZ (compressed LAS)', 'points', 'partial', 'LASzip-compressed LAS 1.0-1.4 with point formats 0-3: the arithmetic-coded "pointwise" and "pointwise chunked" compressors with the version-2 POINT10, GPSTIME11, RGB12 and extra-byte codecs; x, y, z scaled to real coordinates and evenly sub-sampled above the point limit (of very large clouds only every n-th chunk is decompressed). LAS 1.4 point formats 6-10 (layered compression), wave-packet formats 4-5, variable-size chunks and files of LASzip releases before 2.0 are rejected.', 'Decompress such a file to LAS: laszip -i in.laz -o out.las, or pdal translate in.laz out.las.'),
+  F('e57', 'ASTM E57', 'points', 'partial', 'Point coordinates of every scan: the XML section and the CompressedVector binary sections with the bit-pack codec for float, double, integer and scaled-integer fields; Cartesian coordinates, or spherical ones converted; points flagged invalid are dropped, each scan pose is applied and clouds above the point limit are evenly sub-sampled. Images, intensity, colour and other per-point fields are ignored and page checksums are not verified.'),
+  F('gpkg', 'GeoPackage', 'gis', 'partial', 'Vector feature tables of the SQLite container read in place: gpkg_contents / gpkg_geometry_columns / gpkg_spatial_ref_sys, GeoPackage binary headers and WKB Point, LineString, Polygon, their Multi and collection forms with Z / M (ISO or EWKB codes, either byte order); every feature layer is merged (opts.layer = table name reads one) and polylines carry their layer, name and attribute values. Circular-arc curve types are reduced to their control points. Tile pyramids and gridded-coverage elevation rasters, the RTree index and extensions are not read, coordinates are not re-projected, and changes still in a write-ahead log (-wal file) are not replayed.', 'Export a raster layer as GeoTIFF: gdal_translate in.gpkg out.tif. Checkpoint a database in WAL mode first (sqlite3 in.gpkg "PRAGMA wal_checkpoint(TRUNCATE)").'),
   C('grib grb grib2 grb2', 'GRIB / GRIB2', 'gis', 'Convert the GRIB field to NetCDF classic or GeoTIFF (cdo -f nc copy, or gdal_translate).'),
   C('000', 'S-57 / S-101 chart', 'gis', 'Export the chart objects as Shapefile or GeoJSON and soundings as XYZ (ogr2ogr reads S-57).'),
   C('bag', 'BAG bathymetry', 'gis', 'BAG is an HDF5 container. Convert the surface to GeoTIFF or XYZ (gdal_translate reads BAG).'),
@@ -113,7 +124,7 @@ export const FORMATS = Object.freeze([
   F('npy npz', 'NumPy array', 'numeric', 'full', 'Format versions 1-3, bool / integer / float types in C or Fortran order; 2-D and 3-D arrays become voxels, N×2 and N×3 arrays become points; .npz uses its first array.'),
   F('dcm dicom', 'DICOM slice', 'voxel', 'partial', 'Uncompressed little-endian (explicit or implicit VR) single- or multi-frame monochrome images.', 'Decompress the DICOM file (gdcmconv --raw, or dcmdjpeg) or export the stack as TIFF / NRRD / NIfTI.'),
   C('jp2 j2k jpx', 'JPEG 2000', 'voxel', 'Convert JPEG 2000 images to PNG or TIFF.'),
-  C('h5 hdf5 hdf he5 h4', 'HDF / HDF5', 'numeric', 'HDF5 needs the HDF library. Export the data set as CSV (tables, profiles, wall-thickness or deposit maps: h5dump or pandas / h5py then to_csv), NumPy .npy or NetCDF classic (grids and voxels: nccopy -k classic), or Gmsh .msh / VTK .vtu (meshes: meshio convert).'),
+  F('h5 hdf5 hdf he5 h4', 'HDF5', 'numeric', 'partial', 'HDF5 files read in place (superblock versions 0-3, old- and new-style groups, contiguous / compact / chunked data with every chunk index, deflate and shuffle filters, integer, floating-point, string, enum, array and compound types). The content decides the reading: a CGNS tree, a MED mesh, an Exodus II or NetCDF-4 data set and a MATLAB v7.3 file go to those readers; otherwise the most geometry-like numeric data set (opts.dataset = path overrides) becomes points or a polyline (N × 2, N × 3), a grid or table (2-D), voxels (3-D) or a table of equal-length vectors, and g.contents lists what the file holds. HDF4 files, external and virtual data sets, szip / n-bit / scale-offset and third-party filters are not read.', 'Rewrite data compressed with another filter: h5repack -f GZIP=4 in.h5 out.h5; convert HDF4 with h4toh5.'),
   // Plant / piping / network topology
   F('dev wbt survey', 'Well deviation survey (ASCII)', 'well', 'partial', 'Column text with a header naming MD + inclination + azimuth (positions by the minimum-curvature method) or MD + TVD (+ northing / easting offsets); common aliases and feet are recognised, and a header-less file is taken as MD, inclination, azimuth. The same tables are detected in .csv / .txt. Casing, tubing and completion records and binary survey databases are not read.', 'Export the survey from the well-planning package as ASCII or CSV with MD, inclination and azimuth columns.'),
   F('graphml', 'GraphML', 'network', 'partial', 'Nodes and edges with their <data> keys (x, y, z / elevation, type, name, length, diameter) and yEd node geometry; nested graphs are flattened, hyperedges and ports are skipped.'),
@@ -126,21 +137,21 @@ export const FORMATS = Object.freeze([
   F('json', 'JSON data', 'numeric', 'full', 'Sniffed as GeoJSON, glTF, network (nodes + edges), mesh (nodes + elements / vertices + faces), array (grid, voxels, points) or record table.'),
   F('xml', 'XML data', 'numeric', 'partial', 'Routed by root element to LandXML, GraphML, KML, GPX, GML, VTK, COLLADA, X3D, AMF, SVG or CAEX; otherwise read as a network (nodes + edges) definition.'),
   F('csv tsv txt', 'Delimited / column text', 'numeric', 'full', 'Sniffed as node-edge table, well survey (MD / inclination / azimuth or MD / TVD), chainage-elevation profile, 3-D route, wall-thickness / corrosion / deposit map (x, θ, value[, time]), particle cloud, lon/lat/depth soundings, x y z points, x y polyline, numeric matrix, time series or a plain table.'),
-  F('mat', 'MATLAB MAT-file', 'numeric', 'partial', 'Level 5 MAT-files (v5, v6, v7): real numeric and logical arrays, plain or zlib-compressed. Equal-length vectors become one table with the variable names as headers, a matrix becomes a table (up to 16 columns), a grid or a voxel volume. Structs, cells, sparse and character arrays and imaginary parts are skipped; v4 and v7.3 (HDF5) files are rejected.', 'Re-save a v7.3 file in the older format (MATLAB: save(\'data.mat\', \'-v7\')) or write the variables as CSV (writematrix / writetable).'),
+  F('mat', 'MATLAB MAT-file', 'numeric', 'partial', 'Level 5 MAT-files (v5, v6, v7; plain or zlib-compressed) and v7.3 MAT-files (HDF5): real numeric and logical arrays. Equal-length vectors become one table with the variable names as headers, a matrix becomes a table (up to 16 columns), a grid or a voxel volume. Structs, cells, sparse and character arrays and imaginary parts are skipped; v4 files are rejected.', 'Write struct or cell contents as plain numeric variables, or as CSV (writematrix / writetable).'),
   C('parquet', 'Apache Parquet', 'numeric', 'Export the table as CSV or JSON (pandas: read_parquet(...).to_csv(...)).'),
 ]);
 
 export const PATHWAYS = Object.freeze({
-  cad: { title: 'CAD / solid geometry', blurb: 'Exact B-rep exchange files (STEP AP203 / AP214 / AP242, IGES) for trees, manifolds, jumpers, spools and vessels. Kernel-bound formats (Parasolid, ACIS, JT, native CAD) must be exported to STEP or STL first; a long pipeline is better described by its centreline than by a solid.' },
+  cad: { title: 'CAD / solid geometry', blurb: 'Exact B-rep exchange files (STEP AP203 / AP214 / AP242, IGES) and the kernel text formats Parasolid X_T and ACIS SAT for trees, manifolds, jumpers, spools and vessels; a pipe, jumper or spool in X_T or SAT is recognised from its cylinders and bends and returned as a centreline with diameters. JT and native CAD files must be exported to STEP or STL first; a long pipeline is better described by its centreline than by a solid.' },
   surface: { title: 'Surface / tessellated geometry', blurb: 'Faceted approximations of equipment, pipe walls and deposit surfaces: STL, OBJ, PLY, OFF, 3MF, AMF, VRML/X3D, COLLADA, glTF, GTS, BYU.' },
-  mesh: { title: 'CFD and structural meshes', blurb: 'Volume, shell and beam meshes from CFD and FEA (Gmsh, VTK, SU2, UNV, Nastran, Abaqus, ANSYS, LS-DYNA, Fluent, Tecplot, Plot3D, OpenFOAM); the boundary surface, outline or pipe centreline is extracted.' },
-  drawing: { title: '2-D drawings and profiles', blurb: 'DXF, SVG, HPGL and x-y polylines for alignment sheets, elevation profiles, field layouts and cross-sections.' },
-  gis: { title: 'GIS, terrain and bathymetry', blurb: 'Pipeline routes and seabed: GeoJSON, KML, GPX, GML, Shapefile, LandXML, ASCII / Surfer grids, DEM / DTM, GeoTIFF, NetCDF, band rasters, MIF. A route can be draped over a bathymetry grid to give its elevation profile.' },
-  points: { title: 'Point clouds, soundings and seismic lines', blurb: 'LAS, PTS, PTX, XYZ and CSV points from bathymetric surveys, laser scans and inspection; SEG-Y trace positions with an estimated seabed. Gridded on demand.' },
+  mesh: { title: 'CFD and structural meshes', blurb: 'Volume, shell and beam meshes from CFD and FEA (Gmsh, VTK, CGNS, Exodus II, Salome MED, SU2, UNV, Nastran, Abaqus, ANSYS, LS-DYNA, Fluent, Tecplot, Plot3D, OpenFOAM); the boundary surface, outline or pipe centreline is extracted.' },
+  drawing: { title: '2-D drawings and profiles', blurb: 'DXF, DWG (R13 to 2018, except 2007), MicroStation DGN V7, SVG, HPGL and x-y polylines for alignment sheets, elevation profiles, field layouts and cross-sections; 3-D line work keeps its elevations.' },
+  gis: { title: 'GIS, terrain and bathymetry', blurb: 'Pipeline routes and seabed: GeoJSON, KML, GPX, GML, Shapefile, LandXML, ASCII / Surfer grids, DEM / DTM, GeoTIFF, NetCDF (classic and NetCDF-4), GeoPackage vector layers, band rasters, MIF. A route can be draped over a bathymetry grid to give its elevation profile.' },
+  points: { title: 'Point clouds, soundings and seismic lines', blurb: 'LAS, LAZ, E57, PTS, PTX, XYZ and CSV points from bathymetric surveys, laser scans and inspection; SEG-Y trace positions with an estimated seabed. Gridded on demand.' },
   voxel: { title: 'Image and voxel data', blurb: 'Images, TIFF stacks, RAW, NRRD, MetaImage, NIfTI, DICOM and NumPy volumes thresholded into solid / void voxels: deposit and plug scans, sand packs, core samples.' },
   network: { title: 'Pipeline, equipment and network topology', blurb: 'Node-edge definitions of gathering networks, wells, manifolds, valves, chokes and sensors (JSON, YAML, XML, GraphML, CSV), PCF piping, IFC / IFCZIP equipment and AutomationML hierarchies.' },
   well: { title: 'Wells and trajectories', blurb: 'Deviation surveys (MD + inclination + azimuth by minimum curvature, or MD + TVD) from ASCII, CSV, JSON or MATLAB tables become 3-D well paths with dog-leg severity.' },
-  numeric: { title: 'Tabular and scientific data', blurb: 'CSV, text, JSON, XML, YAML, NumPy and MATLAB data sniffed into profiles (chainage / elevation), 3-D routes, wall-thickness, corrosion and deposit maps, particle clouds, time series, grids, networks or parameter tables.' },
+  numeric: { title: 'Tabular and scientific data', blurb: 'CSV, text, JSON, XML, YAML, NumPy, MATLAB (incl. v7.3) and HDF5 data sniffed into profiles (chainage / elevation), 3-D routes, wall-thickness, corrosion and deposit maps, particle clouds, time series, grids, networks or parameter tables.' },
   procedural: { title: 'Parametric and procedural geometry', blurb: 'Generated without a file: catenary and lazy-wave risers, undulating flowlines, build-and-hold wells, M-shaped jumpers, and porous structures (sphere packs, Voronoi foams, TPMS, lattices, CSG trees, implicit functions).' },
 });
 
@@ -151,7 +162,7 @@ export const SUITE_GEOMETRY = Object.freeze({
   solids: { classes: 'The pipe and network geometry of the flow suite plus deposit data: CSV / XYZ deposition maps (x, θ, t, δ), structured grids, voxel data, surface meshes (STL, OBJ, PLY, VTP) and CFD meshes (VTK, Gmsh, Fluent, OpenFOAM, UNV), particle and point clouds with size, velocity and density', accepts: ['table', 'grid', 'points', 'voxels', 'mesh', 'polylines', 'network', 'params'] },
   ops: { classes: 'Network topology and equipment connectivity: CSV, JSON, XML, YAML and GraphML node-edge tables with valve, choke, sensor and actuator locations, GIS pipeline routes, time-series operating data; STEP, IGES and DXF only where physical equipment geometry is needed', accepts: ['network', 'table', 'polylines', 'params'] },
   integ: { classes: 'STEP, IGES, STL, OBJ, DXF, IFC; structural / FEA meshes (Nastran BDF, Abaqus INP, ANSYS CDB, LS-DYNA KEY, UNV, Gmsh, VTK); inspection data: wall-thickness maps, corrosion and pit-depth grids, dent and free-span geometry, laser-scan point clouds (CSV, XYZ, VTK, PLY, LAS); GIS and bathymetric formats', accepts: ['mesh', 'table', 'grid', 'points', 'polylines', 'network', 'params'] },
-  econ: { classes: 'No mandatory CAD geometry. Network and equipment identifiers and engineering results as CSV, TSV, TXT/DAT, JSON, XML, YAML, NetCDF and other tabular or scientific tables (HDF5 after conversion); optional GIS or network references where costs or risks depend on location (route length, water depth, well depth, equipment counts)', accepts: ['network', 'polylines', 'table', 'params'] },
+  econ: { classes: 'No mandatory CAD geometry. Network and equipment identifiers and engineering results as CSV, TSV, TXT/DAT, JSON, XML, YAML, NetCDF, HDF5 and other tabular or scientific tables; optional GIS or network references where costs or risks depend on location (route length, water depth, well depth, equipment counts)', accepts: ['network', 'polylines', 'table', 'params'] },
 });
 
 const extName = (name) => { const s = String(name).toLowerCase(), m = s.match(/\.([a-z0-9_]+)$/); return /\.nii\.gz$/.test(s) ? 'nii.gz' : m ? m[1] : ''; };
@@ -2293,6 +2304,210 @@ async function readMIF(ctx) {
   return linesOrPoints(polys, pts, {});
 }
 
+// ---- Kernel B-rep files: ACIS SAT and Parasolid X_T (neutral model of fmt_brep.js) ---------------------------------------
+const BREP_UNIT = { 1: 'm', 0.001: 'mm', 0.01: 'cm', 0.0254: 'in', 0.3048: 'ft' };
+/** Parametric rectangle [u0, u0 + du] × [v0, v0 + dv] of a surface P(u, v) whose ∂u × ∂v points outwards -> triangles. */
+function patchFace(P, u0, du, v0, dv, sense, tri) {
+  const nu = Math.max(2, Math.ceil((Math.abs(du) / TAU) * ARC_N - 1e-9)), nv = Math.max(2, Math.ceil((Math.abs(dv) / TAU) * ARC_N - 1e-9)), g = [];
+  for (let j = 0; j <= nv; j++) for (let i = 0; i <= nu; i++) g.push(P(u0 + (du * i) / nu, v0 + (dv * j) / nv));
+  const eq = (a, b) => a[0] === b[0] && a[1] === b[1] && a[2] === b[2], put = (a, b, c) => { if (eq(a, b) || eq(b, c) || eq(a, c)) return; for (const q of sense ? [a, b, c] : [a, c, b]) tri.push(q[0], q[1], q[2]); };
+  for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) { const a = g[j * (nu + 1) + i], b = g[j * (nu + 1) + i + 1], c = g[(j + 1) * (nu + 1) + i + 1], d = g[(j + 1) * (nu + 1) + i]; put(a, b, c); put(a, c, d); }
+}
+/**
+ * Neutral B-rep model -> Geometry. A model recognised as a pipe gives its centreline (3-D polyline) with g.pipe = { runs,
+ * diameters, length }; any other model gives the tessellation of its analytic faces, or its wireframe when no face can be
+ * tessellated. opts.prefer = 'centreline' | 'mesh' | 'wireframe' overrides the choice.
+ */
+function brepGeom(m, opts) {
+  const warnings = m.warnings.slice(), tri = [], pr = recognisePipes(m), left = {}, units = BREP_UNIT[m.unitScale], prefer = String(opts.prefer || '');
+  let done = 0;
+  for (const f of m.faces) {
+    const s = f.surf, before = tri.length, pl = s.o ? { o: s.o, x: s.x, y: cross(s.z, s.x), z: s.z } : null, pts = f.loops.flatMap((l) => l.pts);
+    let why = s.type === 'spline' ? 'free-form (spline)' : s.type;
+    if (s.type === 'plane') planarFace(f.loops.filter((l) => !l.single).map((l) => ({ pts: l.pts })), pl, f.sense, tri);
+    else if ((s.type === 'cylinder' || s.type === 'cone') && s.ratio === undefined) revolvedFace(f.loops, pl, s.r, s.tanA, f.sense, tri);
+    else if (s.type === 'cylinder' || s.type === 'cone') why = 'elliptical ' + s.type;
+    else if (s.type === 'torus') {
+      // the face is taken as the parametric rectangle spanned by its boundary: exact for elbows and untrimmed patches
+      const th = [], ph = [];
+      for (const q of pts) { const d = sub(q, s.o), u = dot(d, pl.x), w = dot(d, pl.y); th.push(Math.atan2(w, u)); ph.push(Math.atan2(dot(d, s.z), Math.hypot(u, w) - s.R)); }
+      const [t0, dt] = angularExtent(th), [p0, dp] = angularExtent(ph);
+      patchFace((t, q) => { const c = s.R + s.r * Math.cos(q), a = c * Math.cos(t), b = c * Math.sin(t), h = s.r * Math.sin(q); return [s.o[0] + a * pl.x[0] + b * pl.y[0] + h * s.z[0], s.o[1] + a * pl.x[1] + b * pl.y[1] + h * s.z[1], s.o[2] + a * pl.x[2] + b * pl.y[2] + h * s.z[2]]; }, t0, dt, p0, dp, f.sense, tri);
+    } else if (s.type === 'sphere') {
+      const lat = pts.map((q) => Math.asin(Math.max(-1, Math.min(1, dot(sub(q, s.o), s.z) / s.r)))), band = f.loops.length >= 2 || !f.loops.length;
+      if (band) { const a = f.loops.length ? Math.min(...lat) : -Math.PI / 2, b = f.loops.length ? Math.max(...lat) : Math.PI / 2; patchFace((t, q) => { const c = s.r * Math.cos(q), a2 = c * Math.cos(t), b2 = c * Math.sin(t), h = s.r * Math.sin(q); return [s.o[0] + a2 * pl.x[0] + b2 * pl.y[0] + h * s.z[0], s.o[1] + a2 * pl.x[1] + b2 * pl.y[1] + h * s.z[1], s.o[2] + a2 * pl.x[2] + b2 * pl.y[2] + h * s.z[2]]; }, 0, TAU, a, b - a, f.sense, tri); }
+      else why = 'trimmed sphere';
+    }
+    if (tri.length > before) done++; else left[why] = (left[why] || 0) + 1;
+    if (tri.length > L.triangles * 9) fail(`The model tessellates to too many triangles (limit ${L.triangles}).`);
+  }
+  const runs = pr.runs.slice(0, 500).map((r) => ({ kind: r.kind, length: r.length, diameters: r.radii.map((q) => 2 * q), ...(r.kind === 'bend' ? { bendRadius: r.bendRadius, angle: (r.angle * 180) / Math.PI } : {}), from: r.a, to: r.b }));
+  const stats = { version: m.version, ...(m.schema ? { schema: m.schema } : {}), ...(units ? { units } : {}), faces: m.faces.length, tessellatedFaces: done, edges: m.edges.length, surfaces: m.counts.surfaces, pipeRuns: runs, diameters: pr.diameters, ...(pr.centrelines.length ? { centrelineLength: pr.length } : {}) };
+  const nLeft = m.faces.length - done;
+  if (m.unitScale === null || m.unitScale === undefined) warnings.push('The file gives no length unit; coordinates are returned as written.');
+  else if (!units) { stats.unitScale = m.unitScale; warnings.push(`One model unit is ${m.unitScale} m; coordinates are returned in model units.`); }
+  const poly = (list) => list.map((c) => ({ x: c.pts.map((q) => q[0]), y: c.pts.map((q) => q[1]), z: c.pts.map((q) => q[2]), closed: !!c.closed }));
+  const want = prefer === 'centreline' && pr.centrelines.length ? 'centreline' : prefer === 'mesh' && tri.length ? 'mesh' : prefer === 'wireframe' && m.edges.length ? 'wireframe' : pr.isPipe ? 'centreline' : tri.length ? 'mesh' : m.edges.length ? 'wireframe' : pr.centrelines.length ? 'centreline' : '';
+  const pipe = { isPipe: pr.isPipe, runs, diameters: pr.diameters, length: pr.length };
+  if (want === 'centreline') {
+    const main = pr.centrelines.filter((c, k) => k === 0 || c.length >= 0.02 * pr.length);
+    warnings.push(`${pr.isPipe ? 'Recognised as a pipe' : 'Pipe-like surfaces found'}: ${pr.runs.filter((r) => r.kind === 'straight').length} straight runs, ${pr.runs.filter((r) => r.kind === 'bend').length} bends and ${pr.runs.filter((r) => r.kind === 'reducer').length} reducers give a centreline of ${+pr.length.toPrecision(6)} model units with diameters ${pr.diameters.join(', ')}. Pass opts.prefer = "mesh" for the tessellated faces.`);
+    return Object.assign(polyGeom(poly(main), { warnings, stats: { ...stats, representation: 'pipe centreline' } }), { pipe });
+  }
+  if (want === 'mesh') {
+    if (nLeft) warnings.push(`${done} of ${m.faces.length} faces tessellated; ${nLeft} left out (${Object.entries(left).map(([k, v]) => `${v} × ${k}`).join(', ')}). Export STEP AP242 with tessellation or STL for a complete surface.`);
+    if (m.counts.surfaces.torus || m.counts.surfaces.sphere) warnings.push('Toroidal and spherical faces are filled over the parametric rectangle of their boundary (exact for elbows and untrimmed patches).');
+    return Object.assign(meshGeom(tri, { warnings, stats: { ...stats, representation: 'tessellated faces' } }), pr.runs.length ? { pipe } : {});
+  }
+  if (want !== 'wireframe') fail('The model holds no face or edge geometry that can be shown.');
+  warnings.push(`No face could be tessellated (${Object.entries(left).map(([k, v]) => `${v} × ${k}`).join(', ') || 'no faces'}); the edge wireframe is returned.`);
+  return Object.assign(polyGeom(poly(m.edges), { warnings, stats: { ...stats, representation: 'wireframe' } }), pr.runs.length ? { pipe } : {});
+}
+async function readSAT(ctx) {
+  const u8 = await ctx.bytes();
+  if (isSAB(u8)) parseSAB();
+  if (ctx.ext === 'sab') fail('The .sab file does not start with an ACIS binary header. Save the model as text ACIS (.sat) or STEP.');
+  return brepGeom(parseSAT(latin1.decode(u8)), ctx.opts);
+}
+
+async function readXT(ctx) {
+  const u8 = await ctx.bytes(), kind = xtKind(u8);
+  if (kind === 'binary' || kind === 'neutral') parseXB();
+  if (!kind) fail('Not a Parasolid transmit file (the "**PARASOLID" keyword header is missing).');
+  return brepGeom(parseXT(latin1.decode(u8)), ctx.opts);
+}
+
+// ---- AutoCAD DWG (fmt_dwg.js) -------------------------------------------------------------------------------------------
+const DWG_UNIT = { 1: 'in', 2: 'ft', 4: 'mm', 5: 'cm', 6: 'm', 7: 'km', 10: 'yd', 14: 'dm' };
+async function readDWG(ctx) {
+  const d = parseDWG(await ctx.bytes()), warnings = d.warnings, polys = [];
+  for (const p of d.polylines) {
+    if (!p.spline) { polys.push(p); continue; }
+    const s = p.spline, smp = s.points.length ? nurbsCurve(s.degree, s.knots, s.points, s.weights, NaN, NaN, 8 * s.points.length) : null, pts = smp || (s.fit.length > 1 ? s.fit : s.points);
+    if (pts.length > 1) polys.push({ x: pts.map((q) => q[0]), y: pts.map((q) => q[1]), ...(pts.some((q) => q[2] !== 0) ? { z: pts.map((q) => q[2]) } : {}), closed: !smp && s.closed, layer: p.layer, type: 'SPLINE' });
+  }
+  const sk = Object.entries(d.skipped), unit = DWG_UNIT[d.insunits], stats = { version: d.version, release: `AutoCAD ${d.release}`, entities: d.counts, layers: d.layers.slice(0, 200), ...(unit ? { units: unit } : {}), ...(d.insunits !== null ? { insunits: d.insunits } : {}) };
+  if (sk.length) warnings.push(`Entities that carry no line work were skipped: ${sk.slice(0, 12).map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
+  if (d.insunits === null) warnings.push('The drawing unit ($INSUNITS) is not read for this DWG version; coordinates are returned as drawn.');
+  else if (!unit) warnings.push('The drawing is unitless ($INSUNITS = 0 or an unusual unit); coordinates are returned as drawn.');
+  if (!polys.length && !d.points.length && d.faces.length) return meshGeom(d.faces, { warnings, stats: { ...stats, faces3d: d.counts['3DFACE'] } });
+  if (d.faces.length) warnings.push(`${d.counts['3DFACE']} 3DFACE entities were ignored in favour of the line work.`);
+  if (!polys.length && !d.points.length) fail(`No LINE, POLYLINE, CIRCLE, ARC, ELLIPSE, SPLINE, POINT or 3DFACE entities were found in the model space of this AutoCAD ${d.release} drawing${sk.length ? ` (it holds ${sk.slice(0, 6).map(([k, v]) => `${v} × ${k}`).join(', ')})` : ''}.`);
+  return linesOrPoints(polys, d.points, { warnings, stats });
+}
+
+// ---- MicroStation DGN V7 (fmt_dgn.js) ------------------------------------------------------------------------------
+async function readDGN(ctx) {
+  const d = parseDGN(await ctx.bytes()), names = Object.fromEntries(Object.entries(d.counts).map(([t, n]) => [({ 2: 'cell', 3: 'line', 4: 'line string', 6: 'shape', 11: 'curve', 12: 'complex chain', 14: 'complex shape', 15: 'ellipse', 16: 'arc', 21: 'B-spline poles', 22: 'point string' })[t] || `type ${t}`, n]));
+  const sk = Object.entries(d.skipped).filter(([k]) => k !== 'deleted'), unit = d.units.master.toLowerCase();
+  if (sk.length) d.warnings.push(`Elements that carry no line work were skipped: ${sk.map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
+  return linesOrPoints(d.polylines, d.points, { warnings: d.warnings, stats: { version: 'V7', dimension: d.is3d ? 3 : 2, ...(unit ? { units: unit } : {}), subUnit: d.units.sub || undefined, elements: names, levels: d.levels } });
+}
+
+// ---- GeoPackage (SQLite container, GeoPackage binary + WKB geometries) ------------------------------------------------
+/**
+ * One WKB geometry (OGC, ISO Z / M / ZM codes or EWKB flags, either byte order) starting at b[p0] -> out.polys / out.pts.
+ * Curve types are flattened to their control points (counted in out.curves). Returns false when the blob is malformed.
+ */
+function wkbGeom(b, p0, out, extra) {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), n = b.length;
+  let p = p0;
+  const put = (s, mode) => {
+    if (mode === 2) return s;
+    const m = s.x.length;
+    if (m === 1) out.pts.push(s.x[0], s.y[0], s.z ? s.z[0] : 0);
+    if (m < 2) return null;
+    if (mode === 1 && m > 2 && s.x[0] === s.x[m - 1] && s.y[0] === s.y[m - 1]) { s.x.pop(); s.y.pop(); if (s.z) s.z.pop(); }
+    out.vertices += m;
+    out.polys.push({ x: s.x, y: s.y, ...(s.z ? { z: s.z } : {}), closed: mode === 1, ...extra });
+    return null;
+  };
+  const geom = (depth, mode) => {
+    if (depth > 16 || p + 5 > n || b[p] > 1) throw 0;
+    const le = b[p] === 1;
+    let t = dv.getUint32(p + 1, le), hasZ = false, hasM = false;
+    p += 5;
+    if (t & 0x80000000) hasZ = true;
+    if (t & 0x40000000) hasM = true;
+    if (t & 0x20000000) p += 4;
+    t &= 0x0fffffff;
+    if (t >= 3000) { hasZ = hasM = true; t -= 3000; } else if (t >= 2000) { hasM = true; t -= 2000; } else if (t >= 1000) { hasZ = true; t -= 1000; }
+    const dim = 2 + (hasZ ? 1 : 0) + (hasM ? 1 : 0);
+    const count = (unit) => { if (p + 4 > n) throw 0; const c = dv.getUint32(p, le); p += 4; if (c * unit > n - p) throw 0; return c; };
+    const seq = () => {
+      const c = count(8 * dim), x = new Array(c), y = new Array(c), z = hasZ ? new Array(c) : null;
+      for (let k = 0; k < c; k++, p += 8 * dim) { x[k] = dv.getFloat64(p, le); y[k] = dv.getFloat64(p + 8, le); if (z) z[k] = dv.getFloat64(p + 16, le); }
+      return { x, y, z };
+    };
+    if (t === 1) {
+      if (p + 8 * dim > n) throw 0;
+      const x = dv.getFloat64(p, le), y = dv.getFloat64(p + 8, le), z = hasZ ? dv.getFloat64(p + 16, le) : 0;
+      p += 8 * dim;
+      if (x === x && y === y) { if (mode === 2) return { x: [x], y: [y], z: hasZ ? [z] : null }; out.pts.push(x, y, z === z ? z : 0); }
+      return null;
+    }
+    if (t === 2 || t === 8) { if (t === 8) out.curves++; return put(seq(), mode); }
+    if (t === 3 || t === 17) { for (let k = 0, c = count(4); k < c; k++) put(seq(), 1); return null; }
+    if (t === 9) {
+      const acc = { x: [], y: [], z: hasZ ? [] : null };
+      for (let k = 0, c = count(5); k < c; k++) { const s = geom(depth + 1, 2); if (!s) continue; const skip = acc.x.length && s.x[0] === acc.x[acc.x.length - 1] && s.y[0] === acc.y[acc.y.length - 1] ? 1 : 0; for (let i = skip; i < s.x.length; i++) { acc.x.push(s.x[i]); acc.y.push(s.y[i]); if (acc.z) acc.z.push(s.z ? s.z[i] : 0); } }
+      return put(acc, mode);
+    }
+    if (t === 10) { for (let k = 0, c = count(5); k < c; k++) geom(depth + 1, 1); return null; }
+    if ([4, 5, 6, 7, 11, 12, 15, 16].includes(t)) { for (let k = 0, c = count(5); k < c; k++) geom(depth + 1, mode === 2 ? 0 : mode); return null; }
+    throw 0;
+  };
+  try { geom(0, 0); return true; } catch (e) { if (e === 0) return false; throw e; }
+}
+const GPKG_ENV = [0, 32, 48, 48, 64];
+async function readGPKG(ctx) {
+  const db = openSQLite(await ctx.bytes()), warnings = [], opts = ctx.opts;
+  if (!db.tables.has('gpkg_contents')) fail('The file is an SQLite database but not a GeoPackage (table gpkg_contents is missing).');
+  if (db.wal) warnings.push('The GeoPackage is in write-ahead-log mode; changes still held in a "-wal" file beside it are not read.');
+  const contents = db.rows('gpkg_contents', { max: 10000 }), gcols = db.rows('gpkg_geometry_columns', { max: 10000 }).filter((r) => db.tables.has(String(r.table_name)));
+  const srsOf = new Map(db.rows('gpkg_spatial_ref_sys', { max: 100000 }).map((r) => [r.srs_id, r])), rasters = contents.filter((r) => /tiles|gridded/i.test(String(r.data_type))).map((r) => String(r.table_name));
+  const rasterNote = rasters.length ? `Tile pyramids and gridded-coverage (elevation) rasters are not read (${rasters.slice(0, 4).join(', ')}); export them as GeoTIFF: gdal_translate in.gpkg out.tif.` : '';
+  if (!gcols.length) fail(`The GeoPackage holds no vector feature table. ${rasterNote || 'Its attribute tables carry no geometry.'}`);
+  const want = opts.layer !== undefined ? gcols.filter((r) => String(r.table_name) === String(opts.layer)) : gcols;
+  if (!want.length) fail(`The GeoPackage has no feature layer "${String(opts.layer).slice(0, 60)}" (it holds ${gcols.slice(0, 10).map((r) => r.table_name).join(', ')}).`);
+  if (rasterNote) warnings.push(rasterNote);
+  const out = { polys: [], pts: [], vertices: 0, curves: 0 }, layers = [], attributes = [];
+  let nullGeom = 0, badGeom = 0, total = 0, geographic, cut = false;
+  for (const lay of want.slice(0, 64)) {
+    const name = String(lay.table_name), gc = String(lay.column_name), t = db.tables.get(name), cols = t.cols.filter((c) => c !== gc).slice(0, 32), nameCol = cols.find((c) => /^(name|label|title|line_?name|pipeline|route|tag|ref|descr(iption)?)$/i.test(c)), srs = srsOf.get(lay.srs_id);
+    let nf = 0;
+    if (srs && geographic === undefined && !/^\s*undefined\s*$/i.test(String(srs.definition || 'undefined'))) geographic = /^\s*GEOG(CS|CRS|RAPHICCRS)\b/i.test(String(srs.definition)) || (/^epsg$/i.test(String(srs.organization || '')) && +srs.organization_coordsys_id === 4326);
+    for (const r of db.rows(name, { max: 2e6 })) {
+      const g = r[gc];
+      nf++;
+      if (!(g instanceof Uint8Array) || g.length < 8) { nullGeom++; continue; }
+      if (g[0] !== 0x47 || g[1] !== 0x50) { badGeom++; continue; }
+      const flags = g[3], env = GPKG_ENV[(flags >> 1) & 7];
+      if (flags & 0x10) { nullGeom++; continue; }           // empty geometry
+      if (env === undefined || 8 + env + 5 > g.length) { badGeom++; continue; }
+      const attrs = {};
+      for (const c of cols) { const v = r[c]; if (v !== null && v !== undefined && !(v instanceof Uint8Array)) attrs[c] = typeof v === 'string' ? v.slice(0, 200) : v; }
+      const np = out.pts.length, tag = { layer: name, ...(nameCol && r[nameCol] !== null ? { name: String(r[nameCol]).slice(0, 120) } : {}), ...(Object.keys(attrs).length ? { attrs } : {}) };
+      if (!wkbGeom(g, 8 + env, out, tag)) badGeom++;
+      for (let k = np; k < out.pts.length && attributes.length < L.rows; k += 3) attributes.push(attrs);
+      if (out.vertices > 5e6 || out.pts.length > 3 * 8e6) { cut = true; break; }
+    }
+    total += nf;
+    layers.push({ name, type: String(lay.geometry_type_name || ''), features: nf, srs: srs ? String(srs.srs_name || lay.srs_id).slice(0, 80) : lay.srs_id, hasZ: lay.z === 1 || lay.z === 2 });
+    if (cut) { warnings.push('The GeoPackage holds more vertices than can be shown; the remaining features were not read.'); break; }
+  }
+  if (nullGeom) warnings.push(`${nullGeom} features without geometry were skipped.`);
+  if (badGeom) warnings.push(`${badGeom} geometries are not valid GeoPackage binary / WKB and were skipped.`);
+  if (out.curves) warnings.push(`${out.curves} circular-arc strings were reduced to their control points.`);
+  if (gcols.length > want.length) warnings.push(`Only layer "${want[0].table_name}" of ${gcols.length} feature layers was read.`);
+  else if (layers.length > 1) warnings.push(`${layers.length} feature layers were merged (${layers.map((l) => l.name).slice(0, 8).join(', ')}); pass opts.layer to read one.`);
+  if (!out.polys.length && !out.pts.length) fail(`The GeoPackage feature ${layers.length > 1 ? 'layers hold' : `layer "${layers[0].name}" holds`} no readable geometry (${total} features${nullGeom ? `, ${nullGeom} without geometry` : ''}${badGeom ? `, ${badGeom} not valid GeoPackage binary` : ''}).`);
+  const g = linesOrPoints(out.polys, out.pts, { warnings, stats: { layers, features: total } });
+  if (g.kind === 'points' && attributes.length === g.count && attributes.some((a) => Object.keys(a).length)) g.attributes = attributes;
+  g.geographic = geographic ?? (g.bbox.min[0] >= -180 && g.bbox.max[0] <= 180 && g.bbox.min[1] >= -90 && g.bbox.max[1] <= 90);
+  return g;
+}
+
 // ---- Rasters: ESRI ASCII, Surfer, TIFF, NetCDF classic, band-interleaved ----------------------------------
 function readASCGrid(text) {
   const h = Object.create(null);
@@ -2465,9 +2680,12 @@ async function readTIFF(ctx) {
 const tags2str = (tags, tag, u8) => { const t = tags.get(tag); return t && t.type === 2 ? latin1.decode(u8.subarray(t.vo, t.vo + t.count)).replace(/\0.*$/, '').trim() : null; };
 
 const NC_TYPE = { 1: 'i1', 3: 'i2', 4: 'i4', 5: 'f4', 6: 'f8', 7: 'u1', 8: 'u2', 9: 'u4', 10: 'i8', 11: 'u8' };
-async function readNetCDF(ctx) {
-  const u8 = await ctx.bytes(), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), ver = u8[3], conv = fmtNamed('NetCDF classic').convert;
-  if (u8[0] === 0x89 && u8[1] === 0x48 && u8[2] === 0x44 && u8[3] === 0x46) fail('This is a NetCDF-4 / HDF5 file. ' + conv);
+/**
+ * NetCDF classic header -> variable accessor { vars: [{ name, dims, shape, at, numeric, all(), slice2() }], at } shared by the
+ * grid reader and Exodus II. all() gives every value in C order, slice2() the first 2-D slice over the last two dimensions.
+ */
+function cdfClassic(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), ver = u8[3];
   if (u8.length < 32 || u8[0] !== 0x43 || u8[1] !== 0x44 || u8[2] !== 0x46 || ![1, 2, 5].includes(ver)) fail('Not a NetCDF classic file (CDF signature missing).');
   let p = 4;
   const bad = () => fail('The NetCDF header is truncated or corrupt.');
@@ -2487,40 +2705,73 @@ async function readNetCDF(ctx) {
     });
     return a;
   };
-  const numrecs = nn(), dims = list(10, () => ({ name: name(), len: nn() }));
-  atts();
-  const vars = list(11, () => { const nm = name(), nd = nn(); if (nd > 32) bad(); const dimids = []; for (let k = 0; k < nd; k++) { const d = nn(); if (d >= dims.length) bad(); dimids.push(d); } const at = atts(), type = i4(), vsize = nn(), begin = offs(); return { name: nm, dimids, at, type, vsize, begin }; });
+  const numrecs = nn(), dims = list(10, () => ({ name: name(), len: nn() })), gat = atts();
+  const raw = list(11, () => { const nm = name(), nd = nn(); if (nd > 32) bad(); const dimids = []; for (let k = 0; k < nd; k++) { const d = nn(); if (d >= dims.length) bad(); dimids.push(d); } const at = atts(), type = i4(), vsize = nn(), begin = offs(); return { name: nm, dimids, at, type, vsize, begin }; });
   const isRec = (v) => v.dimids.length > 0 && dims[v.dimids[0]].len === 0, shape = (v) => v.dimids.map((d, k) => (k === 0 && dims[d].len === 0 ? numrecs : dims[d].len));
-  const recVars = vars.filter(isRec), tsz = (v) => DT[NC_TYPE[v.type]][1];
-  const recSize = recVars.length === 1 && NC_TYPE[recVars[0].type] ? shape(recVars[0]).slice(1).reduce((a, b) => a * b, 1) * tsz(recVars[0]) : recVars.reduce((a, v) => a + v.vsize, 0);
-  const numeric = (v) => !!NC_TYPE[v.type];
-  const read1 = (v) => { const n = shape(v)[0]; if (!(n <= u8.length)) bad(); if (!isRec(v)) return typed(u8, v.begin, n, NC_TYPE[v.type], false); const out = new Float64Array(n); for (let r = 0; r < n; r++) out[r] = typed(u8, v.begin + r * recSize, 1, NC_TYPE[v.type], false)[0]; return out; };
-  const warnings = [], byName = (nm) => vars.find((v) => v.name === nm);
+  const recVars = raw.filter(isRec);
+  const recSize = recVars.length === 1 && NC_TYPE[recVars[0].type] ? shape(recVars[0]).slice(1).reduce((a, b) => a * b, 1) * DT[NC_TYPE[recVars[0].type]][1] : recVars.reduce((a, v) => a + v.vsize, 0);
+  /** First n values of a variable in C order (record variables are gathered record by record). */
+  const first = (v, n) => {
+    const dt = NC_TYPE[v.type];
+    if (!dt) fail(`NetCDF variable "${v.name}" is not numeric.`);
+    if (!(n <= u8.length)) bad();
+    if (!isRec(v)) return typed(u8, v.begin, n, dt, false);
+    const per = shape(v).slice(1).reduce((a, b) => a * b, 1), out = new Float64Array(n);
+    for (let r = 0, o = 0; o < n; r++, o += per) out.set(typed(u8, v.begin + r * recSize, Math.min(per, n - o), dt, false), o);
+    return out;
+  };
+  const vars = raw.map((v) => { const sh = shape(v); return { name: v.name, dims: v.dimids.map((d) => dims[d].name), shape: sh, at: v.at, numeric: !!NC_TYPE[v.type], all: async () => first(v, sh.reduce((a, b) => a * b, 1)), slice2: async () => first(v, sh.slice(-2).reduce((a, b) => a * b, 1)) }; });
+  return { vars, at: gat, flavour: `CDF-${ver}` };
+}
+/** The same accessor over a NetCDF-4 file (HDF5 datasets; dimensions resolved through DIMENSION_LIST references). */
+function cdfHDF5(h5) {
+  const byAddr = new Map(), vars = [], norm = (at) => { const o = Object.create(null); for (const k in at) { const v = at[k]; o[k] = typeof v === 'number' ? [v] : ArrayBuffer.isView(v) ? Array.from(v) : v; } return o; };
+  h5.walk((path, addr, inf) => { if (inf.kind === 'dataset') byAddr.set(addr, path.slice(1)); }, { maxDepth: 8 });
+  for (const [addr, name] of byAddr) {
+    const inf = h5.info(addr), at = h5.attrs(addr), dl = at.DIMENSION_LIST, sh = inf.shape, rank = sh.length;
+    if (typeof at.NAME === 'string' && at.NAME.startsWith('This is a netCDF dimension but not a netCDF variable')) continue;
+    const dimNames = Array.isArray(dl) && dl.length === rank ? dl.map((r, k) => (r && r.length ? byAddr.get(r[0]) : undefined) ?? `dim${k}`) : rank === 1 ? [name] : sh.map((_, k) => `dim${k}`);
+    vars.push({ name, dims: dimNames, shape: sh, at: norm(at), numeric: isNumeric(inf.type) && inf.type.cls !== 10, all: async () => (await h5.read(addr)).data, slice2: async () => (await h5.read(addr, { count: sh.map((n, k) => (k < rank - 2 ? 1 : n)) })).data });
+  }
+  return { vars, at: norm(h5.attrs(h5.root)), flavour: 'NetCDF-4' };
+}
+/** First gridded variable of a NetCDF data set (classic or NetCDF-4) with its coordinate variables -> grid. */
+async function cdfGrid(nc) {
+  const { vars } = nc, warnings = [], byName = (nm) => vars.find((v) => v.name === nm);
   // legacy GMT layout: z(xysize) with x_range / y_range / dimension
   const gz = byName('z'), gd = byName('dimension'), gx = byName('x_range'), gy = byName('y_range');
-  if (gz && gd && gx && gy && gz.dimids.length === 1 && numeric(gz)) {
-    const [nx, ny] = read1(gd), xr = read1(gx), yr = read1(gy);
-    if (!(nx > 0 && ny > 0) || nx * ny > L.voxels) bad();
-    const z = typed(u8, gz.begin, nx * ny, NC_TYPE[gz.type], false), sf = (gz.at.scale_factor || [1])[0], ao = (gz.at.add_offset || [0])[0], zz = sf === 1 && ao === 0 ? z : Float64Array.from(z, (q) => q * sf + ao);
+  if (gz && gd && gx && gy && gz.shape.length === 1 && gz.numeric) {
+    const [nx, ny] = await gd.all(), xr = await gx.all(), yr = await gy.all();
+    if (!(nx > 0 && ny > 0) || nx * ny > L.voxels || nx * ny > gz.shape[0]) fail('The NetCDF header is truncated or corrupt.');
+    const z = (await gz.all()).subarray(0, nx * ny), sf = (gz.at.scale_factor || [1])[0], ao = (gz.at.add_offset || [0])[0], zz = sf === 1 && ao === 0 ? z : Float64Array.from(z, (q) => q * sf + ao);
     return gridGeom(zz, nx, ny, (i) => xr[0] + ((xr[1] - xr[0]) * (i + 0.5)) / nx, (j) => yr[1] - ((yr[1] - yr[0]) * (j + 0.5)) / ny, { nodata: (q) => q !== q, warnings, stats: { variable: 'z', layout: 'GMT v3' } });
   }
-  const cand = vars.filter((v) => numeric(v) && v.dimids.length >= 2 && shape(v).slice(-2).every((n) => n > 1) && !/bnds|bounds|^crs$/i.test(v.name));
+  const cand = vars.filter((v) => v.numeric && v.shape.length >= 2 && v.shape.slice(-2).every((n) => n > 1) && !/bnds|bounds|^crs$/i.test(v.name));
   const v = cand.find((q) => /^(z|elev|elevation|topo|bathy|bathymetry|depth|height|band1|dem|altitude)/i.test(q.name)) || cand[0];
   if (!v) fail('No 2-D numeric variable was found in the NetCDF file.');
-  const sh = shape(v), ny = sh[sh.length - 2], nx = sh[sh.length - 1], dt = NC_TYPE[v.type];
+  const sh = v.shape, ny = sh[sh.length - 2], nx = sh[sh.length - 1];
   if (nx * ny > L.voxels) fail('The NetCDF variable is too large.');
-  let raw;
-  if (isRec(v) && sh.length === 2) { raw = new Float64Array(nx * ny); for (let r = 0; r < ny; r++) raw.set(typed(u8, v.begin + r * recSize, nx, dt, false), r * nx); }
-  else raw = typed(u8, v.begin, nx * ny, dt, false);
+  const raw = await v.slice2();
   if (sh.length > 2) warnings.push(`Variable "${v.name}" has ${sh.length} dimensions (${sh.join(' × ')}); its first 2-D slice is used.`);
   const sf = (v.at.scale_factor || [1])[0], ao = (v.at.add_offset || [0])[0], fills = [v.at._FillValue, v.at.missing_value].filter(Array.isArray).map((a) => a[0]);
   const z = new Float64Array(nx * ny);
   for (let k = 0; k < z.length; k++) { const q = raw[k]; z[k] = fills.includes(q) || q !== q ? NaN : q * sf + ao; }
-  const coord = (dimId, n) => { const cv = vars.find((q) => q.name === dims[dimId].name && q.dimids.length === 1 && numeric(q)); if (!cv) return { f: (i) => i, v: null }; const a = read1(cv); return a.length >= n ? { f: (i) => a[i], v: cv } : { f: (i) => i, v: null }; };
-  const cx = coord(v.dimids[v.dimids.length - 1], nx), cy = coord(v.dimids[v.dimids.length - 2], ny);
+  const coord = async (dim, n) => { const cv = vars.find((q) => q.name === dim && q.shape.length === 1 && q.numeric); if (!cv) return { f: (i) => i, v: null }; const a = await cv.all(); return a.length >= n ? { f: (i) => a[i], v: cv } : { f: (i) => i, v: null }; };
+  const cx = await coord(v.dims[v.dims.length - 1], nx), cy = await coord(v.dims[v.dims.length - 2], ny);
   if (!cx.v || !cy.v) warnings.push('No coordinate variables were found for the grid; cell indices are used as coordinates.');
   const geographic = !!cx.v && (/degree/i.test(String(cx.v.at.units || '')) || /^lon/i.test(cx.v.name));
-  return gridGeom(z, nx, ny, cx.f, cy.f, { nodata: (q) => q !== q, geographic, warnings, stats: { variable: v.name, units: typeof v.at.units === 'string' ? v.at.units : undefined, dimensions: v.dimids.map((d) => dims[d].name) } });
+  return gridGeom(z, nx, ny, cx.f, cy.f, { nodata: (q) => q !== q, geographic, warnings, stats: { variable: v.name, units: typeof v.at.units === 'string' ? v.at.units : undefined, dimensions: v.dims } });
+}
+async function readNetCDF(ctx) {
+  const u8 = await ctx.bytes();
+  if (hdf5Offset(u8) === 0) return readHDF(ctx, 'netcdf');
+  return Object.assign(await cdfGrid(cdfClassic(u8)), { format: 'NetCDF classic' });
+}
+async function readExodus(ctx) {
+  const u8 = await ctx.bytes();
+  if (hdf5Offset(u8) === 0) return readHDF(ctx, 'exodus');
+  if (!(u8[0] === 0x43 && u8[1] === 0x44 && u8[2] === 0x46)) fail('Not an Exodus II file: it is neither a NetCDF classic nor a NetCDF-4 / HDF5 container.');
+  return Object.assign(await exodusGeom(cdfClassic(u8)), { format: 'Exodus II' });
 }
 
 async function readBandRaster(ctx) {
@@ -2660,7 +2911,7 @@ async function readLAS(ctx) {
   const u8 = await ctx.bytes(), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (u8.length < 227 || latin1.decode(u8.subarray(0, 4)) !== 'LASF') fail('Not a LAS file (LASF signature missing).');
   const major = u8[24], minor = u8[25], hsize = dv.getUint16(94, true), off = dv.getUint32(96, true), fmtRaw = u8[104], fmt = fmtRaw & 0x3f, rec = dv.getUint16(105, true);
-  if (fmtRaw & 0xc0) fail(fmtNamed('LAZ (compressed LAS)').convert);
+  if (fmtRaw & 0xc0) return Object.assign(await readLAZ(ctx), { format: 'LAZ (compressed LAS)' });
   if (major !== 1 || minor > 4 || fmt > 10 || rec < 20 || off < hsize || off > u8.length) fail(`Unsupported or corrupt LAS file (version ${major}.${minor}, point format ${fmt}).`);
   let n = dv.getUint32(107, true);
   if (minor >= 4 && hsize >= 375 && u8.length >= 255) { const n64 = Number(dv.getBigUint64(247, true)); if (n64 > 0) n = n64; }
@@ -2671,6 +2922,17 @@ async function readLAS(ctx) {
   for (let k = 0, i = 0; i < n; i += step, k++) { const o = off + i * rec; xyz[3 * k] = dv.getInt32(o, true) * sc[0] + of[0]; xyz[3 * k + 1] = dv.getInt32(o + 4, true) * sc[1] + of[1]; xyz[3 * k + 2] = dv.getInt32(o + 8, true) * sc[2] + of[2]; }
   if (step > 1) warnings.push(`Point cloud of ${n} points evenly sub-sampled to ${m} (every ${step}th point).`);
   return pointsGeom(xyz, { warnings, stats: { version: `${major}.${minor}`, pointFormat: fmt, sourcePoints: n } });
+}
+
+async function readLAZ(ctx) {
+  const u8 = await ctx.bytes();
+  if (u8.length > 110 && !isLAZ(u8)) return readLAS(ctx);
+  const d = parseLAZ(u8, { maxPoints: L.points });
+  return pointsGeom(d.xyz, { warnings: d.warnings, stats: { version: d.version, pointFormat: d.pointFormat, sourcePoints: d.total, compression: `LASzip ${d.lazVersion}, ${d.compressor}`, chunks: d.chunks } });
+}
+async function readE57(ctx) {
+  const d = parseE57(await ctx.bytes(), { maxPoints: L.points });
+  return pointsGeom(d.xyz, { warnings: d.warnings, stats: { version: d.version, scans: d.scans.length, sourcePoints: d.total, invalidPoints: d.invalid, scanNames: d.scans.map((s) => s.name).filter(Boolean).slice(0, 20) } });
 }
 
 // ---- Images and voxel volumes -----------------------------------------------------------------------------
@@ -4000,7 +4262,7 @@ const MAT_DT = { 1: 'i1', 2: 'u1', 3: 'i2', 4: 'u2', 5: 'i4', 6: 'u4', 7: 'f4', 
 const MAT_CLASS = { 1: 'cell', 2: 'struct', 3: 'object', 4: 'char', 5: 'sparse', 16: 'function handle', 17: 'opaque' };
 async function readMAT(ctx) {
   const u8 = await ctx.bytes(), head = latin1.decode(u8.subarray(0, Math.min(116, u8.length))), how = fmtNamed('MATLAB MAT-file').convert, opts = ctx.opts, warnings = [];
-  if (/^MATLAB 7\.3 MAT-file/.test(head) || (u8.length > 520 && u8[512] === 0x89 && u8[513] === 0x48 && u8[514] === 0x44 && u8[515] === 0x46)) fail('MATLAB v7.3 MAT-files are HDF5 containers and are not read. ' + how);
+  if (/^MATLAB 7\.3 MAT-file/.test(head) || hdf5Offset(u8) >= 0) return readHDF(ctx, 'matlab');
   if (u8.length < 136 || !/^MATLAB 5\.0 MAT-file/.test(head)) fail('Not a Level 5 MAT-file (version 4 files and other data are not read). ' + how);
   const little = u8[126] === 0x49 && u8[127] === 0x4d;
   if (!little && !(u8[126] === 0x4d && u8[127] === 0x49)) fail('The MAT-file header has no valid byte-order mark.');
@@ -4032,6 +4294,10 @@ async function readMAT(ctx) {
     if (el.type === 15) { const inf = await inflate(el.data, 'deflate', budget); budget -= inf.length; if (budget <= 0) fail('Decompressed data is too large.'); const inner = element(inf, 0); if (inner && inner.type === 14) matrix(inner.data); }
     else if (el.type === 14) matrix(el.data);
   }
+  return matGeom(vars, skipped, opts, warnings);
+}
+/** MATLAB variables [{ name, dims, count, data (column-major), complex }] -> table, survey, grid, voxels (Level 5 and v7.3 alike). */
+function matGeom(vars, skipped, opts, warnings) {
   if (!vars.length) fail(`The MAT-file holds no numeric arrays${skipped.length ? ` (skipped: ${skipped.slice(0, 6).join(', ')})` : ''}.`);
   if (skipped.length) warnings.push(`Variables that are not plain numeric arrays were skipped: ${skipped.slice(0, 8).join(', ')}.`);
   if (vars.some((v) => v.complex)) warnings.push('Imaginary parts of complex arrays are ignored.');
@@ -4070,6 +4336,264 @@ async function readMAT(ctx) {
   }
   g.stats = { ...stats, ...(g.stats || {}) };
   g.warnings = [...new Set([...warnings, ...(g.warnings || [])])];
+  return g;
+}
+
+// ---- HDF5 containers: CGNS, Salome MED, Exodus II, NetCDF-4, MATLAB v7.3 and plain HDF5 data sets --------------------
+const CGNS_ELEM = { 2: ['node', 1], 3: ['line', 2], 4: ['line', 3], 5: ['tri', 3], 6: ['tri', 6], 7: ['quad', 4], 8: ['quad', 8], 9: ['quad', 9], 10: ['tet', 4], 11: ['tet', 10], 12: ['pyramid', 5], 13: ['pyramid', 14], 14: ['wedge', 6], 15: ['wedge', 15], 16: ['wedge', 18], 17: ['hex', 8], 18: ['hex', 20], 19: ['hex', 27], 21: ['pyramid', 13], 24: ['line', 4], 25: ['tri', 9], 26: ['tri', 10], 27: ['quad', 12], 28: ['quad', 16], 29: ['tet', 16], 30: ['tet', 20], 31: ['pyramid', 21], 32: ['pyramid', 29], 33: ['pyramid', 30], 34: ['wedge', 24], 35: ['wedge', 38], 36: ['wedge', 40], 37: ['hex', 32], 38: ['hex', 56], 39: ['hex', 64], 40: ['line', 5], 41: ['tri', 12], 42: ['tri', 15], 43: ['quad', 16], 44: ['quad', 25], 45: ['tet', 22], 46: ['tet', 34], 47: ['tet', 35], 48: ['pyramid', 29], 49: ['pyramid', 50], 50: ['pyramid', 55], 51: ['wedge', 33], 52: ['wedge', 66], 53: ['wedge', 75], 54: ['hex', 44], 55: ['hex', 98], 56: ['hex', 125] };
+const CORNERS = { node: 1, line: 2, tri: 3, quad: 4, tet: 4, pyramid: 5, wedge: 6, hex: 8 };
+const h5Text = (v) => (typeof v === 'string' ? v : ArrayBuffer.isView(v) ? latin1.decode(Uint8Array.from(v, (c) => c & 255)).replace(/\0[\s\S]*$/, '') : Array.isArray(v) && typeof v[0] === 'string' ? v[0] : '').trim();
+/** CGNS (HDF5 flavour): every zone of every base; structured zones as blocks, unstructured Elements_t sections as cells. */
+async function cgnsGeom(h5) {
+  const warnings = [], stats = { bases: 0, zones: 0 };
+  const target = (addr) => (h5Text(h5.attrs(addr).type) === 'LK' ? h5.resolve(' link', addr) : addr);
+  const kidsOf = (addr) => { const out = []; for (const [name, l] of h5.kids(addr)) { if (name[0] === ' ' || l.addr === undefined) continue; const a = target(l.addr); if (a < 0) { stats.externalLinks = (stats.externalLinks || 0) + 1; continue; } out.push({ name, addr: a, label: h5Text(h5.attrs(a).label) }); } return out; };
+  const data = async (addr) => { const d = h5.resolve(' data', addr); return d < 0 || h5.info(d).kind !== 'dataset' ? null : (await h5.read(d)).data; };
+  const bases = kidsOf(h5.root).filter((n) => n.label === 'CGNSBase_t');
+  if (!bases.length) fail('The CGNS file holds no CGNSBase_t node.');
+  const blocks = [], store = cellStore(), xyzParts = [], skipped = {};
+  let nodeBase = 0, sNodes = 0;
+  for (const base of bases) {
+    stats.bases++;
+    const bk = kidsOf(base.addr), du = bk.find((n) => n.label === 'DimensionalUnits_t');
+    if (du && !stats.units) { const t = await data(du.addr); if (t && t.length >= 64) stats.units = h5Text(t.subarray(32, 64)) || undefined; }
+    for (const zone of bk.filter((n) => n.label === 'Zone_t')) {
+      stats.zones++;
+      const zk = kidsOf(zone.addr), zd = await data(zone.addr), zt = zk.find((n) => n.label === 'ZoneType_t'), ztype = zt ? h5Text(await data(zt.addr)) : 'Structured';
+      const gc = zk.find((n) => n.label === 'GridCoordinates_t' && n.name === 'GridCoordinates') || zk.find((n) => n.label === 'GridCoordinates_t');
+      if (!zd || !gc) { warnings.push(`Zone "${zone.name}" has no size or no grid coordinates and was skipped.`); continue; }
+      const idim = Math.floor(zd.length / 3), size = Array.from(zd.subarray(0, idim)), nv = size.reduce((a, b) => a * b, 1), ck = kidsOf(gc.addr), comp = [];
+      for (const nm of ['CoordinateX', 'CoordinateY', 'CoordinateZ']) { const c = ck.find((n) => n.name === nm); comp.push(c ? await data(c.addr) : null); }
+      const cr = ck.find((n) => n.name === 'CoordinateR'), ct = ck.find((n) => n.name === 'CoordinateTheta');
+      if (!comp[0] && cr && ct && !ck.some((n) => n.name === 'CoordinatePhi')) {
+        const R = await data(cr.addr), T = await data(ct.addr);
+        if (R && T && T.length >= R.length) { comp[0] = Float64Array.from(R, (q, i) => q * Math.cos(T[i])); comp[1] = Float64Array.from(R, (q, i) => q * Math.sin(T[i])); warnings.push(`Zone "${zone.name}": cylindrical coordinates converted to Cartesian.`); }
+      }
+      if (!comp[0] || !(nv > 0) || comp.some((c) => c && c.length < nv)) { warnings.push(`Zone "${zone.name}" has no usable CoordinateX / Y / Z arrays and was skipped.`); continue; }
+      if (nv > 3 * L.cells) fail('The CGNS zone has too many nodes.');
+      const xyz = new Float64Array(3 * nv);
+      for (let d = 0; d < 3; d++) if (comp[d]) for (let i = 0; i < nv; i++) xyz[3 * i + d] = comp[d][i];
+      if (/^Structured/i.test(ztype)) { blocks.push({ xyz, ni: size[0] || 1, nj: size[1] || 1, nk: size[2] || 1 }); sNodes += nv; continue; }
+      xyzParts.push(xyz);
+      // element sections in ElementRange order; NGON_n / NFACE_n are resolved once all sections are known
+      const secs = [];
+      for (const s of zk.filter((n) => n.label === 'Elements_t')) {
+        const sd = await data(s.addr), sk = kidsOf(s.addr), by = (nm) => sk.find((n) => n.name === nm), rg = by('ElementRange') && (await data(by('ElementRange').addr)), cn = by('ElementConnectivity') && (await data(by('ElementConnectivity').addr));
+        if (!sd || !rg || !cn) continue;
+        secs.push({ type: sd[0], start: rg[0], end: rg[1], conn: cn, off: by('ElementStartOffset') ? await data(by('ElementStartOffset').addr) : null, pe: sd[0] === 22 && by('ParentElements') ? await data(by('ParentElements').addr) : null, name: s.name });
+      }
+      secs.sort((a, b) => a.start - b.start);
+      const ngon = new Map(), nface = [], add = (kind, c, o) => { const n = CORNERS[kind], ids = new Array(n); for (let k = 0; k < n; k++) ids[k] = nodeBase + c[o + k] - 1; store.add(kind, ids); };
+      for (const s of secs) {
+        const ne = s.end - s.start + 1, c = s.conn;
+        if (!(ne > 0)) continue;
+        if (s.type === 20) {                                  // MIXED: each element is preceded by its type
+          for (let e = 0, o = 0; e < ne && o < c.length; e++) { if (s.off) o = s.off[e]; const el = CGNS_ELEM[c[o]]; if (!el) { skipped['mixed type ' + c[o]] = (skipped['mixed type ' + c[o]] || 0) + 1; if (!s.off) break; continue; } if (o + 1 + el[1] > c.length) break; if (el[0] !== 'node') add(el[0], c, o + 1); o += 1 + el[1]; }
+        } else if (s.type === 22 || s.type === 23) {         // polygon faces / polyhedral cells: offsets (CGNS 4) or inline counts (CGNS 3)
+          for (let e = 0, o = 0; e < ne && o < c.length; e++) {
+            let a, b;
+            if (s.off) { a = s.off[e]; b = s.off[e + 1]; } else { a = o + 1; b = a + c[o]; o = b; }
+            if (!(a >= 0 && b > a && b <= c.length)) break;
+            if (s.type === 22) ngon.set(s.start + e, [c, a, b, s.pe && s.pe.length >= 2 * ne ? !s.pe[e] || !s.pe[ne + e] : null]); else nface.push([c, a, b]);
+          }
+        } else {
+          const el = CGNS_ELEM[s.type];
+          if (!el) { skipped[`element type ${s.type}`] = (skipped[`element type ${s.type}`] || 0) + ne; continue; }
+          if (el[0] === 'node') continue;
+          if (c.length < ne * el[1]) fail(`CGNS section "${s.name}" has fewer connectivity entries than its element range requires.`);
+          for (let e = 0; e < ne; e++) add(el[0], c, e * el[1]);
+        }
+      }
+      if (ngon.size) {
+        const use = new Map();
+        for (const [c, a, b] of nface) for (let k = a; k < b; k++) { const f = Math.abs(c[k]); use.set(f, (use.get(f) || 0) + 1); }
+        let nb = 0;                                           // boundary = faces of one NFACE_n cell, or with one parent element
+        for (const [id, [c, a, b, edge]] of ngon) { if (nface.length ? use.get(id) !== 1 : edge === false) continue; const ids = []; for (let k = a; k < b; k++) ids.push(nodeBase + c[k] - 1); store.add('poly', ids); nb++; }
+        stats.polyhedra = (stats.polyhedra || 0) + nface.length; stats.polygonFaces = (stats.polygonFaces || 0) + ngon.size;
+        if (nb < ngon.size) warnings.push(`Zone "${zone.name}": polyhedral cells (${nface.length ? 'NFACE_n' : 'ParentElements'}) reduced to their ${nb} boundary faces of ${ngon.size}.`);
+      }
+      nodeBase += nv;
+    }
+  }
+  if (stats.externalLinks) warnings.push(`${stats.externalLinks} links to other CGNS files were not followed.`);
+  if (stats.bases > 1) warnings.push(`The file holds ${stats.bases} bases (${bases.slice(0, 6).map((b) => b.name).join(', ')}); their zones are shown together.`);
+  const sk = Object.entries(skipped);
+  if (sk.length) warnings.push(`Unsupported element sections were skipped: ${sk.map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
+  const uNodes = nodeBase;
+  if (blocks.length && (!store.t.length || sNodes >= uNodes)) {
+    if (store.t.length) warnings.push('The file mixes structured and unstructured zones; the structured zones are shown.');
+    return structuredGeom(blocks, { warnings, stats });
+  }
+  if (!xyzParts.length) fail('No zone with grid coordinates could be read from the CGNS file.');
+  if (blocks.length) warnings.push('The file mixes structured and unstructured zones; the unstructured zones are shown.');
+  const all = new Float64Array(3 * uNodes);
+  let o = 0;
+  for (const part of xyzParts) { all.set(part, o); o += part.length; }
+  return cellMesh(all, store, { warnings, stats, ...(store.t.includes('poly') && !store.t.some((t) => CELL_FACES[t]) ? { flat: false } : {}) });
+}
+
+const MED_ELEM = { SE2: 'line', SE3: 'line', SE4: 'line', TR3: 'tri', TR6: 'tri', TR7: 'tri', QU4: 'quad', QU8: 'quad', QU9: 'quad', TE4: 'tet', T10: 'tet', PY5: 'pyramid', P13: 'pyramid', PE6: 'wedge', P15: 'wedge', P18: 'wedge', HE8: 'hex', H20: 'hex', H27: 'hex' };
+/** Salome MED (2.x - 4.x): nodes and element connectivity of one unstructured mesh, quadratic cells reduced to corners. */
+async function medGeom(h5, opts) {
+  const maa = h5.resolve('/ENS_MAA');
+  if (maa < 0) fail('The MED file holds no mesh (group ENS_MAA is missing); MED files with fields only are not read.');
+  const names = [...h5.kids(maa)].filter(([, l]) => l.addr !== undefined), pick = names.find(([n]) => n === String(opts.mesh ?? '')) || names[0], warnings = [];
+  if (!pick) fail('The MED file holds no mesh.');
+  if (names.length > 1) warnings.push(`The file holds ${names.length} meshes (${names.slice(0, 8).map(([n]) => n).join(', ')}); "${pick[0]}" is used.`);
+  let m = pick[1].addr;
+  if (h5.resolve('NOE/COO', m) < 0) { const step = [...h5.kids(m)].find(([, l]) => l.addr !== undefined && h5.resolve('NOE/COO', l.addr) >= 0); if (!step) fail('The MED mesh has no node coordinates (NOE/COO); structured MED grids are not read.'); m = step[1].addr; }
+  const coo = h5.resolve('NOE/COO', m), cd = (await h5.read(coo)).data, nn = +h5.attrs(coo).NBR || 0, dim = nn ? Math.round(cd.length / nn) : 0;
+  if (!(nn > 0) || dim < 1 || dim > 3 || cd.length < nn * dim) fail('The MED node coordinates are inconsistent.');
+  const xyz = new Float64Array(3 * nn), store = cellStore(), skipped = {};
+  for (let d = 0; d < dim; d++) for (let i = 0; i < nn; i++) xyz[3 * i + d] = cd[d * nn + i];
+  const mai = h5.resolve('MAI', m);
+  for (const [type, l] of mai < 0 ? [] : h5.kids(mai)) {
+    const nod = l.addr === undefined ? -1 : h5.resolve('NOD', l.addr), kind = MED_ELEM[type];
+    if (nod < 0) continue;
+    const c = (await h5.read(nod)).data;
+    if (type === 'POG') {                                    // polygons: INN holds the 1-based start of each polygon in NOD
+      const inn = h5.resolve('INN', l.addr), ix = inn < 0 ? null : (await h5.read(inn)).data;
+      for (let e = 0; ix && e + 1 < ix.length; e++) { const ids = []; for (let k = ix[e] - 1; k < ix[e + 1] - 1 && k < c.length; k++) ids.push(c[k] - 1); if (ids.length > 2) store.add('poly', ids); }
+      continue;
+    }
+    const ne = +h5.attrs(nod).NBR || 0, npe = ne ? Math.round(c.length / ne) : 0;
+    if (!kind || !(ne > 0) || npe < CORNERS[kind]) { if (type !== 'PO1') skipped[type] = (skipped[type] || 0) + ne; continue; }
+    for (let e = 0; e < ne; e++) { const ids = new Array(CORNERS[kind]); for (let k = 0; k < ids.length; k++) ids[k] = c[k * ne + e] - 1; store.add(kind, ids); }
+  }
+  const sk = Object.entries(skipped);
+  if (sk.length) warnings.push(`Unsupported MED element types were skipped: ${sk.map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
+  return cellMesh(xyz, store, { warnings, stats: { mesh: pick[0], spaceDimension: dim } });
+}
+
+/** Exodus II over either NetCDF flavour: coordx / coordy / coordz (or coord) and the connect<N> element blocks. */
+async function exodusGeom(nc) {
+  const by = (n) => nc.vars.find((v) => v.name === n), cx = by('coordx'), co = by('coord'), warnings = [], skipped = {}, blocks = {};
+  let xyz, nn;
+  if (cx) {
+    const c = [await cx.all(), by('coordy') ? await by('coordy').all() : null, by('coordz') ? await by('coordz').all() : null];
+    nn = c[0].length; xyz = new Float64Array(3 * nn);
+    for (let d = 0; d < 3; d++) if (c[d] && c[d].length >= nn) for (let i = 0; i < nn; i++) xyz[3 * i + d] = c[d][i];
+  } else if (co && co.shape.length === 2 && co.shape[0] <= 3) {
+    const a = await co.all(), nd = co.shape[0];
+    nn = co.shape[1]; xyz = new Float64Array(3 * nn);
+    for (let d = 0; d < nd; d++) for (let i = 0; i < nn; i++) xyz[3 * i + d] = a[d * nn + i];
+  } else fail('Not an Exodus II mesh: the coordinate variables (coordx, coordy, coordz or coord) are missing.');
+  const store = cellStore(), txt = (v) => (typeof v === 'string' ? v : Array.isArray(v) && typeof v[0] === 'string' ? v[0] : '').trim().toUpperCase();
+  for (const v of nc.vars.filter((q) => /^connect\d+$/.test(q.name)).sort((a, b) => +a.name.slice(7) - +b.name.slice(7))) {
+    if (v.shape.length !== 2 || !v.numeric) continue;
+    const [ne, npe] = v.shape, et = txt(v.at.elem_type);
+    const kind = /^HEX/.test(et) ? 'hex' : /^TET/.test(et) ? 'tet' : /^(WEDGE|PENTA|PRISM)/.test(et) ? 'wedge' : /^PYR/.test(et) ? 'pyramid' : /^TRI/.test(et) ? 'tri' : /^(QUAD|SHELL|RECT)/.test(et) ? (npe === 3 || npe === 6 ? 'tri' : 'quad') : /^(BAR|BEAM|TRUSS|EDGE|ROD|LINE)/.test(et) ? 'line' : null;
+    if (!kind || npe < CORNERS[kind]) { skipped[et || 'untyped'] = (skipped[et || 'untyped'] || 0) + ne; continue; }
+    const c = await v.all(), n = CORNERS[kind];
+    blocks[et] = (blocks[et] || 0) + ne;
+    for (let e = 0; e < ne; e++) { const ids = new Array(n); for (let k = 0; k < n; k++) ids[k] = c[e * npe + k] - 1; store.add(kind, ids); }
+  }
+  const sk = Object.entries(skipped);
+  if (sk.length) warnings.push(`Element blocks of unsupported type were skipped: ${sk.map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
+  return cellMesh(xyz, store, { warnings, stats: { elementBlocks: blocks, title: typeof nc.at.title === 'string' ? nc.at.title.slice(0, 80) : undefined, container: nc.flavour } });
+}
+
+const MAT73_NUM = new Set(['double', 'single', 'int8', 'uint8', 'int16', 'uint16', 'int32', 'uint32', 'int64', 'uint64', 'logical']);
+/** MATLAB v7.3: root data sets with a numeric MATLAB_class -> the variable records of the Level 5 reader. */
+async function mat73Vars(h5) {
+  const vars = [], skipped = [];
+  for (const [name, l] of h5.kids(h5.root)) {
+    if (l.addr === undefined || name[0] === '#') continue;
+    const inf = h5.info(l.addr), at = h5.attrs(l.addr), cls = h5Text(at.MATLAB_class) || (inf.kind === 'group' ? 'struct' : 'unknown');
+    const cplx = inf.kind === 'dataset' && inf.type && inf.type.cls === 6 && inf.type.members.length === 2 && inf.type.members.every((m) => isNumeric(m.type));
+    if (inf.kind !== 'dataset' || !MAT73_NUM.has(cls) || !(isNumeric(inf.type) || cplx) || at.MATLAB_empty || at.MATLAB_sparse !== undefined) { skipped.push(`${name} (${at.MATLAB_sparse !== undefined ? 'sparse' : at.MATLAB_empty ? 'empty' : cls})`); continue; }
+    if (inf.count > L.voxels) fail(`Array "${name}" is too large.`);
+    if (vars.length >= 256) break;
+    const r = await h5.read(l.addr), dims = inf.shape.slice().reverse();
+    while (dims.length < 2) dims.push(1);
+    vars.push({ name, dims, count: inf.count, data: cplx ? r.data[inf.type.members[0].name] : r.data, complex: cplx, logical: cls === 'logical' });
+  }
+  return { vars, skipped };
+}
+
+/** Plain HDF5: the most geometry-like numeric data set (opts.dataset = path overrides) -> points, polyline, grid, voxels or table. */
+async function h5Generic(h5, opts, contents) {
+  const warnings = [], ds = contents.filter((c) => c.kind === 'dataset' && c.numeric && c.count > 1), short = (c) => c.path.replace(/^.*\//, '');
+  if (!ds.length) fail(`The HDF5 file holds no numeric data set${contents.length ? ` (it holds ${contents.slice(0, 6).map((c) => c.path).join(', ')})` : ''}.`);
+  const isXYZ = (c) => c.shape.length === 2 && (c.shape[1] === 2 || c.shape[1] === 3) && c.shape[0] > c.shape[1], load = async (c) => (await h5.read(c.addr)).data;
+  const big = (list) => list.slice().sort((a, b) => b.count - a.count)[0];
+  let c = opts.dataset !== undefined ? ds.find((q) => q.path === String(opts.dataset) || q.path === '/' + String(opts.dataset)) : null;
+  if (opts.dataset !== undefined && !c) fail(`The HDF5 file has no numeric data set "${String(opts.dataset).slice(0, 80)}" (it holds ${ds.slice(0, 10).map((q) => q.path).join(', ')}).`);
+  const vecs = ds.filter((q) => q.shape.length === 1), byLen = new Map();
+  for (const v of vecs) { const k = v.path.replace(/[^/]*$/, '') + '|' + v.count; if (byLen.has(k)) byLen.get(k).push(v); else byLen.set(k, [v]); }
+  const groups = [...byLen.values()].filter((l) => l.length > 1).sort((a, b) => b.length * b[0].count - a.length * a[0].count);
+  if (!c) c = big(ds.filter(isXYZ).filter((q) => /coord|point|xyz|vert|node|pos|route|path|centre|center|line|track/i.test(q.path))) || big(ds.filter(isXYZ));
+  const stats = { datasets: ds.length };
+  const table = (headers, col, n) => {
+    const records = [];
+    for (let r = 0; r < Math.min(n, L.rows); r++) records.push(Object.fromEntries(headers.map((h, k) => [h, col(r, k)])));
+    if (n > L.rows) warnings.push(`Only the first ${L.rows} of ${n} rows are kept.`);
+    const tc = tableColumns(headers);
+    if (tc.role === 'survey') return surveyFromRecords(headers, records, tc, warnings);
+    return { kind: 'table', headers, records, warnings, stats: { ...stats, rows: n, ...(tc.role ? { role: tc.role } : {}) } };
+  };
+  if (!c && groups.length && groups[0].length * groups[0][0].count >= big(ds).count) {
+    const grp = groups[0].slice(0, 64), cols = [];
+    for (const v of grp) cols.push(await load(v));
+    warnings.push(`${grp.length} vectors of length ${grp[0].count} were combined into one table (columns ${grp.map(short).join(', ')}).`);
+    return table(grp.map(short), (r, k) => cols[k][r], grp[0].count);
+  }
+  if (!c) c = big(ds.filter((q) => q.shape.length === 2)) || big(ds.filter((q) => q.shape.length === 3)) || big(ds);
+  if (c.count > L.voxels) fail(`Data set "${c.path}" is too large.`);
+  if (ds.length > 1) warnings.push(`The file holds ${ds.length} numeric data sets; "${c.path}" (${c.shape.join(' × ')}) is used. Pass opts.dataset to choose another.`);
+  stats.dataset = c.path; stats.shape = c.shape; stats.dtype = c.type;
+  const d = await load(c), sh = c.shape.filter((n, k) => n > 1 || k >= c.shape.length - 2);
+  let g;
+  if (isXYZ(c)) {
+    const n = c.shape[0], w = c.shape[1], xyz = new Float64Array(3 * n);
+    for (let i = 0; i < n; i++) for (let k = 0; k < w; k++) xyz[3 * i + k] = d[i * w + k];
+    if (pathLike(xyz) && !/point|cloud|scan|vert|node/i.test(c.path)) { const x = [], y = [], z = []; for (let i = 0; i < n; i++) { x.push(xyz[3 * i]); y.push(xyz[3 * i + 1]); z.push(xyz[3 * i + 2]); } g = polyGeom([{ x, y, ...(w === 3 ? { z } : {}), closed: false }], { warnings, stats }); }
+    else g = pointsGeom(xyz, { warnings, stats });
+  } else if (sh.length === 1) g = table([short(c)], (r) => d[r], c.count);
+  else if (sh.length === 2) {
+    const [nr, ncol] = sh;
+    if (ncol <= 16 && nr > ncol) g = table(Array.from({ length: ncol }, (_, k) => `${short(c)}_${k + 1}`), (r, k) => d[r * ncol + k], nr);
+    else {
+      // 1-D data sets of matching length beside the array serve as its coordinates
+      const dir = c.path.replace(/[^/]*$/, ''), sib = vecs.filter((v) => v.path.startsWith(dir) && !v.path.slice(dir.length).includes('/')), cx = sib.find((v) => v.count === ncol && /^(x|lon|longitude|easting|east)$/i.test(short(v))), cy = sib.find((v) => v.count === nr && /^(y|lat|latitude|northing|north)$/i.test(short(v)));
+      if (cx && cy) { const X = await load(cx), Y = await load(cy); g = gridGeom(Float64Array.from(d), ncol, nr, (i) => X[i], (j) => Y[j], { nodata: (q) => q !== q, geographic: /^lon/i.test(short(cx)), warnings, stats }); }
+      else { warnings.push(`Array "${c.path}" of ${nr} × ${ncol} read as a regular array (row 1 at y = 0, column 1 at x = 0).`); g = imageGeom(Float64Array.from(d), ncol, nr, 1, opts.spacing || [1, 1, 1], [0, 0, 0], opts, { warnings, stats }); }
+    }
+  } else if (sh.length === 3) g = npyGeom({ shape: sh, fortran: false, data: d, dtype: c.type }, opts);
+  else fail(`HDF5 data sets with ${sh.length} dimensions are not supported (use vectors, matrices or 3-D arrays).`);
+  g.stats = { ...stats, ...(g.stats || {}) };
+  g.warnings = [...new Set([...warnings, ...(g.warnings || [])])];
+  return g;
+}
+
+/** Any HDF5 container. hint: 'cgns' | 'med' | 'exodus' | 'netcdf' | 'matlab' forces that reading; otherwise the content decides. */
+async function readHDF(ctx, hint) {
+  const u8 = await ctx.bytes(), opts = ctx.opts;
+  if (u8.length > 4 && u8[0] === 0x0e && u8[1] === 0x03 && u8[2] === 0x13 && u8[3] === 0x01) fail('This is an HDF4 file, which is not read (HDF5 is). Convert it with h4toh5 in.hdf out.h5, or export the data set as GeoTIFF / CSV.');
+  if (hint === 'cgns' && /ADF Database Version/.test(latin1.decode(u8.subarray(0, 64)))) fail('This CGNS file uses the older ADF container, which is not read (the HDF5 container is). Convert it with the CGNS tools: cgnsconvert -h in.cgns out.cgns (or adf2hdf in.cgns out.cgns).');
+  const h5 = openHDF5(u8, { maxBytes: L.inflated }), rootKids = h5.kids(h5.root), rat = h5.attrs(h5.root), contents = [];
+  const has = (n) => rootKids.has(n);
+  let dimScales = false;
+  h5.walk((path, addr, inf) => {
+    if (path === '/') return;
+    if (contents.length < 400) contents.push({ path, kind: inf.kind, addr, ...(inf.kind === 'dataset' ? { shape: inf.shape, type: typeName(inf.type), count: inf.count, numeric: isNumeric(inf.type) && inf.type.cls !== 10 } : {}) });
+    if (inf.kind === 'dataset' && !dimScales && contents.length < 60) { const a = h5.attrs(addr); if (a.DIMENSION_LIST !== undefined || a.CLASS === 'DIMENSION_SCALE') dimScales = true; }
+  }, { maxDepth: 12, maxNodes: 50000 });
+  const isCgns = has('CGNSLibraryVersion') || [...rootKids].some(([n, l]) => n[0] !== ' ' && l.addr !== undefined && h5Text(h5.attrs(l.addr).label) === 'CGNSBase_t');
+  const isMat = h5.userBlock === 512 && /^MATLAB 7\.3 MAT-file/.test(latin1.decode(u8.subarray(0, 24)));
+  const kind = hint && hint !== 'netcdf' ? hint : isCgns ? 'cgns' : has('ENS_MAA') ? 'med' : isMat ? 'matlab' : has('coordx') || (has('coord') && has('connect1')) ? 'exodus' : rat._NCProperties !== undefined || dimScales || hint === 'netcdf' ? 'netcdf' : 'hdf5';
+  let g;
+  if (kind === 'cgns') { if (!isCgns) fail('The file is an HDF5 container but not a CGNS tree (no CGNSBase_t node).'); g = Object.assign(await cgnsGeom(h5), { format: 'CGNS' }); }
+  else if (kind === 'med') g = Object.assign(await medGeom(h5, opts), { format: 'Salome MED' });
+  else if (kind === 'exodus') g = Object.assign(await exodusGeom(cdfHDF5(h5)), { format: 'Exodus II' });
+  else if (kind === 'matlab') { const { vars, skipped } = await mat73Vars(h5); g = Object.assign(matGeom(vars, skipped, opts, []), { format: 'MATLAB MAT-file' }); g.stats.container = 'HDF5 (v7.3)'; }
+  else {
+    let err = null;
+    if (kind === 'netcdf') try { g = Object.assign(await cdfGrid(cdfHDF5(h5)), { format: 'NetCDF-4 (HDF5)' }); } catch (e) { if (!e || !e.user) throw e; err = e; }
+    if (!g) try { g = Object.assign(await h5Generic(h5, opts, contents), { format: kind === 'netcdf' ? 'NetCDF-4 (HDF5)' : 'HDF5' }); } catch (e) { if (err && e && e.user) throw err; throw e; }
+  }
+  g.contents = contents.slice(0, 200).map(({ path, kind: k, shape, type }) => ({ path, kind: k, ...(shape ? { shape, type } : {}) }));
+  if (contents.length >= 400) g.warnings.push('The file holds more objects than are listed in the contents (first 200 shown).');
   return g;
 }
 
@@ -4149,13 +4673,15 @@ const READERS = {
   dxf: readDXF, svg: (ctx) => readSVG(ctx), hpgl: readHPGL, hpg: readHPGL, xy: named('x-y polyline', readDelimited),
   geojson: readJSON, json: readJSON, kml: (ctx) => readKML(ctx), kmz: (ctx) => readKML(ctx), gpx: (ctx) => readGPX(ctx), gml: (ctx) => readGML(ctx), shp: readSHP, mif: readMIF,
   asc: async (ctx) => (/^\s*ncols\s/i.test(await sniffHead(ctx, 200)) ? readASCGrid(await ctx.text()) : Object.assign(await readDelimited(ctx), { format: 'XYZ points / soundings', pathway: 'points' })),
-  grd: readSurfer, tif: readTIFF, tiff: readTIFF, nc: readNetCDF, cdf: readNetCDF, bil: readBandRaster, bip: readBandRaster, bsq: readBandRaster,
+  grd: readSurfer, tif: readTIFF, tiff: readTIFF, nc: readNetCDF, cdf: readNetCDF, nc4: readNetCDF, bil: readBandRaster, bip: readBandRaster, bsq: readBandRaster,
   las: readLAS, pts: (ctx) => readPoints(ctx), ptx: readPTX, xyzi: readDelimited, xyzrgb: readDelimited,
   xyz: async (ctx) => { const h = await sniffHead(ctx, 400), l1 = (splitLines(h).find((l) => l.trim()) || '').trim().split(/\s+/); if (l1.length <= 3 && l1.every((t) => /^\d+$/.test(t))) { const b = plot3dBlocks(numsOf(await ctx.text())); if (b) return Object.assign(structuredGeom(b, {}), { format: 'Plot3D grid (ASCII)' }); return readPoints(ctx, (await ctx.text()).replace(/^\s*\d+\s*(\r\n|\n|\r)/, '')); } return readDelimited(ctx); },
   png: readImage, jpg: readImage, jpeg: readImage, bmp: readImage, webp: readImage, gif: readImage,
   raw: readRAW, vol: readRAW, bin: readRAW, nrrd: readNRRD, nhdr: readNRRD, mha: readMHA, mhd: readMHA, nii: readNIfTI, 'nii.gz': readNIfTI, npy: readNPY, npz: readNPY, dcm: readDICOM, dicom: readDICOM,
   graphml: async (ctx) => graphmlGeom(parseXML(await ctx.text())), landxml: readLandXML, inp: readAbaqus, cdb: readCDB, k: readDyna, key: readDyna, dyn: readDyna,
   dev: readSurvey, wbt: readSurvey, survey: readSurvey, sgy: readSEGY, segy: readSEGY, mat: readMAT, dem: readDEM, dtm: readDEM, dsm: readDEM, ifczip: readIFCZIP,
+  x_t: readXT, x_b: readXT, xmt_txt: readXT, xmt_bin: readXT, sat: readSAT, sab: readSAT, dwg: readDWG, dgn: readDGN, gpkg: readGPKG, e57: readE57, laz: readLAZ, cgns: (ctx) => readHDF(ctx, 'cgns'), med: (ctx) => readHDF(ctx, 'med'), rmed: (ctx) => readHDF(ctx, 'med'), e: readExodus, exo: readExodus, ex2: readExodus, exii: readExodus, g: readExodus,
+  h5: (ctx) => readHDF(ctx), hdf5: (ctx) => readHDF(ctx), hdf: (ctx) => readHDF(ctx), he5: (ctx) => readHDF(ctx), h4: (ctx) => readHDF(ctx),
   pcf: readPCF, ifc: readIFC, aml: async (ctx) => amlGeom(parseXML(await ctx.text())), yaml: readYAML, yml: readYAML, xml: readXML, csv: readDelimited, tsv: readDelimited, txt: readDelimited,
 };
 
@@ -4173,7 +4699,10 @@ export async function importGeometry(file, opts = {}) {
     if (ext === 'hdr') fail('Select the raster data file (.bil / .bip / .bsq) and supply this .hdr as its companion.');
     fail(`Unsupported geometry format "${ext ? '.' + ext : name}". See the format list for what can be read or how to convert it.`);
   }
-  if (fmt.support === 'convert') fail(fmt.convert);
+  if (fmt.support === 'convert') {
+    if (ext === 'jt' && typeof file.arrayBuffer === 'function') { const b = new Uint8Array(await file.arrayBuffer()); if (isJT(b)) parseJT(b); }   // says what the JT file holds
+    fail(fmt.convert);
+  }
   if (!ext) ext = 'foam';
   let buf, u8, txt;
   const comp = opts.companion && typeof opts.companion === 'object' ? (Array.isArray(opts.companion) ? opts.companion.map((f) => [f && f.name, f]) : Object.entries(opts.companion)) : [];
