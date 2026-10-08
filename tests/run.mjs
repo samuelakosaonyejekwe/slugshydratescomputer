@@ -98,6 +98,23 @@ for (const meta of SUITES) {
     try { const m = c.model({ ...d }); for (const t of c.targets) ok(Number.isFinite(m[t.key]), `calibration model returns ${t.key}`); ok(c.sample.length >= 8, 'calibration sample has rows'); for (const p of c.params) ok(keys.has(p.key), `calibration parameter ${p.key} is an input`); }
     catch (e) { ok(false, `calibration threw: ${e.message}`); }
   }
+  if (s.validationData) {
+    ok(Array.isArray(s.validationData), 'validationData is an array');
+    for (const ds of s.validationData || []) {
+      const lab = `reference data "${ds.id}"`;
+      ok(ds.id && ds.title && ds.target && Array.isArray(ds.rows) && ds.rows.length >= 8, `${lab}: id, title, target and ≥ 8 rows`);
+      ok(ds.source && /^https?:\/\//.test(ds.source.url || '') && (ds.source.citation || '').length > 20 && ds.source.licence && /^\d{4}-\d\d-\d\d$/.test(ds.source.retrieved || ''), `${lab}: citation, address, licence and retrieval date`);
+      try {
+        const meas = [], pred = [];
+        for (const r of ds.rows) { const m = +r[ds.target], q = +ds.model(r); if (Number.isFinite(m)) { meas.push(m); pred.push(q); } }
+        ok(pred.every(Number.isFinite), `${lab}: model returns finite predictions`);
+        const mt = metrics(meas, pred), t = ds.tolerance || {};
+        const within = (t.mape === undefined || mt.mape <= t.mape) && (t.rmse === undefined || mt.rmse <= t.rmse) && (t.bias === undefined || Math.abs(mt.bias) <= t.bias) && (t.maxAbs === undefined || Math.max(...mt.residuals.map(Math.abs)) <= t.maxAbs);
+        ok(within, `${lab}: outside its stated tolerance (MAPE ${mt.mape?.toFixed(2)} %, RMSE ${mt.rmse?.toPrecision(3)}, bias ${mt.bias?.toPrecision(3)})`);
+        console.log(`   ${ds.id}: n = ${meas.length}, MAPE ${mt.mape?.toFixed(2)} %, bias ${mt.bias?.toPrecision(3)} ${ds.unit || ''}`);
+      } catch (e) { ok(false, `${lab} threw: ${e.message}`); }
+    }
+  }
   try { const checks = await s.verify(); const failed = checks.filter((c) => !c.pass); ok(checks.length >= 12, `has ≥ 12 verification checks (${checks.length})`); ok(!failed.length, `verification failures: ${failed.map((c) => `${c.name} (got ${c.got}, expected ${c.expected})`).join('; ')}`); console.log(`   ${checks.length - failed.length}/${checks.length} verification checks pass · ${Date.now() - t0} ms`); }
   catch (e) { ok(false, `verify threw: ${e.message}`); }
 }

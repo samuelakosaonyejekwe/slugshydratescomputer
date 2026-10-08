@@ -195,3 +195,49 @@ until the coupled quantities stop changing, so engines must be deterministic for
 `groundTemp` (°C, soil at about 1 m), `pressure` (hPa), `bathy` `{ lat[], lon[], elev[][] }` (local grid, m, negative below sea),
 `seabedSlope` (deg), `inflation` (%/y), `lendingRate` (%/y), `fxPerUSD`, `currency`, `electricityPrice` ($/kWh),
 `gridCarbon` (kgCO₂/kWh), `oilPrice` ($/bbl Brent), `gasPrice` ($/MMBtu), `carbonPrice` ($/tCO₂), `taxRate` (%), `country`.
+
+## Sourced parameters and reference validation data
+
+Numbers that come from the literature (model constants, correlation coefficients, property data, default costs) must be
+traceable. A suite may export, next to its default object:
+
+```js
+// Every constant set the engine relies on, with where it was checked.
+export const PROVENANCE = [
+  { item: 'Calcite solubility product, log K(T)', used: 'scaleIndices()', source: 'USGS PHREEQC database phreeqc.dat', url: 'https://…',
+    retrieved: '2026-10-08', status: 'verified' | 'corrected' | 'unverified', note: 'what was compared and the largest difference found' },
+];
+```
+
+and the default object may carry
+
+```js
+validationData: [
+  { id: 'nist-methane-z', title: 'Methane compressibility factor, 250–400 K, 1–600 bar', quantity: 'Z', unit: '–',
+    kind: 'reference-fluid' | 'experiment' | 'field' | 'benchmark' | 'market',
+    source: { citation: 'Full citation of the publication or database', url: 'https://… (the address the numbers were actually read from)',
+              licence: 'public domain / CC BY 4.0 / …', retrieved: '2026-10-08' },
+    columns: [{ key: 'T', label: 'Temperature', unit: 'K' }, { key: 'P', label: 'Pressure', unit: 'bar' }, { key: 'Z', label: 'Measured Z' }],
+    rows: [{ T: 250, P: 10, Z: 0.9712 }, …],          // >= 8 rows, copied from the source, never invented or "typical"
+    target: 'Z',                                       // the measured column
+    model: (row) => 0.9705,                            // the engine's blind prediction for that row (no fitting to this data set)
+    tolerance: { mape: 2 },                            // acceptance limit the engine is expected to meet (optional: bias, rmse, maxAbs)
+    note: 'range of applicability, what the comparison shows' },
+],
+```
+
+Data sets live in `js/data/ref/<suite id>.js` (one module per suite, imported by that suite) so that the engine file stays
+readable. Rules: only numbers that were actually read from the cited address during development; keep the citation and the
+address; respect the licence (facts and public-domain or openly licensed data only — no copied copyrighted tables beyond a
+few cited data points); never tune the model to a validation set; if the engine misses the tolerance, say so in `note` and
+leave the tolerance honest rather than widening it silently. The workspace shows every data set on the calibration tab with
+a parity plot and error metrics, and `tests/run.mjs` evaluates them all.
+
+## Hand-off to external open-source solvers
+
+Formulations that cannot run inside a browser at useful resolution (three-dimensional LES/DNS, interface-capturing CFD,
+shell and solid finite elements, two-way fluid–structure interaction, multi-parameter reference equations of state) are
+covered by `js/core/bridge.js`: it writes ready-to-run case files for open solvers from the case and the suite results and
+reads their results back. `bridge.js` exports `HANDOFF = { <suite id>: [{ match: 'lower-case fragment of the catalogue item',
+solver: 'OpenFOAM interFoam', generator: 'openfoamVof' }] }`; the Equations tab shows those items as “via external solver”
+— a third state between “solved in-app” and “reference”. Suites must not tick such items as implemented.
