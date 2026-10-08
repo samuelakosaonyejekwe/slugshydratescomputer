@@ -15,8 +15,6 @@ const KEL = 273.15, KB = 1.380649e-23, MW_W = 0.018015, PI = Math.PI;
 export const HYDRATE = Object.freeze({ rho: 920, latent: 4.4e5, k: 0.6, cp: 2100 }); // kg/m³, J/kg, W/m/K, J/kg/K
 const need = (cond, msg) => { if (!cond) throw new Error(msg); };
 const num = (x, d) => (isNum(+x) ? +x : d);
-const fin = (x, d = 0) => (Number.isFinite(x) ? x : d);
-const nn = (x) => (Number.isFinite(x) ? x : null);
 
 // =====================================================================================================
 // 1. Hydrate thermodynamics: van der Waals–Platteeuw statistical model for methane structure I
@@ -125,7 +123,8 @@ export function pbeGrid(n = 14, Lmin = 2e-6, Lmax = 2e-2, dCol = 0) {
     const vd = v[i] / 2; // two equal daughters shared between the neighbouring pivots: conserves number (2) and volume
     if (vd < v[0]) { bk[i] = -1; } else { const k = find(vd); bk[i] = k; ba[i] = (2 * (v[k + 1] - vd)) / (v[k + 1] - v[k]); bb[i] = 2 - ba[i]; }
   }
-  return { n, L, v, pk, pa, pb, bk, ba, bb, gS, gD, gB };
+  let ub = 1; for (let i = 0; i < n; i++) if (bk[i] >= 0) ub = Math.max(ub, i - bk[i]); // classes a daughter can fall below its parent
+  return { n, L, v, pk, pa, pb, bk, ba, bb, gS, gD, gB, ub };
 }
 /**
  * Collision-frequency kernel (m³/s) between spheres of diameter Li and Lj and its parts.
@@ -139,7 +138,8 @@ export function aggregationKernel(Li, Lj, { shear = 0, eps = 0, nu = 1e-6, mu = 
 /**
  * Sectional population balance over a time t (s) in one well-mixed volume: aggregation (fixed pivot, explicit sub-steps),
  * binary breakage, growth/shrinkage in volume space (pivot shift with the exact volume rate and, for growth, exact number) and a source in one class.
- * N: number per class (any consistent basis). o: { beta: Float64Array n×n (m³/s on the same basis) | number (constant kernel),
+ * N: number per class (any consistent basis). o: { beta: Float64Array n×n (m³/s on the same basis) | number (constant kernel) |
+ *   [cS, cD, cB] (coefficients of the grid's shear, differential-settling and Brownian geometry tables),
  *   gv: [dv/dt per class, m³/s], S: [breakage frequency 1/s], src: { k, rate (1/s) }, frac (max fractional loss per sub-step), maxSub }.
  * Returns { N, sub, limited } — `limited` is true when the interval was too stiff for maxSub explicit sub-steps and
  * linearly implicit (modified Patankar–Euler) steps on the class volumes were used instead: unconditionally positive,
@@ -148,17 +148,17 @@ export function aggregationKernel(Li, Lj, { shear = 0, eps = 0, nu = 1e-6, mu = 
 export function solvePBE(grid, N0, t, { beta = null, gv = null, S = null, src = null, frac = 0.25, maxSub = 400 } = {}) {
   const { n, v, pk, pa, pb, bk, ba, bb } = grid, ws = (grid.ws ||= { dN: new Float64Array(n), tmp: new Float64Array(n), dth: new Float64Array(n), lim: new Float64Array(n), V: new Float64Array(n), M: new Float64Array(n * n) });
   const N = new Float64Array(n), { dN, tmp, dth, lim, V, M } = ws; for (let i = 0; i < n; i++) N[i] = N0[i];
-  const _c = 0, cst = typeof beta === 'number';
-  const B = (i, j) => (cst ? beta : beta[i * n + j]);
+  const cst = typeof beta === 'number', kc = beta !== null && !cst && beta.length === 3 ? beta : null, { gS, gD, gB } = grid, k0 = kc ? kc[0] : 0, k1 = kc ? kc[1] : 0, k2 = kc ? kc[2] : 0;
+  const B = (i, j) => { if (cst) return beta; const q = i * n + j; return kc ? k0 * gS[q] + k1 * gD[q] + k2 * gB[q] : beta[q]; };
   // death frequency of every class and the largest one among the classes that carry a noticeable share of the volume
-  const rates = () => { let r = 0, vt = 0; for (let i = 0; i < n; i++) vt += N[i] * v[i]; for (let i = 0; i < n; i++) { let d = 0; if (beta !== null && N[i] > 0) for (let j = 0; j < n; j++) d += B(i, j) * N[j]; dth[i] = d; const tot = d + (S ? S[i] : 0); if (N[i] * v[i] > 1e-5 * vt && tot > r) r = tot; } return r; };
+  const rates = () => { let r = 0, vt = 0; for (let i = 0; i < n; i++) vt += N[i] * v[i]; for (let i = 0; i < n; i++) { let d = 0; if (beta !== null && N[i] > 0) for (let j = 0; j < n; j++) if (N[j] > 0) d += B(i, j) * N[j]; dth[i] = d; const tot = d + (S ? S[i] : 0); if (N[i] * v[i] > 1e-5 * vt && tot > r) r = tot; } return r; };
   let rate = rates(), sub = Math.max(1, Math.ceil((t * rate) / frac)), limited = false, dt = t / sub;
   if (sub > maxSub) { // too stiff for explicit sub-steps: linearly implicit, positivity-preserving and volume-conserving steps
     limited = true; sub = 0;
     const nImp = 3, h = t / nImp;
-    const flow = (src, dst, fl) => { if (src === dst || !(fl > 0)) return; const c = fl / V[src]; M[dst * n + src] += c; M[src * n + src] -= c; };
+    const ub = grid.ub, flow = (src, dst, fl) => { if (src === dst) return; const c = (h * fl) / V[src]; if (!(c > 1e-18)) return; M[dst * n + src] -= c; M[src * n + src] += c; }; // negligible transfers are skipped (they would only cost denormal arithmetic)
     for (let st = 0; st < nImp; st++) {
-      M.fill(0); for (let i = 0; i < n; i++) V[i] = N[i] * v[i];
+      M.fill(0); for (let i = 0; i < n; i++) { V[i] = N[i] * v[i]; M[i * n + i] = 1; }
       if (beta !== null) for (let i = 0; i < n; i++) {
         if (!(N[i] > 0)) continue;
         for (let j = i; j < n; j++) {
@@ -168,10 +168,10 @@ export function solvePBE(grid, N0, t, { beta = null, gv = null, S = null, src = 
         }
       }
       if (S) for (let i = 0; i < n; i++) { const k = bk[i]; if (k < 0 || !(S[i] > 0) || !(N[i] > 0)) continue; const r = S[i] * N[i]; flow(i, k, r * ba[i] * v[k]); flow(i, k + 1, r * bb[i] * v[k + 1]); }
-      // (I − h·M) V' = V by elimination (column-diagonally-dominant M-matrix: no pivoting needed)
-      for (let i = 0; i < n * n; i++) M[i] *= -h; for (let i = 0; i < n; i++) M[i * n + i] += 1;
-      for (let c = 0; c < n; c++) { const pv = M[c * n + c]; for (let r2 = c + 1; r2 < n; r2++) { const m = M[r2 * n + c] / pv; if (m === 0) continue; for (let cc = c; cc < n; cc++) M[r2 * n + cc] -= m * M[c * n + cc]; V[r2] -= m * V[c]; } }
-      for (let r2 = n - 1; r2 >= 0; r2--) { let x = V[r2]; for (let cc = r2 + 1; cc < n; cc++) x -= M[r2 * n + cc] * V[cc]; V[r2] = x / M[r2 * n + r2]; }
+      // (I − h·M) V' = V by elimination. The matrix is lower triangular plus `ub` super-diagonals (aggregation only moves volume
+      // up, a breakage daughter falls at most `ub` classes) and column-diagonally dominant, so no pivoting and O(n²·ub) work.
+      for (let c = 0; c < n; c++) { const pv = M[c * n + c], ce = Math.min(c + ub, n - 1); for (let r2 = c + 1; r2 < n; r2++) { const m = M[r2 * n + c] / pv; if (m === 0) continue; for (let cc = c + 1; cc <= ce; cc++) M[r2 * n + cc] -= m * M[c * n + cc]; V[r2] -= m * V[c]; } }
+      for (let r2 = n - 1; r2 >= 0; r2--) { let x = V[r2]; const ce = Math.min(r2 + ub, n - 1); for (let cc = r2 + 1; cc <= ce; cc++) x -= M[r2 * n + cc] * V[cc]; V[r2] = x / M[r2 * n + r2]; }
       for (let i = 0; i < n; i++) N[i] = Math.max(V[i], 0) / v[i];
     }
   }
@@ -208,6 +208,9 @@ export function solvePBE(grid, N0, t, { beta = null, gv = null, S = null, src = 
     }
     N.set(tmp);
   }
+  // drop numerically empty classes (below 1e-24 of the largest volume share): they cost denormal arithmetic and carry nothing
+  let vmx = 0; for (let i = 0; i < n; i++) if (N[i] * v[i] > vmx) vmx = N[i] * v[i];
+  for (let i = 0; i < n; i++) if (N[i] * v[i] < 1e-24 * vmx) N[i] = 0;
   return { N, sub, limited };
 }
 /** Moments of a sectional distribution: { m0, m1, m2, m3, vol (Σ N v), d10, d32, d43 }. */
@@ -290,7 +293,7 @@ export function maxAgglomerateSize({ dp, Fa, mu0, shear, phi, phiMax = 4 / 7, fr
   const p = clamp(phi, 0, 0.99 * phiMax), e = 3 - fr, cap = p > 1e-9 ? (phiMax / p) ** (1 / e) : 1e6;
   const g = (x) => x ** (4 - fr) - (Fa * (1 - (p / phiMax) * x ** e) ** 2) / (dp * dp * mu0 * Math.max(shear, 1e-9) * (1 - p * x ** e));
   let ratio = 1;
-  if (g(1) < 0) { const hi = Math.min(cap * (1 - 1e-9), 1e6); ratio = g(hi) <= 0 ? hi : brent(g, 1, hi, 1e-9, 80); }
+  if (g(1) < 0) { const hi = Math.min(cap * (1 - 1e-9), 1e6); ratio = g(hi) <= 0 ? hi : brent(g, 1, hi, 1e-6, 60); }
   return { ratio, dA: ratio * dp, phiEff: Math.min(p * ratio ** e, phiMax) };
 }
 /**
@@ -415,7 +418,7 @@ export function waxDeposition({ Tb, Tamb, U, hIn, kOil = 0.13, rhoOil = 800, muO
   const TK = Ti + KEL, Dwo = waxDiffusivity(TK, muOil, { model: diffModel }), sol = waxSolubility(Ti, wat, wTot, slope), bulk = waxSolubility(Tb, wat, wTot, slope);
   const jMol = rhoOil * Dwo * sol.dCdT * dTdr; // Fick's law with the solubility slope and the radial temperature gradient
   const dCr = 10e-6, sub = (5 * muOil) / (rhoOil * Math.max(Math.sqrt((gammaW * muOil) / rhoOil), 1e-6)); // crystal size, viscous sub-layer thickness
-  const jShear = bulk.solid > 0 ? (rhoOil * 0.1 * (dCr / 2) ** 2 * gammaW * bulk.solid * bulk.solid) / sub : 0; // shear dispersion of precipitated crystals
+  const jShear = bulk.solid > 0 ? (rhoOil * 0.1 * (dCr / 2) ** 2 * gammaW * bulk.solid * bulk.solid) / (D / 2) : 0; // shear dispersion of precipitated crystals (Eckstein diffusivity, gradient over the radius)
   const jBrown = bulk.solid > 0 ? (rhoOil * ((KB * TK) / (3 * PI * muOil * dCr)) * bulk.solid) / sub : 0; // Brownian diffusion of crystals to the wall
   const nsr = ((/slug|bubble|churn/.test(regime) ? rhoMix ?? rhoOil : /annular/.test(regime) ? Math.sqrt((rhoMix ?? rhoOil) * rhoOil) : rhoOil) * vL * Math.max(delta, 1e-5)) / muOil;
   const strip = 1 / (1 + 0.055 * (nsr / 1000) ** 1.4); // shear stripping (Matzain form on a film Reynolds number in thousands)
@@ -440,6 +443,8 @@ const MINERALS = [
   { id: 'anhydrite', name: 'Anhydrite (CaSO₄)', logK: -4.36, dH: -7150, dV: -49.8, M: 136.14, rho: 2960, cat: 'Ca', an: 'SO4' },
   { id: 'siderite', name: 'Siderite (FeCO₃)', logK: -10.89, dH: -10380, dV: -55.3, M: 115.85, rho: 3870, cat: 'Fe', an: 'CO3' },
 ];
+// log10 association constants of the ion pairs at 25 °C (MSO4°, NaSO4⁻, KSO4⁻; MHCO3⁺, NaHCO3°)
+const PAIRS = { SO4: { Ca: 2.30, Mg: 2.37, Na: 0.70, K: 0.85, Ba: 2.70, Sr: 2.29, Fe: 2.25 }, HCO3: { Ca: 1.11, Mg: 1.07, Na: -0.25, Sr: 1.18, Ba: 0.98, Fe: 2.0 } };
 /** Ionic strength (mol/L) and molar concentrations of a water analysis given in mg/L: { I, m: { ion: mol/L }, tds (mg/L), balance (charge-balance error, fraction) }. */
 export function ionicStrength(water) {
   const m = {}; let I = 0, tds = 0, cat = 0, an = 0;
@@ -451,7 +456,7 @@ export function ionicStrength(water) {
  * parameters, usable to about 2 mol/L in chloride waters). ion: optional { a (Å), b }.
  */
 export function activityCoefficient(z, I, Tc = 25, model = 'davies', ion = null) {
-  const T = Tc + KEL, eps = 87.74 - 0.4008 * Tc + 9.398e-4 * Tc * Tc - 1.41e-6 * Tc ** 3, rho = 1 - 4.5e-6 * (Tc - 4) ** 2 * (Tc < 100 ? 1 : 1), A = (1.82483e6 * Math.sqrt(Math.max(rho, 0.9))) / (eps * T) ** 1.5, B = (50.2916 * Math.sqrt(Math.max(rho, 0.9))) / Math.sqrt(eps * T), s = Math.sqrt(I);
+  const T = Tc + KEL, eps = 87.74 - 0.4008 * Tc + 9.398e-4 * Tc * Tc - 1.41e-6 * Tc ** 3, rho = Math.max(1 - 4.5e-6 * (Tc - 4) ** 2, 0.9), A = (1.82483e6 * Math.sqrt(rho)) / (eps * T) ** 1.5, B = (50.2916 * Math.sqrt(rho)) / Math.sqrt(eps * T), s = Math.sqrt(I); // Debye–Hückel constants from the dielectric constant of water
   if (model === 'truesdellJones' && ion) return 10 ** ((-A * z * z * s) / (1 + B * ion.a * s) + ion.b * I);
   return 10 ** (-A * z * z * (s / (1 + s) - 0.3 * I));
 }
@@ -459,16 +464,32 @@ export function activityCoefficient(z, I, Tc = 25, model = 'davies', ion = null)
 export const mixWaters = (a, b, f) => Object.fromEntries(ION_IDS.map((id) => [id, (1 - f) * num(a?.[id], 0) + f * num(b?.[id], 0)]));
 /**
  * Saturation indices of the common oilfield scales at T (°C), P (bara).
- * opt: { yCO2 (mole fraction of CO2 in the gas), model ('truesdellJones' | 'davies') }.
+ * opt: { yCO2 (mole fraction of CO2 in the gas), model ('truesdellJones' | 'davies'), pairing (sulphate and bicarbonate ion pairs, default true) }.
  * Carbonate system: pH from the CO2 fugacity and the bicarbonate alkalinity with temperature-dependent Henry and dissociation
  * constants (Plummer–Busenberg); solubility products by van 't Hoff with a volume-of-reaction pressure term.
  * Returns { I, tds, pH, fCO2 (bar), minerals: [{ id, name, SI, ptb (mg/L that can precipitate), logK }], max: { id, name, SI }, oddoTomson (calcite Is, Oddo–Tomson) }.
  */
-export function scaleIndices(water, Tc, Pbar, { yCO2 = 0.03, model = 'truesdellJones' } = {}) {
-  const { I, m, tds } = ionicStrength(water), T = Tc + KEL, lg = Math.log10, g = (id) => activityCoefficient(IONS[id].z, I, Tc, model, IONS[id]);
+export function scaleIndices(water, Tc, Pbar, { yCO2 = 0.03, model = 'truesdellJones', pairing = true } = {}) {
+  const st = ionicStrength(water), m = st.m, tds = st.tds, T = Tc + KEL, lg = Math.log10;
   const TF = Tc * 1.8 + 32, Ppsia = Pbar * 14.5038, phi = Math.exp(Ppsia * (2.84e-4 - 0.255 / (TF + 460))), fCO2 = Math.max(yCO2 * Pbar * phi, 1e-9);
   const lKH = 108.3865 + 0.01985076 * T - 6919.53 / T - 40.45154 * lg(T) + 669365 / T ** 2, lK1 = -356.3094 - 0.06091964 * T + 21834.37 / T + 126.8339 * lg(T) - 1684915 / T ** 2, lK2 = -107.8871 - 0.03252849 * T + 5151.79 / T + 38.92561 * lg(T) - 563713.9 / T ** 2;
-  const gam = Object.fromEntries(ION_IDS.map((id) => [id, g(id)])), g2 = activityCoefficient(2, I, Tc, model, { a: 5.4, b: 0 });
+  // free-ion speciation with the sulphate and bicarbonate ion pairs (25 °C association constants), ionic strength from the free species
+  const free = { ...m }, cats = ['Na', 'K', 'Ca', 'Mg', 'Ba', 'Sr', 'Fe'];
+  let I = st.I, gam = Object.fromEntries(ION_IDS.map((id) => [id, activityCoefficient(IONS[id].z, I, Tc, model, IONS[id])]));
+  if (pairing) for (let outer = 0; outer < 4; outer++) {
+    const g1 = activityCoefficient(1, I, Tc, 'davies'), kOf = (c, an) => { const lk = PAIRS[an][c]; if (lk === undefined) return 0; const zp = IONS[c].z + IONS[an].z; return (10 ** lk * gam[c] * gam[an]) / (zp === 0 ? 1 : g1); };
+    for (let it = 0; it < 40; it++) {
+      let ch = 0;
+      for (const c of cats) { const x = m[c] / (1 + kOf(c, 'SO4') * free.SO4 + kOf(c, 'HCO3') * free.HCO3); ch = Math.max(ch, Math.abs(x - free[c])); free[c] = x; }
+      for (const an of ['SO4', 'HCO3']) { let d = 1; for (const c of cats) d += kOf(c, an) * free[c]; const x = m[an] / d; ch = Math.max(ch, Math.abs(x - free[an])); free[an] = x; }
+      if (ch < 1e-12) break;
+    }
+    let In = 0; for (const id of ION_IDS) In += 0.5 * free[id] * IONS[id].z ** 2;
+    for (const c of cats) for (const an of ['SO4', 'HCO3']) { const zp = IONS[c].z + IONS[an].z; if (zp !== 0) In += 0.5 * kOf(c, an) * free[c] * free[an] * zp * zp; }
+    I = In; gam = Object.fromEntries(ION_IDS.map((id) => [id, activityCoefficient(IONS[id].z, I, Tc, model, IONS[id])]));
+  }
+  for (const id of ION_IDS) gam[id] *= m[id] > 0 ? free[id] / m[id] : 1; // total (stoichiometric) activity coefficients: activity = γ_T × total concentration
+  const g2 = activityCoefficient(2, I, Tc, model, { a: 5.4, b: 0 });
   const aHCO3 = Math.max(gam.HCO3 * m.HCO3, 1e-12), aH = (10 ** (lK1 + lKH) * (fCO2 / 1.01325)) / aHCO3, pH = -lg(aH), aCO3 = (10 ** lK2 * aHCO3) / aH;
   const logKof = (mn) => (mn.id === 'calcite' ? -171.9065 - 0.077993 * T + 2839.319 / T + 71.595 * lg(T) : mn.logK - (mn.dH / (2.302585 * R)) * (1 / T - 1 / 298.15)) - (mn.dV * 1e-6 * (Pbar - 1) * 1e5) / (2.302585 * R * T);
   const minerals = MINERALS.map((mn) => {
@@ -484,7 +505,7 @@ export function scaleIndices(water, Tc, Pbar, { yCO2 = 0.03, model = 'truesdellJ
   });
   const max = minerals.reduce((a, b) => (b.SI > a.SI ? b : a));
   // Oddo–Tomson calcite index (gas phase present), conditional constants in °F, psia and mol/L
-  const oddoTomson = m.Ca > 0 && m.HCO3 > 0 ? lg((m.Ca * m.HCO3 ** 2) / ((fCO2 / phi) * 14.5038 * phi)) + 5.85 + 15.19e-3 * TF - 1.64e-6 * TF * TF - 5.27e-5 * Ppsia - 3.334 * Math.sqrt(I) + 1.431 * I : -99;
+  const oddoTomson = m.Ca > 0 && m.HCO3 > 0 ? lg((m.Ca * m.HCO3 ** 2) / (fCO2 * 14.5038)) + 5.85 + 15.19e-3 * TF - 1.64e-6 * TF * TF - 5.27e-5 * Ppsia - 3.334 * Math.sqrt(st.I) + 1.431 * st.I : -99;
   return { I, tds, pH, fCO2, gamma: gam, gammaCO3: g2, minerals, max: { id: max.id, name: max.name, SI: max.SI }, oddoTomson };
 }
 
@@ -619,7 +640,7 @@ export function hydrateParams(v, S, over = {}) {
     kinK: v.kinK * 1e-10, EaR: v.kinEa, shellD: v.shellD * 1e-13, H: mode === 'oil' ? 2500 : 7e4, mtMult: v.mtMult,
     nucA: 10 ** v.nucA, theta: v.contactAngle, sigma: v.sigmaHW * 1e-3, nucV: v.nucVolume * 1e-3, het: v.nucleation !== 'homogeneous', lamStar: 1,
     cohesion: v.cohesion * 1e-3, fr: v.fractal, phiMax: v.phiMax, viscModel: v.viscModel, aggEff: v.aggEff, kBreak: v.kBreak,
-    inhEff: v.inhEff / 100, htMult: v.htMult, inletPhi: v.inletHydPct / 100,
+    inhEff: v.inhEff / 100, htMult: v.htMult, inletPhi: v.inletHydPct / 100, disK0: v.disK0 * 1e4, disE: v.disE * 1000, sigG: Math.max(v.primarySigma, 1),
     adhesion: v.adhesion, adhForce: v.adhForce * 1e-3, tauCrit: v.tauCrit, kRemove: v.kRemove / 3600, por0: v.porosity0, porInf: Math.min(v.porosityInf, v.porosity0), tAge: v.ageHours * 3600, filmMult: v.filmMult,
     plugBlock: v.plugBlockPct / 100, pInMax: v.pInMax, pShut: v.pShut, maxSub: 4, ...over };
 }
@@ -640,10 +661,10 @@ export function hydrateMarch(S, p, o) {
   const mDep0 = mDep.reduce((a, b) => a + b, 0);
   const T = init.T.slice(), P = init.P.slice(), hold = init.holdup.slice(), dpdx = init.dpdx.slice(), tauW = init.tauW.slice(), muFac = new Array(n).fill(1), Dn = Dbase.slice();
   const cD = new Array(n).fill(-1), cMu = new Array(n).fill(1), cT = new Array(n).fill(0), cP = new Array(n).fill(0), cF = new Array(n).fill(0), cG = new Array(n).fill(null);
-  const rec = { sub: new Array(n).fill(0), teq: new Array(n).fill(0), phi: new Array(n).fill(0), phiE: new Array(n).fill(0), d43: new Array(n).fill(0), dA: new Array(n).fill(0), J: new Array(n).fill(0), lam: new Array(n).fill(0), rate: new Array(n).fill(0), vL: new Array(n).fill(0), X: new Array(n).fill(0), tw: new Array(n).fill(0), lim: new Array(n).fill(''), depRate: new Array(n).fill(0), freeW: new Array(n).fill(1), subMax: new Array(n).fill(-99), phiMaxT: new Array(n).fill(0), Jmax: 0, gdot: new Array(n).fill(0), muC: new Array(n).fill(1e-3), rhoC: new Array(n).fill(800), exposure: new Array(n).fill(0), removal: new Array(n).fill(0), capture: new Array(n).fill(0) };
-  const ser = { t: [], pIn: [], dp: [], susp: [], dep: [], blk: [], phi: [], rate: [], sub: [], frac: [], visc: [] }, fld = { t: [], phi: [], dep: [], sub: [] };
+  const rec = { sub: new Array(n).fill(0), teq: new Array(n).fill(0), phi: new Array(n).fill(0), phiE: new Array(n).fill(0), d43: new Array(n).fill(0), dA: new Array(n).fill(0), J: new Array(n).fill(0), lam: new Array(n).fill(0), rate: new Array(n).fill(0), vL: new Array(n).fill(0), X: new Array(n).fill(0), tw: new Array(n).fill(0), lim: new Array(n).fill(''), depRate: new Array(n).fill(0), freeW: new Array(n).fill(1), subMax: new Array(n).fill(-99), phiMaxT: new Array(n).fill(0), Jmax: 0, removalMax: 0, captureMax: 0, VL: new Array(n).fill(1), gdot: new Array(n).fill(0), muC: new Array(n).fill(1e-3), rhoC: new Array(n).fill(800), exposure: new Array(n).fill(0), removal: new Array(n).fill(0), capture: new Array(n).fill(0) };
+  const ser = { exp: [], t: [], pIn: [], dp: [], susp: [], dep: [], blk: [], phi: [], rate: [], sub: [], frac: [], visc: [] }, fld = { t: [], phi: [], dep: [], sub: [] };
   const cpC = new Array(n).fill(null), L3 = g.L.map((L) => L ** 3), L4 = g.L.map((L) => L ** 4);
-  const beta = new Float64Array(nC * nC), gv = new Float64Array(nC), Sb = new Float64Array(nC), FinN = new Float64Array(nC);
+  const beta = new Float64Array(3), gv = new Float64Array(nC), Sb = new Float64Array(nC), FinN = new Float64Array(nC);
   const peak = { phi: 0, blk: 0, tPhi: 0, tBlk: 0, iPhi: 0, iBlk: 0, N: null, phiX: null, dHyd: null };
   const led = { inflow: 0, formed: 0, dissociated: 0, exported: 0, sloughed: 0, captured: 0, filmWall: 0, heat: 0 };
   const total = o.phases.reduce((a, b) => a + b.dur, 0), nSteps = o.phases.reduce((a, b) => a + Math.ceil(b.dur / b.dt - 1e-9), 0), stride = Math.max(1, Math.ceil(nSteps / (o.rows || 48)));
@@ -651,6 +672,7 @@ export function hydrateMarch(S, p, o) {
   const dep0Of = (cf) => { const Sx = Math.min(S.aq.S * cf, 260), salt = hydrateDepression({ S: Sx, inhWt: 0, inh: S.aq.inh }); if (!(S.aq.inhWt > 0)) return salt; const w = S.aq.inhWt / 100; return salt + (p.inhEff ?? 1) * (hydrateDepression({ S: Sx, inhWt: (100 * w) / (w + (1 - w) / cf), inh: S.aq.inh }) - salt); };
   const depBase = dep0Of(1), kStarAt = (TK) => p.kinK * Math.exp(-p.EaR * (1 / TK - 1 / 277.15));
   const kP = (() => { let b = 0; for (let j = 1; j < nC; j++) if (Math.abs(Math.log(g.L[j] / p.dPrim)) < Math.abs(Math.log(g.L[b] / p.dPrim))) b = j; return b; })();
+  const seedW = (() => { const w = new Float64Array(nC), lg = Math.log(p.sigG || 1); if (!(lg > 1e-6)) { w[kP] = 1; return w; } let sm = 0; for (let c = 0; c < nC; c++) { w[c] = Math.exp(-0.5 * (Math.log(g.L[c] / p.dPrim) / lg) ** 2); sm += w[c]; } for (let c = 0; c < nC; c++) w[c] /= sm; return w; })(); // share of the seeded particle volume per class
   const kSl = (L) => { let b = 0; for (let j = 1; j < nC; j++) if (Math.abs(Math.log(g.L[j] / L)) < Math.abs(Math.log(g.L[b] / L))) b = j; return b; };
 
   function step() {
@@ -658,7 +680,7 @@ export function hydrateMarch(S, p, o) {
     const phz = o.phases[ph], dt = Math.min(phz.dt, phz.dur - tPh), flowing = phz.frac > 0;
     if (newPhase) {
       newPhase = false;
-      if (flowing) { fe = phz.frac; ref = S.prof(phz.frac); gRef = S.gref(phz.frac); released = false; cD.fill(-1); for (let i = 0; i < n; i++) if (o.cheap) { hold[i] = ref.holdup[i]; } }
+      if (flowing) { fe = phz.frac; ref = S.prof(phz.frac); gRef = S.gref(phz.frac); released = false; cD.fill(-1); for (let i = 0; i < n; i++) { hold[i] = ref.holdup[i]; dpdx[i] = ref.dpdx[i]; tauW[i] = ref.tauW[i]; } }
       else { // static pressure: outlet pressure plus the head of the settled column, later scaled with the absolute gas temperature
         const b = S.prof(1), rm = mean(b.rhoM); pst = new Array(n); pst[n - 1] = p.pShut > 0 ? p.pShut : P[n - 1];
         for (let i = n - 2; i >= 0; i--) pst[i] = pst[i + 1] + (rm * G * (S.z[i + 1] - S.z[i])) / 1e5;
@@ -677,9 +699,9 @@ export function hydrateMarch(S, p, o) {
       for (let i = 0; i < n; i++) P[i] = clamp(P[i], 1.05, 1500);
     } else { const f = (mean(T) + KEL) / tm0; for (let i = 0; i < n; i++) P[i] = Math.max(pst[i] * f, 1.05); pInNow = P[0]; }
     // ---- march downstream through the cells
-    let thUp = 0, FinPS = 0, FinWD = 0, FinLV = 0, FinHV = 0, hydIn = 0, sumRate = 0, sumSusp = 0, maxBlk = 0, iBlk = 0, maxPhi = 0, iPhi = 0, maxVisc = 1, iVisc = 0, maxSub = -99;
+    let thUp = 0, FinPS = 0, FinWD = 0, FinLV = 0, FinHV = 0, hydIn = 0, sumRate = 0, sumSusp = 0, maxBlk = 0, iBlk = 0, iPlugDep = -1, maxPhi = 0, iPhi = 0, maxVisc = 1, iVisc = 0, maxSub = -99;
     FinN.fill(0);
-    if (flowing && p.inletPhi > 0) { const qin = S.props(P[0], T[0]).qL * fe * p.inletPhi; FinN[kP] = qin / g.v[kP]; FinHV = qin; FinPS = qin / (vp * eexp); led.inflow += qin * RHO * dt; }
+    if (flowing && p.inletPhi > 0) { const qin = S.props(P[0], T[0]).qL * fe * p.inletPhi; for (let c = 0; c < nC; c++) FinN[c] = (qin * seedW[c]) / g.v[c]; FinHV = qin; FinPS = qin / (vp * eexp); led.inflow += qin * RHO * dt; }
     for (let i = 0; i < n; i++) {
       const pr0 = S.props(P[i], T[i]), mcp = flowing ? fe * (pr0.mG * pr0.cpG + pr0.mO * pr0.cpO + pr0.mW * pr0.cpW) : 0, Cds = (S.C[i] * ds) / dt, UA = S.U * PI * D0 * ds, den = Cds + mcp + UA;
       let Ti = flowing ? ref.T[i] + ((T[i] - ref.T[i]) * Cds + mcp * thUp) / den : (T[i] * Cds + UA * S.tAmb[i]) / den;
@@ -711,6 +733,14 @@ export function hydrateMarch(S, p, o) {
       const dep = cf > 1.0005 ? dep0Of(cf) : depBase, Teq = S.hT0(P[i]) - dep, dTs = Teq - Ti, TK = Ti + KEL, zG = pr.zG || 0.85;
       const Jn = dTs > 0 ? nucleationRate({ TK, dT: dTs, TeqK: Teq + KEL, sigma: p.sigma, theta: p.theta, A: p.nucA, het: p.het }).J : 0;
       if (mWfree > 0 && dTs > 0) lv += h * Jn * p.nucV * VL;
+      if (!(dTs > 0) && pVol <= 0 && hydVol <= 0 && film[i] <= 0 && mDep[i] <= 0) { // nothing can happen here: warm, clean and particle-free
+        PS[i] = ps; WD[i] = wd; LV[i] = lv; HV[i] = 0; T[i] = Ti; muFac[i] = 1;
+        if (flowing) { for (let c = 0; c < nC; c++) FinN[c] = 0; FinPS = ps / tau; FinWD = wd / tau; FinLV = lv / tau; FinHV = 0; hydIn = 0; thUp = Ti - ref.T[i]; }
+        rec.sub[i] = dTs; rec.teq[i] = Teq; rec.phi[i] = 0; rec.phiE[i] = 0; rec.d43[i] = 0; rec.J[i] = 0; rec.lam[i] = lv / VL; rec.rate[i] = 0; rec.vL[i] = vL; rec.lim[i] = 'outside the hydrate region'; rec.freeW[i] = mW0 > 0 ? mWfree / mW0 : 0; rec.X[i] = 0; rec.capture[i] = 0; rec.removal[i] = 0; rec.depRate[i] = 0;
+        if (dTs > rec.subMax[i]) rec.subMax[i] = dTs; if (dTs > maxSub) maxSub = dTs;
+        { const blk = 1 - (D * D) / (D0 * D0); if (blk > maxBlk) { maxBlk = blk; iBlk = i; } }
+        continue;
+      }
       const lam = lv / VL, rhoC = oil ? pr.rhoO : p.mode === 'water' ? pr.rhoW : pr.rhoL, muC = oil ? pr.muO : p.mode === 'water' ? pr.muW : pr.muL, nuC = muC / rhoC, kC = oil ? pr.kO : p.mode === 'water' ? pr.kW : pr.kL;
       const rhoM = pr.rhoL * HL + pr.rhoG * (1 - HL), epsT = (4 * tauW[i] * vm) / (rhoM * D), gdot = Math.max(Math.sqrt(epsT / nuC), (8 * vL) / D, 0.05);
       const Peq = S.peq(Ti + dep), Dg = (7.4e-12 * Math.sqrt(oil ? pr.mwO || 150 : 46.8) * TK) / (muC * 1000 * 37.7 ** 0.6); // methane in the continuous liquid (Wilke–Chang)
@@ -722,14 +752,14 @@ export function hydrateMarch(S, p, o) {
           if (!onset) onset = { t: t + dt, x: S.x[i], i };
           const dc = (fug(P[i], zG) - fugAt(Peq, P[i], zG)) / p.H, j = dc > 0 ? dc / (1 / (kStarAt(TK) * p.H) + (0.25 * D * HL + 1e-3) / Dg + film[i] / Ai / p.shellD) : 0;
           dVol = Math.min(j * Ai * p.vmh * dt, (0.98 * mWfree) / (RHO * p.wfH), (0.9 * dTs * den * dt) / (RHO * LAT)); limTxt = 'diffusion through the interface film (shut-in)';
-        } else if (dTs < 0 && film[i] > 0) { dVol = -Math.min(film[i], hydrateDissociationRate({ TK, P: P[i], Peq, zG }) * Ai * p.vmh * dt, (0.9 * -dTs * den * dt) / (RHO * LAT)); limTxt = 'dissociating'; }
+        } else if (dTs < 0 && film[i] > 0) { dVol = -Math.min(film[i], hydrateDissociationRate({ TK, P: P[i], Peq, zG, K0: p.disK0, E: p.disE }) * Ai * p.vmh * dt, (0.9 * -dTs * den * dt) / (RHO * LAT)); limTxt = 'dissociating'; }
         film[i] += dVol;
       } else {
         if (lam >= p.lamStar && dTs > 0 && mWfree > 0.02 * mW0) { // onset: the water phase is seeded as primary particles
           const target = (mWfree / pr.rhoW + hydVol / eexp) / vp;
           if (ps < target * 0.999) {
             const add = target - ps;
-            if (oil) { Nc[kP] += (add * vp) / g.v[kP]; pVol += add * vp; hydVol += add * vp * eexp * 1e-3; } else { Nc[0] += add; hydVol += add * g.v[0]; pVol = hydVol; }
+            if (oil) { for (let c = 0; c < nC; c++) if (seedW[c] > 0) Nc[c] += (add * vp * seedW[c]) / g.v[c]; pVol += add * vp; hydVol += add * vp * eexp * 1e-4; } else { Nc[0] += add; hydVol += add * g.v[0]; pVol = hydVol; }
             ps = target; if (!onset) onset = { t: t + dt, x: S.x[i], i };
           }
         }
@@ -758,7 +788,7 @@ export function hydrateMarch(S, p, o) {
             limTxt = lim;
           }
         } else if (hydVol > 0 && dTs < 0) {
-          const jd = hydrateDissociationRate({ TK, P: P[i], Peq, zG }) * p.vmh, capH = (0.9 * -dTs * den * dt) / (RHO * LAT * q);
+          const jd = hydrateDissociationRate({ TK, P: P[i], Peq, zG, K0: p.disK0, E: p.disE }) * p.vmh, capH = (0.9 * -dTs * den * dt) / (RHO * LAT * q);
           if (oil) dV = -Math.min(hydVol, jd * ps * PI * p.dPrim * p.dPrim * h, capH);
           else { let tot = 0; for (let c = 0; c < nC; c++) { gv[c] = -PI * g.L[c] ** 2 * jd; tot -= Nc[c] * gv[c]; } const sc = tot * h > capH ? capH / (tot * h) : 1; for (let c = 0; c < nC; c++) gv[c] *= sc; any = tot > 0; }
           limTxt = 'dissociating';
@@ -770,7 +800,7 @@ export function hydrateMarch(S, p, o) {
           rec.dA[i] = cp.dA; cpR = cp.ratio;
           if (agg) {
             const cS = (p.aggEff * ((8 * vL) / D / 6 + 0.1618 * Math.sqrt(epsT / nuC))) / VL, cDf = (p.aggEff * (PI / 4) * Math.abs(RHO - rhoC) * G) / (18 * muC) / VL, cB = (p.aggEff * 2 * KB * TK) / (3 * muC) / VL;
-            for (let c = 0; c < nC * nC; c++) beta[c] = cS * g.gS[c] + cDf * g.gD[c] + cB * g.gB[c];
+            beta[0] = cS; beta[1] = cDf; beta[2] = cB;
           }
           { const kb = (p.kBreak * gdot) / cp.dA ** 3; for (let c = 0; c < nC; c++) Sb[c] = g.L[c] > 1.01 * p.dPrim ? kb * L3[c] : 0; } // agglomerates above the cohesive limit break even when nothing sticks any more
           const r = solvePBE(g, Nc, h, { beta: agg ? beta : null, gv: any ? gv : null, S: Sb, maxSub: p.maxSub, frac: 0.3 });
@@ -810,7 +840,7 @@ export function hydrateMarch(S, p, o) {
         rec.removal[i] = dm / dt; m -= dm; Nc[c] += fv / g.v[c]; pVol += fv; ps += fv / (vp * eexp); wd -= (dm * p.wfH) / q; hydVol += fv; led.sloughed += dm;
       }
       if (m > 0 && dTs < 0) { // a deposit outside the hydrate region melts at the Kim–Bishnoi rate on its exposed surface, as fast as heat arrives
-        const dm = Math.min(m, hydrateDissociationRate({ TK, P: P[i], Peq, zG }) * p.vmh * RHO * PI * D * ds * dt, (0.9 * Math.max(Teq - Ti, 0) * -1 + 0.9 * Math.max(Ti - Teq, 0)) * den * dt / LAT);
+        const dm = Math.min(m, hydrateDissociationRate({ TK, P: P[i], Peq, zG, K0: p.disK0, E: p.disE }) * p.vmh * RHO * PI * D * ds * dt, (0.9 * Math.max(Ti - Teq, 0) * den * dt) / LAT);
         if (dm > 0) { m -= dm; led.dissociated += dm; led.heat -= dm * LAT; Ti -= (dm * LAT) / dt / den; if (flowing) wd -= (dm * p.wfH) / q; }
       }
       const gain = depVol * RHO * q + mFilmWall;
@@ -825,31 +855,32 @@ export function hydrateMarch(S, p, o) {
       HV[i] = hydVol; PS[i] = ps; WD[i] = wd; LV[i] = lv; T[i] = Ti;
       if (flowing) { for (let c = 0; c < nC; c++) FinN[c] = Nc[c] / tau; FinPS = ps / tau; FinWD = wd / tau; FinLV = lv / tau; FinHV = hydVol / tau; hydIn = (hydVol * RHO) / tau; thUp = Ti - ref.T[i]; }
       const blk = 1 - (D * D) / (D0 * D0), rate = mNew / dt + mFilmWall / dt;
-      rec.gdot[i] = gdot; rec.muC[i] = muC; rec.rhoC[i] = rhoC; if (dTs > 0) rec.exposure[i] += dt / 3600; rec.capture[i] = (depVol * RHO * q + mFilmWall) / dt;
+      rec.gdot[i] = gdot; rec.muC[i] = muC; rec.rhoC[i] = rhoC; rec.VL[i] = VL; if (rec.removal[i] > rec.removalMax) rec.removalMax = rec.removal[i]; if ((depVol * RHO * q + mFilmWall) / dt > rec.captureMax) rec.captureMax = (depVol * RHO * q + mFilmWall) / dt; if (dTs > 0) rec.exposure[i] += dt / 3600; rec.capture[i] = (depVol * RHO * q + mFilmWall) / dt;
       rec.sub[i] = dTs; rec.teq[i] = Teq; rec.phi[i] = phiH + film[i] / VL; rec.phiE[i] = phiE; rec.d43[i] = d43; rec.J[i] = Jn; if (Jn > rec.Jmax) rec.Jmax = Jn; rec.lam[i] = lam; rec.rate[i] = rate; rec.vL[i] = vL; rec.lim[i] = limTxt; rec.freeW[i] = mW0 > 0 ? mWfree / mW0 : 0;
       rec.X[i] = mW0 > 0 ? clamp(((hydVol + film[i]) * RHO * p.wfH) / mW0, 0, 1) : 0;
       if (dTs > rec.subMax[i]) rec.subMax[i] = dTs; if (rec.phi[i] > rec.phiMaxT[i]) rec.phiMaxT[i] = rec.phi[i];
       sumRate += rate; sumSusp += (hydVol + film[i]) * RHO;
-      if (blk > maxBlk) { maxBlk = blk; iBlk = i; } if (rec.phi[i] > maxPhi) { maxPhi = rec.phi[i]; iPhi = i; } if (muFac[i] > maxVisc) { maxVisc = muFac[i]; iVisc = i; } if (dTs > maxSub) maxSub = dTs;
+      if (blk > maxBlk) { maxBlk = blk; iBlk = i; } if (blk >= p.plugBlock && mDep[i] > 0 && iPlugDep < 0) iPlugDep = i; if (rec.phi[i] > maxPhi) { maxPhi = rec.phi[i]; iPhi = i; } if (muFac[i] > maxVisc) { maxVisc = muFac[i]; iVisc = i; } if (dTs > maxSub) maxSub = dTs;
     }
     if (flowing) { led.exported += dt * hydIn; released = true; }
     t += dt; tPh += dt; k++;
-    if (!plug && maxBlk >= p.plugBlock) plug = { t, x: S.x[iBlk], i: iBlk, mech: 'wall deposit closes the bore' };
+    if (!plug && iPlugDep >= 0) plug = { t, x: S.x[iPlugDep], i: iPlugDep, mech: 'hydrate wall deposit closes the bore' };
     if (!plug && flowing && maxVisc >= 1000) plug = { t, x: S.x[iVisc], i: iVisc, mech: 'slurry jams (effective solids fraction at the packing limit)' };
     let depTot = 0; for (let i = 0; i < n; i++) depTot += mDep[i];
-    if (maxPhi > peak.phi) Object.assign(peak, { phi: maxPhi, tPhi: t, iPhi, N: Array.from(NP[iPhi]), phiX: rec.phi.slice(), phiE: rec.phiE.slice(), d43: rec.d43.slice(), dA: rec.dA.slice(), gdot: rec.gdot[iPhi], muC: rec.muC[iPhi], rhoC: rec.rhoC[iPhi], T: T[iPhi], visc: muFac.slice() });
+    if (maxPhi > peak.phi) Object.assign(peak, { phi: maxPhi, tPhi: t, iPhi, N: Array.from(NP[iPhi]), phiX: rec.phi.slice(), phiE: rec.phiE.slice(), d43: rec.d43.slice(), dA: rec.dA.slice(), gdot: rec.gdot[iPhi], muC: rec.muC[iPhi], rhoC: rec.rhoC[iPhi], VL: rec.VL[iPhi], vL: rec.vL[iPhi], T: T[iPhi], visc: muFac.slice() });
     if (maxBlk > peak.blk) Object.assign(peak, { blk: maxBlk, tBlk: t, iBlk, dHyd: Dn.map((d, i) => Math.max((Dbase[i] - d) / 2, 0)), por: Array.from(por) });
-    ser.t.push(t / 3600); ser.pIn.push(pInNow); ser.dp.push(pInNow - P[n - 1]); ser.susp.push(sumSusp); ser.dep.push(depTot); ser.blk.push(maxBlk); ser.phi.push(maxPhi); ser.rate.push(sumRate); ser.sub.push(maxSub); ser.frac.push(flowing ? fe : 0); ser.visc.push(maxVisc);
+    ser.exp.push(led.exported); ser.t.push(t / 3600); ser.pIn.push(pInNow); ser.dp.push(pInNow - P[n - 1]); ser.susp.push(sumSusp); ser.dep.push(depTot); ser.blk.push(maxBlk); ser.phi.push(maxPhi); ser.rate.push(sumRate); ser.sub.push(maxSub); ser.frac.push(flowing ? fe : 0); ser.visc.push(maxVisc);
     if (k % stride === 0 || plug || tPh >= phz.dur - 1e-9) { fld.t.push(t / 3600); fld.phi.push(rec.phi.slice()); fld.dep.push(Dn.map((d, i) => (Dbase[i] - d) / 2)); fld.sub.push(rec.sub.slice()); }
     if (tPh >= phz.dur - 1e-9) { ph++; tPh = 0; newPhase = true; }
     if (plug || ph >= o.phases.length) done = true;
+    if (o.stopWhenClear && flowing && onset && maxSub < 0 && sumSusp <= 0 && depTot <= 0) done = true; // nothing left that could still plug
   }
   return {
     step, get done() { return done; }, get progress() { return total > 0 ? t / total : 1; },
     result() {
       let susp = 0, depTot = 0; for (let i = 0; i < n; i++) { let hv = film[i] + HV[i]; susp += hv * RHO; depTot += mDep[i]; }
-      const dHyd = Dn.map((d, i) => Math.max((Dbase[i] - d) / 2, 0));
-      return { t: t / 3600, T: T.slice(), P: P.slice(), D: Dn.slice(), dHyd, por: Array.from(por), hold: hold.slice(), tauW: tauW.slice(), dpdx: dpdx.slice(), muFac: muFac.slice(), N: NP.map((a) => Array.from(a)), rec, ser, fld, peak, onset, plug, limited, pIn: pInNow,
+      const Dend = Dbase.map((d, i) => Math.sqrt(Math.max(d * d - (4 * mDep[i]) / (PI * RHO * (1 - por[i]) * ds), (0.03 * D0) ** 2))), dHyd = Dend.map((d, i) => Math.max((Dbase[i] - d) / 2, 0));
+      return { t: t / 3600, T: T.slice(), P: P.slice(), D: Dend, dHyd, mDep: Array.from(mDep), por: Array.from(por), hold: hold.slice(), tauW: tauW.slice(), dpdx: dpdx.slice(), muFac: muFac.slice(), N: NP.map((a) => Array.from(a)), rec, ser, fld, peak, onset, plug, limited, pIn: pInNow,
         ledger: { ...led, suspended: susp, deposited: depTot, deposit0: mDep0, in: led.formed + mDep0 + led.inflow, out: susp + depTot + led.exported + led.dissociated } };
     },
   };
@@ -883,10 +914,11 @@ export function slowDeposits(S, v, frac = 1, nt = 40) {
   const ser = { t: [0], dMax: [0], mass: [0] }, last = new Array(n).fill(null), Tb = b.T.slice();
   let waxRate0 = 0;
   for (let k = 0; k < nt; k++) {
-    let cum = 0, dMax = 0, mass = 0;
+    let cum = 0, dMax = 0, mass = 0, used = 0;
     for (let i = 0; i < n; i++) {
-      const c = cells[i]; Tb[i] = S.tAmb[i] + (b.T[i] - S.tAmb[i]) * Math.exp(Math.min(cum, 3));
-      const r = waxDeposition({ Tb: Tb[i], Tamb: S.tAmb[i], U: S.U, hIn: c.hIn, kOil: c.pr.kO, rhoOil: c.pr.rhoO, muOil: c.pr.muO, wat: v.wat, wTot, slope: v.waxSlope, delta: dWax[i], Fw: Fw[i], kDep: v.waxK, D: D0 - 2 * dWax[i], vL: c.vL, gammaW: c.gammaW, rhoMix: b.rhoM[i], regime: b.regime[i], mult: v.waxMult, diffModel: v.waxDiff, wetFrac: c.oilWet });
+      const c = cells[i], left = clamp(1 - used / Math.max(c.pr.mO * frac * wTot, 1e-12), 0, 1); Tb[i] = S.tAmb[i] + (b.T[i] - S.tAmb[i]) * Math.exp(Math.min(cum, 3));
+      const r = waxDeposition({ Tb: Tb[i], Tamb: S.tAmb[i], U: S.U, hIn: c.hIn, kOil: c.pr.kO, rhoOil: c.pr.rhoO, muOil: c.pr.muO, wat: v.wat, wTot: wTot * left, slope: v.waxSlope, delta: dWax[i], Fw: Fw[i], kDep: v.waxK, D: D0 - 2 * dWax[i], vL: c.vL, gammaW: c.gammaW, rhoMix: b.rhoM[i], regime: b.regime[i], mult: v.waxMult, diffModel: v.waxDiff, wetFrac: c.oilWet });
+      used += 900 * (r.dDelta * Fw[i] + r.dFw * dWax[i]) * PI * D0 * ds; // wax leaving the oil: the dissolved wax available downstream is depleted
       if (k === 0 && r.dDelta * 86400e3 > waxRate0) waxRate0 = r.dDelta * 86400e3;
       cum += ((S.U - r.Ueff) * PI * D0 * ds) / Math.max(c.mcp, 1e-9); last[i] = r;
       dWax[i] = Math.min(dWax[i] + r.dDelta * dt, 0.4 * D0); Fw[i] = Math.min(Fw[i] + r.dFw * dt, 0.95);
@@ -964,10 +996,13 @@ const INPUTS = [
     { key: 'mtMult', label: 'Gas-absorption (mass-transfer) multiplier', unit: '–', value: 1, min: 0.001, max: 1000 },
     { key: 'htMult', label: 'Heat-removal multiplier', unit: '–', value: 1, min: 0.05, max: 20, help: 'Scales the heat that can be removed from a forming slurry before it reaches the hydrate temperature.' },
     { key: 'hydNumber', label: 'Hydration number', unit: 'mol water/mol gas', value: 0, min: 0, max: 9, help: '0 = from the Langmuir cage occupancy of methane structure I at line conditions (van der Waals–Platteeuw).' },
+    { key: 'disK0', label: 'Dissociation constant K₀ (Kim–Bishnoi)', unit: '10⁴ mol/m²/Pa/s', value: 3.6, min: 0, max: 1e4, help: 'Arrhenius pre-exponential of the dissociation flux K₀ exp(−E/RT)(f_eq − f); 3.6 and 81 kJ/mol are the methane values of Clarke and Bishnoi.' },
+    { key: 'disE', label: 'Dissociation activation energy', unit: 'kJ/mol', value: 81, min: 10, max: 200 },
     { key: 'rhoHyd', label: 'Hydrate particle density', unit: 'kg/m³', value: 920, min: 800, max: 1100 },
   ] },
   { group: 'Particles, agglomeration and slurry', tab: 'setup', fields: [
     { key: 'primaryUm', label: 'Primary particle size', unit: 'µm', value: 0, min: 0, max: 2000, help: '0 = droplet size from the Boxall inertial correlation, d/D = 0.063 We^−3/5.' },
+    { key: 'primarySigma', label: 'Geometric standard deviation of the primary size', unit: '–', value: 1, min: 1, max: 4, help: '1 = all primary particles in one size class; larger values seed a log-normal size distribution around the primary size.' },
     { key: 'cohesion', label: 'Cohesive force per unit particle size', unit: 'mN/m', value: 2, min: 0, max: 200, typical: [0.1, 50], help: 'Micromechanical force between hydrate particles divided by their size. Anti-agglomerants reduce it by one to two orders of magnitude.' },
     { key: 'aggEff', label: 'Collision (sticking) efficiency', unit: '–', value: 0.05, min: 0, max: 1 },
     { key: 'kBreak', label: 'Breakage coefficient', unit: '–', value: 0.04, min: 0, max: 10, help: 'Breakage frequency = coefficient × shear rate × (size / cohesive-limit size)³.' },
@@ -976,7 +1011,7 @@ const INPUTS = [
     { key: 'viscModel', label: 'Slurry viscosity model', type: 'select', value: 'mills', options: [{ value: 'mills', label: 'Mills' }, { value: 'krieger', label: 'Krieger–Dougherty' }, { value: 'thomas', label: 'Thomas' }] },
   ] },
   { group: 'Wall deposition and plugging', tab: 'setup', fields: [
-    { key: 'adhesion', label: 'Wall-capture efficiency', unit: '–', value: 0.02, min: 0, max: 1, help: 'Probability that a particle reaching a sub-cooled wall stays there, before the force-balance reduction.' },
+    { key: 'adhesion', label: 'Wall-capture efficiency', unit: '–', value: 0.005, min: 0, max: 1, typical: [0.0005, 0.05], help: 'Probability that a particle reaching a sub-cooled wall stays there, before the force-balance reduction.' },
     { key: 'adhForce', label: 'Wall adhesion force per unit particle size', unit: 'mN/m', value: 5, min: 0.001, max: 500 },
     { key: 'filmMult', label: 'Vapour-film deposition multiplier', unit: '–', value: 1, min: 0, max: 100, help: 'Scales hydrate growth from water vapour condensing on the gas-wetted cold wall.' },
     { key: 'tauCrit', label: 'Critical wall shear for removal (fresh deposit)', unit: 'Pa', value: 30, min: 0.1, max: 5000, help: 'Above this shear the deposit is eroded and sloughs back into the stream. It rises as the deposit ages and densifies.' },
@@ -1016,15 +1051,16 @@ const INPUTS = [
     { key: 'sandRate', label: 'Sand production', unit: 'kg/d', value: 50, min: 0, max: 1e5 }, { key: 'sandUm', label: 'Sand particle size', unit: 'µm', value: 150, min: 10, max: 3000 }, { key: 'sandRho', label: 'Sand density', unit: 'kg/m³', value: 2650, min: 1100, max: 5000 },
   ] },
   { group: 'Discretisation', tab: 'mesh', help: 'Axial cells, time step of the hydrate march and number of particle-size classes; the Monte Carlo runs use a coarser copy of the same model.', fields: [
-    { key: 'nAxial', label: 'Axial cells', value: 40, min: 8, max: 120 },
-    { key: 'dtMin', label: 'Time step of the hydrate march', unit: 'min', value: 15, min: 0.5, max: 240 },
+    { key: 'nAxial', label: 'Axial cells', value: 36, min: 8, max: 120 },
+    { key: 'dtMin', label: 'Time step of the hydrate march', unit: 'min', value: 20, min: 0.5, max: 240 },
     { key: 'nClasses', label: 'Particle-size classes', value: 14, min: 6, max: 40 },
-    { key: 'nMC', label: 'Monte Carlo samples for plugging probability', value: 32, min: 0, max: 400 },
+    { key: 'nMC', label: 'Monte Carlo samples for plugging probability', value: 20, min: 0, max: 400 },
     { key: 'seed', label: 'Random seed', value: 7, min: 1, max: 1e6 },
   ] },
 ];
+/** Flat list of the input field declarations (key, label, unit, default, limits). */
 export const INPUT_FIELDS = INPUTS.flatMap((g) => g.fields);
-const FIELDS = INPUTS.flatMap((g) => g.fields), DEF = Object.fromEntries(FIELDS.map((f) => [f.key, f.value]));
+const FIELDS = INPUT_FIELDS, DEF = Object.fromEntries(FIELDS.map((f) => [f.key, f.value]));
 /** Fill defaults, coerce and check the inputs; throws a readable Error for impossible input. */
 function clean(v0 = {}) {
   const v = {};
@@ -1034,8 +1070,8 @@ function clean(v0 = {}) {
     if (f.type === 'table') { v[f.key] = Array.isArray(x) && x.length ? x : f.value; continue; }
     const y = x === null || x === undefined || x === '' ? f.value : +x;
     need(Number.isFinite(y), `${f.label} must be a number.`);
-    need(f.min === undefined || y >= f.min - 1e-12, `${f.label} must be at least ${f.min}${f.unit ? ' ' + f.unit : ''} (got ${y}).`);
-    need(f.max === undefined || y <= f.max + 1e-12, `${f.label} must not exceed ${f.max}${f.unit ? ' ' + f.unit : ''} (got ${y}).`);
+    need(f.min === undefined || y >= f.min - 1e-12, `${f.label} must be at least ${f.min}${f.unit && f.unit !== '–' ? ' ' + f.unit : ''} (got ${y}).`);
+    need(f.max === undefined || y <= f.max + 1e-12, `${f.label} must not exceed ${f.max}${f.unit && f.unit !== '–' ? ' ' + f.unit : ''} (got ${y}).`);
     v[f.key] = y;
   }
   for (const k of ['nAxial', 'nClasses', 'nMC', 'seed']) v[k] = Math.round(v[k]);
@@ -1064,15 +1100,15 @@ const SC_LABEL = Object.fromEntries(SCEN.map((s) => [s.value, s.label]));
 const aqDepression = (S, eff = 1, wt = S.aq.inhWt) => { const salt = hydrateDepression({ S: S.aq.S, inhWt: 0, inh: S.aq.inh }); return wt > 0 ? salt + eff * (hydrateDepression({ S: S.aq.S, inhWt: wt, inh: S.aq.inh }) - salt) : salt; };
 
 /** Monte Carlo over uncertain kinetics, cohesion, adhesion and the stochastic (Poisson) onset on a coarse copy of the model. */
-async function plugMonteCarlo(v, ctx, S, p, slow, tick) {
-  const N = v.nMC, out = { n: N, plugTimes: [], onsetTimes: [], blk: [], visc: [], prob: 0, lo: 0, hi: 0 };
-  if (!(N > 0)) return out;
-  const n2 = Math.min(S.n, 12), S2 = buildSetup(v, ctx, n2), g2 = pbeGrid(8, p.mode === 'oil' ? p.dPrim / 4 : 2e-6, 2e-2), { phases } = scenarioPhases(v, 2), rg = rng(v.seed);
+async function plugMonteCarlo(v, ctx, S, p, slow, tick, skip = false) {
+  const N = v.nMC, out = { n: N, plugX: [], plugTimes: [], onsetTimes: [], blk: [], visc: [], prob: 0, lo: 0, hi: 0 };
+  if (!(N > 0) || skip) return out;
+  const n2 = Math.min(S.n, 10), S2 = buildSetup(v, ctx, n2), g2 = pbeGrid(8, p.mode === 'oil' ? p.dPrim / 4 : 2e-6, 2e-2), { phases } = scenarioPhases(v, 3), rg = rng(v.seed);
   const dW = S2.s.map((s) => interp1(S.s, slow.dWax, s) + interp1(S.s, slow.dScale, s)), Dbase = dW.map((d) => Math.max(S.D0 - 2 * d, 0.2 * S.D0)), ln = (sd) => Math.exp(rg.normal(0, sd));
   for (let k = 0; k < N; k++) {
     const pk = { ...p, kinK: p.kinK * ln(0.7), cohesion: p.cohesion * ln(0.6), adhesion: Math.min(p.adhesion * ln(0.6), 1), adhForce: p.adhForce * ln(0.5), tauCrit: p.tauCrit * ln(0.4), nucA: p.nucA * ln(1.5), shellD: p.shellD * ln(0.7), lamStar: -Math.log(1 - rg.uniform(0, 1) * 0.999999) };
-    const r = runHydrateMarch(S2, pk, { phases, grid: g2, Dbase, dep0: v.dep0Mm / 1000, cheap: true, rows: 2 });
-    if (r.plug) out.plugTimes.push(r.plug.t / 3600); if (r.onset) out.onsetTimes.push(r.onset.t / 3600);
+    const r = runHydrateMarch(S2, pk, { phases, grid: g2, Dbase, dep0: v.dep0Mm / 1000, cheap: true, rows: 2, stopWhenClear: true });
+    if (r.plug) { out.plugTimes.push(r.plug.t / 3600); out.plugX.push(r.plug.x); } if (r.onset) out.onsetTimes.push(r.onset.t / 3600);
     out.blk.push(Math.max(...r.ser.blk, 0)); out.visc.push(Math.max(...r.ser.visc, 1));
     if (k % 8 === 7) await tick(0.7 + (0.2 * k) / N);
   }
@@ -1097,7 +1133,7 @@ async function run(v0, ctx = {}) {
   let kk = 0; while (!m.done) { m.step(); if (++kk % 10 === 0) await tick(0.1 + 0.55 * m.progress, 'Marching hydrate formation, transport and deposition'); }
   const h = m.result(), rec = h.rec, ser = h.ser, pk = h.peak, tShut = v.scenario === 'restart' ? v.shutHours : 0;
   await tick(0.68, 'Plugging probability (Monte Carlo)');
-  const mc = await plugMonteCarlo(v, ctx, S, p, slow, tick);
+  const mc = await plugMonteCarlo(v, ctx, S, p, slow, tick, Math.max(...rec.subMax) <= 0 && !h.plug && !(v.dep0Mm > 0)); // without any subcooling no sample can form hydrate
   await tick(0.92, 'Wax, scale, asphaltene, sand and remediation');
 
   // ---- hydrate driving force, exposure, conversion
@@ -1105,15 +1141,20 @@ async function run(v0, ctx = {}) {
   let expoH = 0, degH = 0; for (let k = 0; k < ser.t.length; k++) { const dtH = ser.t[k] - (k ? ser.t[k - 1] : 0); if (ser.sub[k] > 0) { expoH += dtH; degH += ser.sub[k] * dtH; } }
   const teqSteady = base.P.map((P) => S.hT0(P) - depNow), subSteady = base.T.map((T, i) => teqSteady[i] - T);
   const tauC = S.C.map((C) => C / (S.U * PI * D0)), coolT = base.T.map((T, i) => (T <= teqSteady[i] ? 0 : S.tAmb[i] >= teqSteady[i] ? Infinity : tauC[i] * Math.log((T - S.tAmb[i]) / (teqSteady[i] - S.tAmb[i]))) / 3600), cooldown = Math.min(...coolT), iCool = coolT.indexOf(cooldown);
-  const peakPhi = pk.phi, peakBlkHyd = pk.blk, peakVisc = Math.max(...ser.visc, 1), waterIn = ser.t.length ? base.P.reduce((a, P, i) => a + S.props(P, base.T[i]).rhoW * S.props(P, base.T[i]).wcut * A0 * base.holdup[i] * ds, 0) : 0;
-  const led = h.ledger, waterUsed = (led.formed - led.dissociated) * p.wfH, gasUsed = led.formed * (1 - p.wfH), peakRate = Math.max(...ser.rate, 0), convMax = Math.max(...rec.X, pk.phiX ? Math.max(...pk.phiX.map((f, i) => (f * p.rhoH * p.wfH) / Math.max(S.props(h.P[i], h.T[i]).rhoW * S.props(h.P[i], h.T[i]).wcut, 1e-9))) : 0);
+  const peakPhi = pk.phi, peakBlkHyd = pk.blk, peakVisc = Math.max(...ser.visc, 1);
+  const led = h.ledger, waterUsed = led.formed * p.wfH, gasUsed = led.formed * (1 - p.wfH), peakRate = Math.max(...ser.rate, 0), convMax = Math.max(...rec.X, pk.phiX ? Math.max(...pk.phiX.map((f, i) => (f * p.rhoH * p.wfH) / Math.max(S.props(h.P[i], h.T[i]).rhoW * S.props(h.P[i], h.T[i]).wcut, 1e-9))) : 0);
   // ---- combined deposit profile at the worst time of the event
   const dHyd = pk.dHyd || h.dHyd, total = dHyd.map((d, i) => d + slow.dWax[i] + slow.dScale[i]), Deff = total.map((d) => Math.max(D0 - 2 * d, 0.03 * D0)), iMin = argmax(total), blockage = 1 - (Deff[iMin] / D0) ** 2;
   const roughEff = Math.min(S.rough0 + Math.max(...total.map((_, i) => 0.1 * dHyd[i] + 0.05 * slow.dWax[i] + 0.3 * slow.dScale[i])), 0.05 * D0), grain = v.plugGrainUm > 0 ? v.plugGrainUm * 1e-6 : p.dPrim;
   const porPk = pk.por || h.por, perm = porPk.map((e) => kozenyCarman(e, grain));
   // clean versus fouled pressure drop in production (kernel gradient with the restricted bore and the rougher wall)
   let dpClean = 0, dpFoul = 0; for (let i = 0; i < n; i++) { const g0 = S.grad(i, pb.P[i], pb.T[i], D0, S.rough0, 1, fProd), g1 = S.grad(i, pb.P[i], pb.T[i], Math.max(D0 - 2 * (slow.dWax[i] + slow.dScale[i]), 0.2 * D0), roughBase[i], 1, fProd); dpClean += (g0.dpdx * ds) / 1e5; dpFoul += (g1.dpdx * ds) / 1e5; }
-  const pIn0 = ser.pIn.find((_, k) => ser.frac[k] > 0) ?? ser.pIn[0] ?? base.pIn, pInPeak = Math.max(...ser.pIn.filter((_, k) => ser.frac[k] > 0), pIn0), dpRise = pInPeak - pIn0;
+  const pIn0 = S.prof(fEvent).pIn, pInPeak = Math.max(...ser.pIn.filter((_, k) => ser.frac[k] > 0), pIn0), dpRise = pInPeak - pIn0;
+  // slurry transport at the peak: settling of the agglomerates (hindered) and the velocity needed to keep them suspended
+  const dAg = Math.max(pk.d43 ? pk.d43[pk.iPhi] : 0, p.dPrim), setH = settlingVelocity(dAg, p.rhoH, pk.rhoC || 800, pk.muC || 3e-3, { phi: pk.phiE ? Math.min(pk.phiE[pk.iPhi], 0.6) : 0 }), critH = sandCriticalVelocity({ d: dAg, D: D0, rhoP: Math.max(p.rhoH, (pk.rhoC || 800) + 1), rhoF: pk.rhoC || 800, mu: pk.muC || 3e-3, C: Math.max(peakPhi, 1e-6) }).oroskarTurian;
+  const numPk = pk.N ? pk.N.reduce((a, b) => a + b, 0) / Math.max(pk.VL || 1, 1e-12) : 0;
+  // flow that still leaks through a fully formed porous plug at the available pressure difference (Darcy–Forchheimer, Kozeny–Carman)
+  const iPl = h.plug ? h.plug.i : iSub, prPlug = S.props(h.P[iPl], S.tAmb[iPl]), dpAvail = Math.max(p.pInMax - S.pOut, 0) * 1e5, vLeak = porousVelocity(dpAvail / v.plugLength, prPlug.muL, prPlug.rhoL, v.porosityInf, grain), pgr = porousGradient(vLeak, prPlug.muL, prPlug.rhoL, v.porosityInf, grain);
   // ---- plugging indicator
   const plug = h.plug, pOn = h.onset ? 1 : 1 - Math.exp(-Math.max(...rec.lam, 0)), sev = Math.max(peakBlkHyd / p.plugBlock, Math.log10(peakVisc) / 3, dpRise / Math.max(p.pInMax - pIn0, 1));
   const risk = plug ? 1 : clamp(Math.max(pOn * Math.max(maxSub > 0 ? 0.15 : 0, sev), mc.prob), 0, 1), plugT = mc.plugTimes.slice().sort((a, b) => a - b);
@@ -1140,7 +1181,7 @@ async function run(v0, ctx = {}) {
   let pBub = aPath[aPath.length - 1].P; for (const q of aPath) if (q.wG > 1e-4) { pBub = q.P; break; }
   const sara = { sat: v.saraSat, aro: v.saraAro, res: v.saraRes, asp: v.saraAsp }, cii = colloidalInstability(sara), db = deBoer(aPath[0].rho, Math.max(pRes - pBub, 0)), aspPhi = ((v.saraAsp / 100) * aPath[0].rho) / 1200;
   const fh = aPath.map((q) => asphalteneSolubility({ rhoL: q.rho, mwL: q.mw, TK: q.T + KEL, deltaA: v.asphDelta, vA: v.asphMV })), iFh = fh.findIndex((f) => f.phiMax < aspPhi), fhMin = Math.min(...fh.map((f) => f.phiMax));
-  const aScore = (db.cls === 'severe problems' ? 2 : db.cls === 'slight problems' ? 1 : 0) + (cii.cls === 'unstable' ? 2 : cii.cls === 'uncertain' ? 1 : 0) + (iFh >= 0 ? 2 : 0), aRisk = aScore >= 4 ? 'high' : aScore >= 2 ? 'medium' : 'low';
+  const aScore = (db.cls === 'severe problems' ? 2 : db.cls === 'slight problems' ? 1 : 0) + (cii.cls === 'unstable' ? 2 : cii.cls === 'uncertain' ? 1 : 0) + (iFh >= 0 ? 2 : 0), oilSys = p.mode !== 'gas', aRisk = !oilSys ? 'low' : aScore >= 4 ? 'high' : aScore >= 2 ? 'medium' : 'low';
   // ---- scale summary and seawater mixing curve at arrival conditions
   const iSI = argmax(slow.si), scaleSI = slow.si[iSI], scaleMineral = scaleSI > 0 ? slow.mineral[iSI] : 'none', mixF = linspace(0, 1, 21), w0 = waterOf(v), tMix = pb.T[0], pMix = pb.P[0];
   const mix = mixF.map((f) => scaleIndices(mixWaters(w0, SEAWATER, f), tMix, pMix, { yCO2: v.co2Pct / 100, model: v.actModel })), sIn = slow.sis[0], mic = scaleSI > 0 ? clamp(2 * 10 ** (0.5 * scaleSI), 1, 200) : 0;
@@ -1149,7 +1190,7 @@ async function run(v0, ctx = {}) {
     const phi = Math.max(peakPhi, 0.02), env = { shear: pk.gdot || 200, eps: 0, nu: (pk.muC || 3e-3) / (pk.rhoC || 800), mu: pk.muC || 3e-3, TK: (pk.T ?? 4) + KEL, dRho: Math.abs(p.rhoH - (pk.rhoC || 800)), alpha: p.aggEff }, g2 = pbeGrid(40, p.dPrim / 2, 60 * p.dPrim), kP = 5, L0 = g2.L[kP], N0 = phi / g2.v[kP];
     const b0 = aggregationKernel(L0, L0, env).total, tB = b0 * N0 > 0 ? 3 / (b0 * N0) : 1, be = new Float64Array(g2.n * g2.n); for (let i = 0; i < g2.n; i++) for (let j = 0; j < g2.n; j++) be[i * g2.n + j] = aggregationKernel(g2.L[i], g2.L[j], env).total;
     const Ni = new Float64Array(g2.n); Ni[kP] = N0; const sct = solvePBE(g2, Ni, tB, { beta: be, maxSub: 4000, frac: 0.05 }), ms = pbeMoments(g2, sct.N);
-    const sg = 0.05, mom = [0, 1, 2, 3, 4, 5].map((k) => N0 * L0 ** k * Math.exp((k * k * sg * sg) / 2)), q = solveQMOM(mom, tB, { beta: (a, b) => aggregationKernel(a, b, env).total, steps: 120 });
+    const sg = 0.05, mom = [0, 1, 2, 3, 4, 5].map((k) => N0 * L0 ** k * Math.exp((k * k * sg * sg) / 2)), q = solveQMOM(mom, tB, { beta: (a, b) => aggregationKernel(a, b, env).total, steps: 50 });
     return { tB, m0s: ms.m0 / N0, m0q: q.m[0] / N0, m3s: ms.m3 / (N0 * L0 ** 3), m3q: q.m[3] / mom[3], d43s: ms.d43, d43q: q.m[4] / q.m[3], ok: q.ok, nodes: q.nodes };
   })();
   const vdw = vdwpMethane(Math.max(mean(S.tAmb), 0.5)), occ = langmuirOccupancy(Math.max(mean(S.tAmb), 0) + KEL, methaneFugacity(mean(base.P), Math.max(mean(S.tAmb), 0) + KEL));
@@ -1174,7 +1215,7 @@ async function run(v0, ctx = {}) {
     scenario: v.scenario, hydrateMode: p.mode, hydrateLength: r3(stableLen, 5), exposureHours: r3(expoH, 4), cooldownTime: Number.isFinite(cooldown) ? r3(cooldown, 4) : null, hydrateMass: r3(Math.max(...ser.susp.map((s, k) => s + ser.dep[k]), 0), 4), waterConversion: r3(convMax, 4), gasConsumed: r3(gasUsed, 4),
     plugProbabilityInterval: [r3(mc.lo), r3(mc.hi)], plugTimeP10: plugT.length ? r3(quantile(plugT, 0.1), 4) : null, plugTimeP50: plugT.length ? r3(quantile(plugT, 0.5), 4) : null, plugTimeP90: plugT.length ? r3(quantile(plugT, 0.9), 4) : null, plugMechanism: plug ? plug.mech : null,
     dpIncrease: r3(dpRise + (dpFoul - dpClean), 4), dpFouling: r3(dpFoul - dpClean, 4), inhibitor: inhId, inhibitorDepression: r3(depNow - depSalt, 4), meltTimeTwoSided: Number.isFinite(melt2.tNumeric) ? r3(melt2.tNumeric / 3600, 4) : null, heatingPower: r3(dehW / 1000, 4),
-    waxRestartPressure: r3(slow.restartDp, 4), sandRate: r3(v.sandRate / 86400, 4), sandSize: v.sandUm * 1e-6, sandDensity: v.sandRho, sandMinRateFraction: r3(sandMinRate / 100, 4), sandErosionScreen: r3(erosion, 3), asphalteneCII: r3(cii.cii, 4), particleSize: r3(pk.d43 ? pk.d43[pk.iPhi] : 0, 4),
+    waxRestartPressure: r3(slow.restartDp, 4), sandRate: r3(v.sandRate / 86400, 4), sandSize: v.sandUm * 1e-6, sandDensity: v.sandRho, sandMinRateFraction: r3(sandMinRate / 100, 4), sandErosionScreen: r3(erosion, 3), plugXP50: mc.plugX.length ? r3(quantile(mc.plugX, 0.5), 5) : null, particleNumber: r3(numPk, 4), slurryCriticalVelocity: r3(critH, 4), depositPermeability: r3(kozenyCarman(v.porosityInf, grain), 3), captureRate: r3(rec.captureMax, 4), removalRate: r3(rec.removalMax, 4), asphalteneCII: r3(cii.cii, 4), particleSize: r3(pk.d43 ? pk.d43[pk.iPhi] : 0, 4),
   };
 
   // ---- KPIs
@@ -1203,7 +1244,9 @@ async function run(v0, ctx = {}) {
   if (plug) warnings.push({ level: 'bad', msg: `The base-case march plugs after ${(plug.t / 3600).toFixed(1)} h at ${(plug.x / 1000).toFixed(1)} km: ${plug.mech}.` });
   if (maxSub > 0 && !plug) warnings.push({ level: maxSub > 6 ? 'bad' : 'warn', msg: `The line is inside the hydrate region over ${(stableLen / 1000).toFixed(1)} km with up to ${maxSub.toFixed(1)} °C of subcooling for ${expoH.toFixed(1)} h.` });
   if (mc.prob >= 0.05) warnings.push({ level: mc.prob > 0.3 ? 'bad' : 'warn', msg: `Plugging probability ${(mc.prob * 100).toFixed(0)} % (90 % interval ${(mc.lo * 100).toFixed(0)}–${(mc.hi * 100).toFixed(0)} %, ${mc.n} samples of uncertain kinetics, cohesion, adhesion and nucleation).` });
+  if (peakPhi > 0.005 && (pk.vL ?? 9) < critH) warnings.push({ level: 'warn', msg: `At the peak the liquid moves at ${(pk.vL ?? 0).toFixed(2)} m/s, below the ${critH.toFixed(2)} m/s needed to keep ${(dAg * 1e6).toFixed(0)} µm agglomerates suspended: a moving or stationary hydrate bed is likely.` });
   if (h.limited) warnings.push({ level: 'info', msg: 'Agglomeration and breakage are much faster than the transport step in part of the line; those cells were integrated with the implicit conservative scheme, which resolves the equilibrium size but not the sub-second transient.' });
+  if (Math.max(...slow.dWax.map((d, i) => 1 - (Dbase[i] / D0) ** 2)) > 0.5) warnings.push({ level: 'bad', msg: `Wax and scale alone close more than half of the bore after ${v.depositDays} d without pigging.` });
   if (piggingInterval !== null && piggingInterval < 30) warnings.push({ level: 'warn', msg: `Wax reaches ${v.waxLimitMm} mm in ${piggingInterval.toFixed(0)} d at ${(slow.waxRate0).toFixed(3)} mm/d.` });
   if (scaleSI > 0.5) warnings.push({ level: scaleSI > 1 ? 'bad' : 'warn', msg: `${scaleMineral} is supersaturated (SI ${scaleSI.toFixed(2)}) at ${xkm[iSI].toFixed(1)} km.` });
   if (sIn.I > 1 && v.actModel === 'davies') warnings.push({ level: 'warn', msg: `Ionic strength ${sIn.I.toFixed(2)} mol/L is beyond the range of the Davies equation; use the Truesdell–Jones model.` });
@@ -1214,14 +1257,16 @@ async function run(v0, ctx = {}) {
   if (S.src !== 'flow suite') warnings.push({ level: 'info', msg: S.custom ? 'The flow picture was recomputed here with the shared kernel because the line or fluid inputs differ from the case.' : 'The flow suite has not been run: pressure, temperature and holdup come from the shared kernel estimate.' });
   if (maxSub > 0) {
     recs.push(wReqIdeal >= 94 ? `No practical ${inh.name} dose removes ${maxSub.toFixed(1)} °C of subcooling: shorten the shutdown, depressurise, or displace the line before it cools.` : `Inject ${inh.name} to ${wReqIdeal.toFixed(0)} wt % of the aqueous phase (about ${inhRate.toFixed(1)} m³/d at ${(fEvent * 100).toFixed(0)} % rate) to stay ${v.marginC} °C outside the hydrate region; the present ${S.aq.inhWt.toFixed(0)} wt % leaves ${maxSub.toFixed(1)} °C of subcooling.`);
-    if (Number.isFinite(cooldown)) recs.push(`Treat ${cooldown.toFixed(1)} h as the cooldown limit: after a trip, start inhibitor displacement or depressurisation within about ${Math.max(cooldown - 2, 0).toFixed(1)} h (2 h reserved for the operation itself); the coldest point is at ${xkm[iCool].toFixed(1)} km.`);
+    if (cooldown <= 0) recs.push(`The line is already inside the hydrate region in steady production at ${xkm[iCool].toFixed(1)} km: continuous inhibition (or more insulation) is needed, not only shutdown procedures.`);
+    else if (Number.isFinite(cooldown)) recs.push(`Treat ${cooldown.toFixed(1)} h as the cooldown limit: after a trip, start inhibitor displacement or depressurisation within about ${Math.max(cooldown - 2, 0).toFixed(1)} h (2 h reserved for the operation itself); the coldest point is at ${xkm[iCool].toFixed(1)} km.`);
     recs.push(`Screening for low-dosage inhibitors: a kinetic inhibitor is ${khiOk ? `plausible (subcooling ${maxSub.toFixed(1)} °C ≤ ${v.khiLimit} °C, indicative hold time ${khiHold > 1e4 ? 'very long' : khiHold.toFixed(0) + ' h'})` : `not suitable (subcooling ${maxSub.toFixed(1)} °C exceeds ${v.khiLimit} °C)`}; an anti-agglomerant is ${aaOk ? 'plausible' : 'not suitable'} at ${(prE.wcut * 100).toFixed(0)} % water cut — confirm either with qualification tests.`);
   } else recs.push(`The line stays ${(-maxSub).toFixed(1)} °C outside the hydrate region throughout this scenario; no hydrate inhibitor is needed for it. Check the shutdown and restart scenarios before relaxing the inhibition philosophy.`);
   if (plug || mc.prob > 0.1) recs.push(`If a plug forms, depressurise from both sides to ${v.depressP} bara: a ${v.plugLength} m plug then melts radially in about ${Number.isFinite(melt2.tNumeric) ? (melt2.tNumeric / 86400).toFixed(1) + ' d' : 'no finite time (the seabed is colder than the hydrate temperature at that pressure)'}. Never depressurise from one side only: ${Math.max(pLoc - v.depressP, 0).toFixed(0)} bar across the plug could launch it at the order of ${projV.toFixed(0)} m/s.`);
   if (piggingInterval !== null) recs.push(`Pig for wax every ${Math.max(Math.floor(piggingInterval * 0.8), 1)} d (80 % of the ${piggingInterval.toFixed(0)} d it takes to reach ${v.waxLimitMm} mm; ${slow.waxMass.toFixed(0)} kg of wax after ${v.depositDays} d).`);
-  else recs.push(`No wax deposits in this operating mode: the wall stays above the wax appearance temperature of ${v.wat} °C.`);
+  else recs.push(`No wax deposits in this operating mode: the wall stays above the wax appearance temperature of ${(+v.wat).toFixed(1)} °C.`);
   if (scaleSI > 0) recs.push(`Dose scale inhibitor against ${scaleMineral} (SI ${scaleSI.toFixed(2)}): a screening minimum inhibitor concentration is about ${mic.toFixed(0)} ppm — confirm with a dynamic tube-blocking test on the real brine.`);
   if (v.sandRate > 0) recs.push(sandBed ? `Raise the rate to at least ${sandMinRate.toFixed(0)} % of the case rate (mixture velocity ≥ ${sandCrit.toFixed(2)} m/s) to keep sand moving, or schedule sand pigging.` : `Sand keeps moving: the lowest velocity is ${sandMargin.toFixed(1)} times the critical velocity; do not run below about ${Math.min(sandMinRate, 100).toFixed(0)} % of the case rate for long periods.`);
+  if (!oilSys) warnings.push({ level: 'info', msg: 'Asphaltene screening is not meaningful for a gas-dominated system with little stock-tank oil; the class is reported as low.' });
   if (aRisk !== 'low') recs.push(`Run an asphaltene onset test on live oil (depressurisation from ${pRes.toFixed(0)} bara through the bubble point near ${pBub.toFixed(0)} bara) before selecting an inhibitor.`);
 
   // ---- plots
@@ -1264,25 +1309,26 @@ async function run(v0, ctx = {}) {
   tables.push({ title: 'Hydrate formation, transport and plugging', columns: ['Quantity', 'Value', 'Unit'], rows: [
     ['Scenario', SC_LABEL[v.scenario], ''], ['Hydrate system', p.mode === 'oil' ? 'oil-dominated (shrinking-core droplets)' : p.mode === 'gas' ? 'gas-dominated (film and entrained water)' : 'water-dominated (absorption limited)', ''],
     ['Stability margin (most negative = safest)', tx(-maxSub), '°C'], ['Exposure inside the hydrate region', tx(expoH), 'h'], ['Exposure integral', tx(degH), '°C·h'], ['Hydrate-stable length at the end', tx(stableEnd / 1000), 'km'],
-    ['Onset location', h.onset ? tx(h.onset.x / 1000) : '—', 'km'], ['Onset time', tOnset === null ? '—' : tx(tOnset), 'h'], ['Peak nucleation rate', tx(Math.max(...rec.J)), '1/m³ water/s'], ['Peak formation rate', tx(peakRate), 'kg/s'],
+    ['Onset location', h.onset ? tx(h.onset.x / 1000) : '—', 'km'], ['Onset time', tOnset === null ? '—' : tx(tOnset), 'h'], ['Peak nucleation rate', tx(rec.Jmax), '1/m³ water/s'], ['Peak formation rate', tx(peakRate), 'kg/s'],
     ['Hydrate formed', tx(led.formed / 1000), 't'], ['Hydrate dissociated', tx(led.dissociated / 1000), 't'], ['Hydrate carried out of the line', tx(led.exported / 1000), 't'], ['Captured on the wall', tx(led.captured / 1000), 't'], ['Sloughed back into the stream', tx(led.sloughed / 1000), 't'],
-    ['Water converted (net)', tx(waterUsed / 1000), 't'], ['Gas consumed', tx(gasUsed / 1000), 't'], ['Peak water conversion in a cell', tx(convMax * 100), '%'], ['Heat of formation released (net)', tx(led.heat / 1e9), 'GJ'], ['Hydration number', tx(p.hydN, 4), 'mol/mol'],
-    ['Primary particle size', tx(p.dPrim * 1e6), 'µm'], ['Cohesive-limit agglomerate size at the peak', tx((pk.dA ? pk.dA[pk.iPhi] : 0) * 1e6), 'µm'], ['Agglomerate d43 at the peak', tx((pk.d43 ? pk.d43[pk.iPhi] : 0) * 1e6), 'µm'], ['Effective volume fraction at the peak', tx(pk.phiE ? pk.phiE[pk.iPhi] : 0), '–'], ['Peak slurry viscosity factor', tx(peakVisc), '×'],
-    ['Peak wall-capture rate', tx(Math.max(...ser.dep.map((d, k) => (k ? (d - ser.dep[k - 1]) / Math.max((ser.t[k] - ser.t[k - 1]) * 3600, 1) : 0)), 0)), 'kg/s'], ['Inlet-pressure rise in the event', tx(dpRise), 'bar'], ['Pressure-drop increase from wax and scale', tx(dpFoul - dpClean), 'bar'],
+    ['Water converted to hydrate', tx(waterUsed / 1000), 't'], ['Gas consumed', tx(gasUsed / 1000), 't'], ['Peak water conversion in a cell', tx(convMax * 100), '%'], ['Heat of formation released (net of melting)', tx(led.heat / 1e9), 'GJ'], ['Hydration number', tx(p.hydN, 4), 'mol/mol'],
+    ['Primary particle size', tx(p.dPrim * 1e6), 'µm'], ['Cohesive-limit agglomerate size at the peak', tx((pk.dA ? pk.dA[pk.iPhi] : 0) * 1e6), 'µm'], ['Agglomerate d43 at the peak', tx((pk.d43 ? pk.d43[pk.iPhi] : 0) * 1e6), 'µm'], ['Particle number concentration at the peak', tx(numPk), '1/m³ liquid'], ['Agglomerate settling velocity (hindered; negative = rises)', tx(setH.vHindered), 'm/s'], ['Velocity needed to keep the slurry suspended', tx(critH), 'm/s'], ['Liquid velocity at the peak', tx(pk.vL ?? 0), 'm/s'], ['Effective volume fraction at the peak', tx(pk.phiE ? pk.phiE[pk.iPhi] : 0), '–'], ['Peak slurry viscosity factor', tx(peakVisc), '×'],
+    ['Peak wall-capture rate in a cell', tx(rec.captureMax), 'kg/s'], ['Peak shear-removal rate in a cell', tx(rec.removalMax), 'kg/s'], ['Deposit porosity (aged → fresh)', `${Math.min(...porPk).toFixed(2)} – ${Math.max(...porPk).toFixed(2)}`, '–'], ['Deposit permeability (Kozeny–Carman, range)', `${Math.min(...perm).toExponential(1)} – ${Math.max(...perm).toExponential(1)}`, 'm²'], ['Inlet-pressure rise in the event', tx(dpRise), 'bar'], ['Pressure-drop increase from wax and scale', tx(dpFoul - dpClean), 'bar'],
     ['Effective roughness with deposits', tx(roughEff * 1e6), 'µm'], ['Plug', plug ? `${(plug.t / 3600).toFixed(2)} h at ${(plug.x / 1000).toFixed(2)} km — ${plug.mech}` : 'none in the base case', ''],
-    ['Plugging probability (90 % interval)', `${(mc.prob * 100).toFixed(0)} % (${(mc.lo * 100).toFixed(0)}–${(mc.hi * 100).toFixed(0)} %)`, ''], ['Time to plug P10 / P50 / P90', plugT.length ? `${quantile(plugT, 0.1).toFixed(1)} / ${quantile(plugT, 0.5).toFixed(1)} / ${quantile(plugT, 0.9).toFixed(1)}` : '—', 'h'], ['Risk index', tx(risk), '0–1']],
+    ['Plugging probability (90 % interval)', `${(mc.prob * 100).toFixed(0)} % (${(mc.lo * 100).toFixed(0)}–${(mc.hi * 100).toFixed(0)} %)`, ''], ['Plug location P10 / P50 / P90', mc.plugX.length ? `${(quantile(mc.plugX, 0.1) / 1000).toFixed(1)} / ${(quantile(mc.plugX, 0.5) / 1000).toFixed(1)} / ${(quantile(mc.plugX, 0.9) / 1000).toFixed(1)}` : '—', 'km'], ['Time to plug P10 / P50 / P90', plugT.length ? `${quantile(plugT, 0.1).toFixed(1)} / ${quantile(plugT, 0.5).toFixed(1)} / ${quantile(plugT, 0.9).toFixed(1)}` : '—', 'h'], ['Risk index', tx(risk), '0–1']],
     note: 'Times are measured from the start of the simulated sequence (the start of the shut-in for a cold restart).' });
   tables.push({ title: 'Population balance cross-check: sectional against quadrature method of moments', columns: ['Quantity', 'Sectional (fixed pivot)', 'QMOM (3 nodes)'], rows: [['Batch time (s)', tx(qm.tB), tx(qm.tB)], ['Number remaining N/N₀', tx(qm.m0s, 4), qm.ok ? tx(qm.m0q, 4) : '—'], ['Third moment m₃/m₃₀ (volume)', tx(qm.m3s, 6), qm.ok ? tx(qm.m3q, 6) : '—'], ['d43 (µm)', tx(qm.d43s * 1e6, 4), qm.ok ? tx(qm.d43q * 1e6, 4) : '—']], note: 'Pure aggregation of a narrow population with the collision kernel of the worst cell over three collision times; both methods must conserve the third moment.' });
   tables.push({ title: 'Inhibition and remediation', columns: ['Item', 'Value', 'Unit', 'Basis'], rows: [
     ['Depression from salt', tx(depSalt), '°C', 'Nielsen–Bucklin on the water mole fraction'], [`Depression from ${S.aq.inhWt > 0 ? S.aq.inh.name : 'inhibitor'} now`, tx(depNow - depSalt), '°C', `${S.aq.inhWt.toFixed(1)} wt %, effectiveness ${v.inhEff} %`], ['Inhibitor effectiveness', tx(maxSub > 0 || depNow > depSalt ? (100 * (depNow - depSalt)) / Math.max(maxSub + depNow - depSalt, 1e-9) : 100), '% of the uninhibited subcooling removed', 'event peak'],
     [`${inh.name} required`, tx(wReqIdeal), 'wt %', `${v.marginC} °C margin on the peak subcooling`], ['Injection rate', tx(inhRate), 'm³/d', `${(mWater * 86.4).toFixed(1)} t/d of water at the event rate`], ['Loss to gas and hydrocarbon liquid', tx(lossPct), '% of injected', inhId === 'MeOH' ? 'partition coefficients (screening)' : 'negligible for glycols (screening)'],
     ['Kinetic inhibitor (screening)', khiOk ? 'plausible' : 'not suitable', '', `subcooling limit ${v.khiLimit} °C`], ['Anti-agglomerant (screening)', aaOk ? 'plausible' : 'not suitable', '', `water-cut limit ${v.aaWcLimit} %`],
-    ['Two-sided depressurisation: radial melt time', Number.isFinite(melt2.tNumeric) ? tx(melt2.tNumeric / 3600) : 'no melting', 'h', `Stefan front, hydrate at ${tdTwo.toFixed(1)} °C, ambient ${tA.toFixed(1)} °C`], ['One-sided depressurisation: axial melt time', Number.isFinite(melt1) ? tx(melt1 / 86400) : 'no melting', 'd', `Neumann solution over ${v.plugLength} m — not recommended`],
+    ['Two-sided depressurisation: radial melt time', Number.isFinite(melt2.tNumeric) ? tx(melt2.tNumeric / 3600) : 'no melting', 'h', `Stefan front, hydrate at ${tdTwo.toFixed(1)} °C, ambient ${tA.toFixed(1)} °C`], ['One-sided depressurisation: axial melt time', !Number.isFinite(melt1) ? 'no melting' : melt1 > 3.15e8 ? 'more than 10 years' : tx(melt1 / 86400), 'd', `Neumann solution over ${v.plugLength} m — not recommended`],
+    ['Leak through a formed plug at the available pressure', tx(vLeak * A0 * 86400), 'm³/d', `Darcy–Forchheimer over ${v.plugLength} m, permeability ${kozenyCarman(v.porosityInf, grain).toExponential(1)} m², inertial share ${(100 * pgr.forchheimer / Math.max(pgr.total, 1e-300)).toFixed(0)} %`],
     ['Plug velocity if released one-sided', tx(projV), 'm/s', 'after 100 m of free travel, friction neglected'], ['Intrinsic dissociation time of a grain', Number.isFinite(tKin) ? tx(tKin) : '—', 's', 'Kim–Bishnoi: far faster than heat supply, so melting is heat-transfer-controlled'],
     ['Methanol to dissolve the plug', tx(meohMelt), 'm³', `${(wEq * 100).toFixed(0)} wt % in the released water`], ['Methanol contact time (mass-transfer-controlled)', tx(tMeoh / 86400), 'd', 'film coefficient 10⁻⁵ m/s on the plug face'], ['Heating to hold the line outside the region', tx(dehW / 1000), 'kW', `${tHold.toFixed(1)} °C along ${(S.L / 1000).toFixed(1)} km`], ['Heat to melt the plug in one day', tx(meltKW), 'kW', 'latent heat only']] });
   tables.push({ title: 'Wax', columns: ['Quantity', 'Value', 'Unit'], rows: [['Wax appearance temperature', v.wat, '°C'], ['Length with a wall below the WAT', tx(slow.last.filter((r) => r && r.Ti < v.wat).length * ds / 1000), 'km'], ['Initial build-up rate', tx(slow.waxRate0), 'mm/d'], [`Maximum thickness after ${v.depositDays} d`, tx(slow.ser.dMax[slow.ser.dMax.length - 1]), 'mm'], ['Wax mass in the line', tx(slow.waxMass), 'kg'], ['Wax fraction of the aged deposit', tx(Math.max(...slow.Fw)), '–'], ['Wax diffusivity at the wall', tx(Math.max(...slow.last.map((r) => r?.Dwo || 0))), 'm²/s'], ['Pigging interval', piggingInterval === null ? 'not needed' : tx(piggingInterval), 'd'], ['Gelled length after a cold shutdown', tx(slow.gelLen / 1000), 'km'], ['Gel yield stress', tx(slow.tauY), 'Pa'], ['Gel-breaking restart pressure', tx(slow.restartDp), 'bar']] });
   tables.push({ title: 'Scale at the inlet and at the worst location', columns: ['Mineral', 'SI at the inlet', 'SI at the worst location', 'Precipitation potential at the inlet (mg/L)', 'SI with 50 % seawater'], rows: minIds.map((id, k) => [nameOf[id], tx(siOf(sIn, id)), tx(Math.max(...slow.sis.map((r) => siOf(r, id)))), tx(sIn.minerals[k].ptb), tx(siOf(mix[10], id))]),
-    note: `Ionic strength ${sIn.I.toFixed(2)} mol/L, pH ${sIn.pH.toFixed(2)} at ${pMix.toFixed(0)} bara and ${tMix.toFixed(0)} °C with ${v.co2Pct} mol % CO₂; Oddo–Tomson calcite index ${sIn.oddoTomson.toFixed(2)} for comparison. Maximum deposition rate ${Math.max(...slow.scaleRate).toFixed(3)} mm/y. Ion pairing is neglected, which is conservative for the sulphates.` });
+    note: `Ionic strength ${sIn.I.toFixed(2)} mol/L, pH ${sIn.pH.toFixed(2)} at ${pMix.toFixed(0)} bara and ${tMix.toFixed(0)} °C with ${v.co2Pct} mol % CO₂; Oddo–Tomson calcite index ${sIn.oddoTomson.toFixed(2)} for comparison. Maximum deposition rate ${Math.max(...slow.scaleRate).toFixed(3)} mm/y. Sulphate and bicarbonate ion pairs are included with 25 °C association constants.` });
   tables.push({ title: 'Asphaltene and sand', columns: ['Quantity', 'Value', 'Unit'], rows: [['In-situ oil density at reservoir conditions', tx(aPath[0].rho), 'kg/m³'], ['Undersaturation', tx(Math.max(pRes - pBub, 0)), 'bar'], ['de Boer class', db.cls, ''], ['Colloidal instability index', tx(cii.cii), cii.cls], ['Lowest Flory–Huggins solubility on the depressurisation path', tx(fhMin), 'vol fraction'], ['Asphaltene in the oil', tx(aspPhi), 'vol fraction'], ['Flory–Huggins onset pressure', iFh >= 0 ? tx(aPath[iFh].P) : 'none', 'bara'], ['Asphaltene deposition risk', aRisk, ''],
     ['Sand concentration in the liquid', tx(sand[0].C * 1e6), 'ppm by volume'], ['Sand settling velocity (hindered)', tx(Math.abs(sand[0].st.vHindered)), 'm/s'], ['Particle response time', tx(relax.tau), 's'], ['Critical velocity (governing)', tx(sandCrit), 'm/s'], ['Lowest velocity ratio v / v_critical', tx(sandMargin), '–'], ['Length with a sand bed', tx(bedLen / 1000), 'km'], ['Sand hold-up in the line', tx(sandInv), 'kg'], ['Minimum rate to keep sand moving', tx(sandMinRate), '% of case rate'], ['Bend erosion (screening)', tx(erosion), 'mm/y']] });
   tables.push({ title: 'Governing threat by zone', columns: ['From (km)', 'To (km)', 'Hydrate', 'Wax', 'Scale', 'Sand', 'Governing'], rows: zones.map((z) => [tx(z.from), tx(z.to), tx(z.sc.Hydrate), tx(z.sc.Wax), tx(z.sc.Scale), tx(z.sc.Sand), z.top]), note: 'Severity indices: 1 means at the limit (10 °C subcooling or 15 % of the bore for hydrate, the pigging thickness for wax, SI 1.5 or 2 mm/y for scale, velocity at the critical velocity for sand).' });
@@ -1291,7 +1337,8 @@ async function run(v0, ctx = {}) {
   const flowArea = Deff.reduce((a, d) => a + (PI / 4) * d * d * ds, 0), depArea = total.reduce((a, d, i) => a + (PI / 4) * (D0 * D0 - Deff[i] ** 2) * ds, 0);
   const balances = [
     { name: 'Hydrate mass (kg): formed + initial + inflow = suspended + deposited + exported + dissociated', in: led.in, out: led.out },
-    { name: 'Water bound in hydrate (kg) = hydration-number share of the net hydrate formed', in: (led.formed - led.dissociated) * ((p.hydN * MW_W) / (p.mwG + p.hydN * MW_W)), out: waterUsed },
+    { name: 'Water + gas consumed (kg) = hydrate formed (hydration number ' + p.hydN.toFixed(2) + ')', in: led.formed, out: waterUsed + gasUsed },
+    { name: 'Latent heat (J): heat put into the fluid = (formed − dissociated) × latent heat', in: (led.formed - led.filmWall - led.dissociated) * HYDRATE.latent, out: led.heat },
     { name: 'Pipe volume (m³): flow area + deposit area = clean bore', in: A0 * S.L, out: flowArea + depArea },
   ];
   const summary = `${SC_LABEL[v.scenario]}: ${maxSub > 0 ? `up to ${maxSub.toFixed(1)} °C of subcooling over ${(stableLen / 1000).toFixed(1)} km, hydrate reaches ${(peakPhi * 100).toFixed(1)} vol % of the liquid and ${plug ? `the line plugs after ${(plug.t / 3600).toFixed(1)} h at ${(plug.x / 1000).toFixed(1)} km` : `no plug forms in the base case (plugging probability ${(mc.prob * 100).toFixed(0)} %)`}` : `the line stays ${(-maxSub).toFixed(1)} °C outside the hydrate region`}; wax ${slow.waxRate0 > 1e-4 ? `builds at ${slow.waxRate0.toFixed(3)} mm/d` : 'does not deposit'}, ${scaleSI > 0 ? `${scaleMineral} is supersaturated (SI ${scaleSI.toFixed(2)})` : 'no mineral is supersaturated'}, asphaltene risk is ${aRisk} and sand ${sandBed ? 'settles' : 'keeps moving'}.`;
@@ -1300,4 +1347,230 @@ async function run(v0, ctx = {}) {
 }
 
 export const runSolids = run;
-/*__PART5__*/
+// =====================================================================================================
+// 16. Calibration model: a jacketed flow loop at constant subcooling (hydrate) and a cold-wall wax test
+// =====================================================================================================
+/**
+ * Fast loop model for parameter estimation. v: input values plus the operating point of a test:
+ * calT (h of test), calDT (°C subcooling without inhibitor), calInh (wt % MEG in the water), calV (m/s loop velocity), calDTw (°C oil-to-coolant
+ * difference of the wax test).
+ * Returns { phi (hydrate vol % of the liquid), dpRatio (pressure drop relative to the hydrate-free loop), waxMm (wax thickness) }.
+ */
+export function loopModel(v0) {
+  const v = { ...DEF, ...v0 }, tH = num(v0.calT, 4), dT0 = num(v0.calDT, 8), dT = Math.max(dT0 - (v.inhEff / 100) * hydrateDepression({ S: 0, inhWt: clamp(num(v0.calInh, 0), 0, 90), inh: INHIBITORS.MEG }), 0), vel = num(v0.calV, 1.5), dTw = num(v0.calDTw, 15), D = 0.0508, wc = 0.2, P = 80;
+  const rho = 820, mu = 4e-3, nu = mu / rho, sg = 0.7, Teq = hydrateT0(P, sg), TK = Teq - dT + KEL, Peq = brent((p) => hydrateT0(p, sg) - (Teq - dT), 1, 700, 1e-6), dp = v.primaryUm > 0 ? v.primaryUm * 1e-6 : 40e-6;
+  const hydN = v.hydNumber > 0 ? v.hydNumber : 6, mHyd = 0.018 + hydN * MW_W, rhoH = v.rhoHyd > 0 ? v.rhoHyd : HYDRATE.rho, vmh = mHyd / rhoH, eexp = (1000 / rhoH) / ((hydN * MW_W) / mHyd);
+  const Re = (rho * vel * D) / mu, f = frictionFactor(Re, 4.5e-5 / D), tauW = (f / 8) * rho * vel * vel, eps = (4 * tauW * vel) / (rho * D), gdot = Math.sqrt(eps / nu), Dg = (7.4e-12 * Math.sqrt(150) * TK) / (mu * 1000 * 37.7 ** 0.6), Sh = 2 + 0.6 * Math.sqrt((gdot * dp * dp) / nu) * Math.cbrt(nu / Dg);
+  const kLa = 0.4 * (eps * nu) ** 0.25 * Math.sqrt(Dg / nu) * 40 * v.mtMult, nd = wc / ((PI / 6) * dp ** 3), n = 80, dt = (tH * 3600) / n;
+  let X = 1e-4, dep = 0, phi = 0, mur = 1;
+  for (let k = 0; k < n; k++) {
+    const gr = hydrateGrowthRate({ TK, P, Peq, zG: 0.85, kRef: v.kinK * 1e-10, EaR: v.kinEa, H: 2500, kFilm: (Sh * Dg) / dp, kShell: shellConductance(X, dp / 2, v.shellD * 1e-13), hPart: (2 * 0.14) / dp, dT, dHmol: HYDRATE.latent * mHyd });
+    const rP = gr.j * nd * PI * dp * dp, r = gr.dc > 0 ? rP / (1 + rP / (kLa * gr.dc)) : 0;
+    X = Math.min(X + (r * vmh * dt) / (wc * eexp), 1); phi = X * wc * eexp;
+    const cp = maxAgglomerateSize({ dp, Fa: v.cohesion * 1e-3 * dp, mu0: mu, shear: gdot, phi, phiMax: v.phiMax, fr: v.fractal });
+    // agglomerate size where the collision and breakage frequencies of the kernels balance: (2.5 α φ / k_b)^(1/3) of the cohesive limit
+    const dEq = clamp(cp.dA * Math.cbrt((2.5 * v.aggEff * phi) / Math.max(v.kBreak, 1e-9)), dp, 1.5 * cp.dA), phiE = Math.min(phi * (dEq / dp) ** (3 - v.fractal), 0.98 * v.phiMax);
+    mur = slurryViscosity(phiE, v.viscModel, { phiMax: v.phiMax });
+    const uS = Math.sqrt(tauW / rho), Vd = depositionVelocity(dEq, rhoH, uS, nu, rho, TK) * v.adhesion * Math.min(1, (v.adhForce * 1e-3) / (8 * tauW * dEq));
+    dep = Math.min(dep + (Vd * phi * dt) / (1 - v.porosity0), 0.45 * D);
+  }
+  // wax: oil 3 °C above the WAT in the bulk, coolant dTw below the oil, film coefficient of the loop
+  const hIn = hInside(Re, (2000 * mu) / 0.13, 0.13, D), Tb = v.wat + 3; let dW = 0, Fw = clamp(1 - v.waxOil / 100, 0.03, 0.95);
+  for (let k = 0; k < 40; k++) { const r = waxDeposition({ Tb, Tamb: Tb - dTw, U: 1 / (1 / hIn + 1 / 400), hIn, kOil: 0.13, rhoOil: rho, muOil: mu, wat: v.wat, wTot: v.waxContent / 100, slope: v.waxSlope, delta: dW, Fw, kDep: v.waxK, D, vL: vel, gammaW: tauW / mu, mult: v.waxMult, diffModel: v.waxDiff }); dW += (r.dDelta * tH * 3600) / 40; Fw = Math.min(Fw + (r.dFw * tH * 3600) / 40, 0.95); }
+  return { phi: phi * 100, dpRatio: mur ** 0.25 * (D / (D - 2 * dep)) ** 4.75, waxMm: dW * 1000 };
+}
+const CAL_SAMPLE = [
+  { calT: 0.02, calDT: 4, calInh: 0, calV: 1.5, calDTw: 15, phi: 6.96, dpRatio: 1.118, waxMm: null },
+  { calT: 0.04, calDT: 4, calInh: 0, calV: 1.5, calDTw: 15, phi: 11.47, dpRatio: 1.244, waxMm: null },
+  { calT: 0.08, calDT: 4, calInh: 0, calV: 1.5, calDTw: 15, phi: 17.53, dpRatio: 1.427, waxMm: null },
+  { calT: 0.15, calDT: 4, calInh: 0, calV: 1.5, calDTw: 15, phi: 23.75, dpRatio: 1.624, waxMm: null },
+  { calT: 0.03, calDT: 8, calInh: 0, calV: 1.5, calDTw: 15, phi: 12.90, dpRatio: 1.262, waxMm: null },
+  { calT: 0.06, calDT: 8, calInh: 0, calV: 1.5, calDTw: 15, phi: 20.15, dpRatio: 1.471, waxMm: null },
+  { calT: 0.05, calDT: 6, calInh: 0, calV: 1, calDTw: 15, phi: 14.39, dpRatio: 1.370, waxMm: null },
+  { calT: 0.1, calDT: 6, calInh: 0, calV: 2, calDTw: 15, phi: 22.67, dpRatio: 1.526, waxMm: null },
+  { calT: 0.05, calDT: 10, calInh: 10, calV: 1.5, calDTw: 15, phi: 17.17, dpRatio: 1.411, waxMm: null },
+  { calT: 0.1, calDT: 10, calInh: 20, calV: 1.5, calDTw: 15, phi: 21.68, dpRatio: 1.557, waxMm: null },
+  { calT: 0.1, calDT: 12, calInh: 10, calV: 2, calDTw: 15, phi: 24.40, dpRatio: 1.586, waxMm: null },
+  { calT: 1, calDT: 6, calInh: 0, calV: 1.5, calDTw: 15, phi: 25.59, dpRatio: 1.787, waxMm: null },
+  { calT: 4, calDT: 6, calInh: 0, calV: 1.5, calDTw: 15, phi: 26.26, dpRatio: 2.098, waxMm: null },
+  { calT: 8, calDT: 5, calInh: 0, calV: 2, calDTw: 15, phi: 25.05, dpRatio: 3.040, waxMm: null },
+  { calT: 12, calDT: 8, calInh: 0, calV: 1.5, calDTw: 15, phi: 24.54, dpRatio: 3.126, waxMm: null },
+  { calT: 6, calDT: 0, calInh: 0, calV: 1.5, calDTw: 10, phi: null, dpRatio: null, waxMm: 0.262 },
+  { calT: 12, calDT: 0, calInh: 0, calV: 1.5, calDTw: 15, phi: null, dpRatio: null, waxMm: 0.883 },
+  { calT: 24, calDT: 0, calInh: 0, calV: 1, calDTw: 15, phi: null, dpRatio: null, waxMm: 1.563 },
+  { calT: 24, calDT: 0, calInh: 0, calV: 2, calDTw: 25, phi: null, dpRatio: null, waxMm: 1.495 },
+  { calT: 48, calDT: 0, calInh: 0, calV: 1.5, calDTw: 20, phi: null, dpRatio: null, waxMm: 1.495 },
+  { calT: 72, calDT: 0, calInh: 0, calV: 2.5, calDTw: 10, phi: null, dpRatio: null, waxMm: 0.000 },
+];
+const CAL_VALID = [
+  { calT: 0.03, calDT: 5, calInh: 0, calV: 2, calDTw: 15, phi: 11.32, dpRatio: 1.197, waxMm: null },
+  { calT: 0.07, calDT: 5, calInh: 0, calV: 1.2, calDTw: 15, phi: 17.56, dpRatio: 1.441, waxMm: null },
+  { calT: 0.1, calDT: 10, calInh: 0, calV: 1.8, calDTw: 15, phi: 25.05, dpRatio: 1.650, waxMm: null },
+  { calT: 0.08, calDT: 12, calInh: 15, calV: 1.5, calDTw: 15, phi: 21.90, dpRatio: 1.593, waxMm: null },
+  { calT: 2, calDT: 7, calInh: 0, calV: 1.5, calDTw: 15, phi: 24.55, dpRatio: 1.858, waxMm: null },
+  { calT: 6, calDT: 4, calInh: 0, calV: 1.8, calDTw: 15, phi: 25.93, dpRatio: 2.402, waxMm: null },
+  { calT: 10, calDT: 10, calInh: 0, calV: 1.2, calDTw: 15, phi: 26.29, dpRatio: 2.496, waxMm: null },
+  { calT: 18, calDT: 0, calInh: 0, calV: 1.2, calDTw: 12, phi: null, dpRatio: null, waxMm: 0.801 },
+  { calT: 36, calDT: 0, calInh: 0, calV: 2, calDTw: 18, phi: null, dpRatio: null, waxMm: 0.787 },
+  { calT: 60, calDT: 0, calInh: 0, calV: 1.5, calDTw: 22, phi: null, dpRatio: null, waxMm: 1.699 },
+];
+
+// =====================================================================================================
+// 17. Verification
+// =====================================================================================================
+function verify() {
+  const out = [], chk = (name, expected, got, tol, note) => out.push({ name, expected, got: Number.isFinite(got) ? got : null, tol, pass: Number.isFinite(got) && Math.abs(got - expected) <= tol, note });
+  // --- particles and rheology
+  chk('Stokes settling velocity (hand value)', 8.9894e-3, settlingVelocity(1e-4, 2650, 1000, 1e-3, { model: 'stokes' }).v, 2e-6, '100 µm quartz in water: Δρ g d²/(18 μ) = 1650 × 9.80665 × 10⁻⁸ / 0.018');
+  { const s = settlingVelocity(1e-3, 2650, 1000, 1e-3), cdBal = (4 * 1650 * G * 1e-3) / (3 * 1000 * s.v * s.v), cdSN = (24 / s.Re) * (1 + 0.15 * s.Re ** 0.687); chk('Schiller–Naumann drag closes the force balance', 1, cdBal / cdSN, 1e-6, `1 mm sand grain: Re = ${s.Re.toFixed(0)}, Cd from weight/drag balance against 24/Re (1 + 0.15 Re^0.687)`); }
+  { const d = 5e-5, rp = 2650, rf = 1000, mu = 1e-3, r = particleRelaxation({ d, rhoP: rp, rhoF: rf, mu }); chk('Particle momentum equation: Stokes response time', ((rp + 0.5 * rf) * d * d) / (18 * mu), r.tau, 0.06 * (((rp + 0.5 * rf) * d * d) / (18 * mu)), 'time to 63 % of the terminal velocity equals (ρp + ½ρf) d²/(18 μ) in the Stokes regime'); }
+  chk('Krieger–Dougherty reduces to Einstein at small fraction', 1.0025, slurryViscosity(0.001, 'krieger', { phiMax: 4 / 7 }), 1e-5, '1 + 2.5 φ at φ = 0.001');
+  chk('Mills relative viscosity (hand value)', 0.8 / (1 - 0.35) ** 2, slurryViscosity(0.2, 'mills', { phiMax: 4 / 7 }), 1e-9, '(1 − φ)/(1 − φ/φmax)² at φ = 0.2, φmax = 4/7 → 1.8935');
+  chk('No-cohesion limit of the agglomerate force balance', 1, maxAgglomerateSize({ dp: 4e-5, Fa: 0, mu0: 3e-3, shear: 200, phi: 0.1 }).ratio, 1e-12, 'without cohesive force the stable agglomerate is the primary particle');
+  chk('Kozeny–Carman permeability (hand value)', 9.8765e-12, kozenyCarman(0.4, 1e-4), 1e-15, 'ε³ d²/(180 (1 − ε)²) = 0.064 × 10⁻⁸ / 64.8');
+  { const g = porousGradient(0.01, 1e-3, 800, 0.4, 1e-4); chk('Darcy–Forchheimer: velocity recovered from the gradient', 0.01, porousVelocity(g.total, 1e-3, 800, 0.4, 1e-4), 1e-9, 'root of μv/k + βρv² for the gradient computed at 0.01 m/s'); }
+  chk('Danielson sand critical velocity (hand value)', 0.7958, sandCriticalVelocity({ d: 2e-4, D: 0.2, rhoP: 2650, rhoF: 1000, mu: 1e-3 }).danielson, 2e-3, '0.23 ν^−1/9 d^1/9 (g D (s − 1))^5/9 with ν = 10⁻⁶ m²/s, d = 200 µm, D = 0.2 m');
+  // --- population balance
+  { const g = pbeGrid(46, 1e-6, 1e-6 * 2 ** 15), n = g.n; let eN = 0, eV = 0; for (let q = 0; q < n * n; q++) { const i = Math.floor(q / n), j = q % n, k = g.pk[q], vs = g.v[i] + g.v[j]; if (vs >= g.v[n - 1]) continue; eN = Math.max(eN, Math.abs(g.pa[q] + g.pb[q] - 1)); eV = Math.max(eV, Math.abs((g.pa[q] * g.v[k] + g.pb[q] * g.v[k + 1]) / vs - 1)); }
+    chk('Fixed-pivot allocation: one particle per collision, volume conserved', 0, Math.max(eN, eV), 1e-12, 'largest error of the number and volume assigned to the two neighbouring pivots over all class pairs');
+    const N0 = new Float64Array(n); N0[0] = 1e12; const K = 1e-15, t = 4000, r = solvePBE(g, N0, t, { beta: K, frac: 0.02, maxSub: 1e6 }), m = pbeMoments(g, r.N);
+    chk('Smoluchowski constant kernel: N(t) = N₀/(1 + K N₀ t/2)', 1 / 3, m.m0 / 1e12, 0.01, 'sectional solution after two characteristic times (K N₀ t/2 = 2)');
+    chk('Pure aggregation conserves particle volume', 1, m.vol / (1e12 * g.v[0]), 1e-9, 'Σ N v after aggregation over Σ N v before');
+    const m2 = (gg, N) => { let x = 0; for (let i = 0; i < gg.n; i++) x += N[i] * gg.v[i] ** 2; return x / (1e12 * gg.v[0] ** 2); }, g2 = pbeGrid(16, 1e-6, 1e-6 * 2 ** 15), Nc = new Float64Array(16); Nc[0] = 1e12;
+    const e1 = Math.abs(m2(g2, solvePBE(g2, Nc, t, { beta: K, frac: 0.02, maxSub: 1e6 }).N) / 5 - 1), e2 = Math.abs(m2(g, r.N) / 5 - 1);
+    chk('Size-class refinement reduces the error of the second volume moment', 1, e2 < 0.5 * e1 ? 1 : 0, 0, `Σ N v² = N₀ v₀² (1 + K N₀ t) analytically; relative error ${e1.toFixed(3)} with 16 classes, ${e2.toFixed(3)} with 46 classes over the same size range`);
+    const rc = solvePBE(g, N0, t, { beta: K, frac: 0.2, maxSub: 1e6 }), ec = Math.abs(pbeMoments(g, rc.N).m0 / 1e12 - 1 / 3), ef = Math.abs(m.m0 / 1e12 - 1 / 3);
+    chk('Sub-step refinement reduces the aggregation error', 0.1, ef / ec, 0.03, 'first-order explicit sub-steps: ten times smaller steps give a ten times smaller error in N(t)');
+    const ri = solvePBE(g, N0, t, { beta: K, maxSub: 2 }), mi = pbeMoments(g, ri.N);
+    chk('Implicit (stiff) aggregation step conserves volume', 1, mi.vol / (1e12 * g.v[0]), 1e-9, 'modified Patankar–Euler steps on the class volumes');
+    const Ng = new Float64Array(n); Ng[10] = 1e10; const gr = 2e-20, rg = solvePBE(g, Ng, 100, { gv: new Float64Array(n).fill(gr) }), mg = pbeMoments(g, rg.N);
+    chk('Pure growth conserves particle number', 1e10, mg.m0, 1, 'number after a volume growth step');
+    chk('Pure growth adds exactly N·(dv/dt)·t of volume', 1e10 * (g.v[10] + gr * 100), mg.vol, 1e-9 * 1e10 * g.v[10], 'Σ N v after growth');
+    const Gl = 2e-9, L0 = g.L[12], Nl = new Float64Array(n); Nl[12] = 1e9; const gvl = Float64Array.from(g.L, (L) => ((PI / 6) * ((L + Gl * 500) ** 3 - L ** 3)) / 500), rl = solvePBE(g, Nl, 500, { gv: gvl }), ml = pbeMoments(g, rl.N);
+    chk('Size-independent growth shifts the size by G·t', L0 + Gl * 500, Math.cbrt((6 * ml.vol) / (PI * ml.m0)), 1e-9 * L0, 'volume-mean size after linear growth at G = 2 nm/s for 500 s');
+    const Nb = new Float64Array(n), Sb = new Float64Array(n); Nb[20] = 1e8; Sb[20] = 1e-3; const rb = solvePBE(g, Nb, 500, { S: Sb }), mb = pbeMoments(g, rb.N);
+    chk('Binary breakage: two daughters per event', 2 - Math.exp(-0.5), mb.m0 / 1e8, 1e-9, 'N/N₀ = 2 − exp(−S t) when only the parent class breaks');
+    chk('Breakage conserves particle volume', 1, mb.vol / (1e8 * g.v[20]), 1e-12, 'Σ N v after breakage over Σ N v before');
+    const q = qmomNodes([0, 1, 2, 3].map((k) => 2 + 3 ** k)); chk('Wheeler quadrature recovers a two-point distribution', 3, Math.max(...q.L), 1e-9, 'moments of 2 δ(L − 1) + δ(L − 3) give the nodes 1 and 3');
+    const qm = solveQMOM([0, 1, 2, 3, 4, 5].map((k) => 1e12 * 1e-5 ** k * Math.exp((k * k * 0.01) / 2)), t, { beta: () => K, steps: 400 });
+    chk('Method of moments, constant kernel: m₀(t)', 1 / 3, qm.m[0] / 1e12, 1e-4, 'quadrature method of moments against the Smoluchowski solution');
+    chk('Method of moments conserves the third moment', 1, qm.m[3] / (1e12 * 1e-15 * Math.exp(0.045)), 1e-9, 'm₃ after aggregation over m₃ before'); }
+  // --- nucleation, kinetics, thermodynamics
+  chk('Critical nucleus radius (hand value)', 2.8656e-9, nucleationRate({ TK: 280, dT: 10, TeqK: 290, sigma: 0.02 }).rc, 2e-12, '2σ Teq/(ρ L ΔT) = 0.04 × 290 / (920 × 4.4×10⁵ × 10)');
+  chk('Contact-angle factor at 90°', 0.5, nucleationRate({ TK: 280, dT: 10, TeqK: 290, theta: 90 }).f, 1e-12, '(2 + cos θ)(1 − cos θ)²/4');
+  { const r = rng(11), ti = inductionTime(7, { TK: 277 }); let s = 0; const N = 6000; for (let k = 0; k < N; k++) s += -Math.log(1 - r.uniform(0, 1)) * ti; chk('Poisson onset: sampled mean equals the induction time', 1, s / N / ti, 0.04, 'mean of 6,000 exponentially distributed onset times over 1/(J V)'); }
+  chk('Equilibrium limit: no growth at the hydrate curve', 0, hydrateGrowthRate({ TK: 285, P: 60, Peq: 60 }).j + hydrateDissociationRate({ TK: 285, P: 60, Peq: 60 }), 1e-30, 'growth and dissociation fluxes vanish when the pressure equals the equilibrium pressure');
+  { const a = hydrateGrowthRate({ TK: 277.15, P: 80, Peq: 40, zG: 1, kRef: 1e-10, H: 2500 }); chk('Intrinsic kinetics (hand value)', 1e-10 * 40e5, a.j, 1e-9, 'K*(f − f_eq) with ideal gas: 10⁻¹⁰ × 4.0 MPa = 4×10⁻⁴ mol/m²/s'); }
+  { const a = hydrateGrowthRate({ TK: 277.15, P: 80, Peq: 40, zG: 1, kRef: 1, H: 2500, kFilm: 1e-5 }); chk('Fast kinetics: growth becomes mass-transfer-limited', 1e-5 * (40e5 / 2500), a.j, 1e-4 * 16, 'flux tends to k_film × Δc when the intrinsic constant is very large'); }
+  chk('Kim–Bishnoi dissociation constant (Arrhenius, hand value)', 3.6e4 * Math.exp(-81e3 / (8.314462618 * 280)) * 20e5, hydrateDissociationRate({ TK: 280, P: 30, Peq: 50, zG: 1 }), 1e-9, 'K₀ exp(−E/RT) (f_eq − f) at 280 K with 20 bar of driving force');
+  chk('Methane hydrate equilibrium at 10 °C (van der Waals–Platteeuw)', 72.5, vdwpMethane(10).P, 4, 'measured three-phase pressure of methane hydrate at 283.15 K is 71–73 bara');
+  chk('Methane hydrate equilibrium at 0 °C', 26.0, vdwpMethane(0).P, 1.5, 'measured quadruple-point pressure is about 25.6–26.3 bara');
+  // --- moving boundary
+  { const m = plugMeltTime({ R: 0.127, U: 3, Tamb: 4, Td: -1, eps: 0.4 }); chk('Stefan radial melting: front tracking against the analytic time', 1, m.tNumeric / m.tAnalytic, 5e-3, 'ρ(1 − ε)L (R/2U + R²/4k)/ΔT'); }
+  chk('Stefan similarity constant at small Stefan number', Math.sqrt(0.005), stefanLambda(0.01), 1e-3, 'λ → √(Ste/2); exact 0.07059 at Ste = 0.01');
+  // --- transport operator
+  { const n = 60, tau = new Array(n).fill(10), E = new Array(n).fill(0); let t = 0, f = 0, t50 = 0; while (t < 2000) { const fo = advectImplicit(E, tau, 1, 1); t += 1; if (!t50 && fo >= 0.5) { t50 = t - (fo - 0.5) / Math.max(fo - f, 1e-12); } f = fo; } chk('Advection of a tracer front: arrival time', 600, t50, 18, 'half-height breakthrough after 60 cells of 10 s residence time'); }
+  // --- wax and scale
+  chk('Hayduk–Minhas wax diffusivity (hand value)', 2.287e-10, waxDiffusivity(300, 5e-3), 2e-12, '13.3×10⁻¹² T^1.47 μ^(10.2/V − 0.791)/V^0.71 at 300 K, 5 cP, V = 430 cm³/mol');
+  chk('Wax diffusion flux (hand value)', 3.832e-7, waxDeposition({ Tb: 30, Tamb: 10, U: 10, hIn: 1e12, kOil: 0.13, rhoOil: 800, muOil: 5e-3, wat: 40, wTot: 0.05, slope: 0.04 }).jMol, 4e-9, 'ρ D (dC/dT)(q/k): 800 × 2.322×10⁻¹⁰ × 1.3406×10⁻³ × 1538.5 kg/m²/s');
+  chk('Davies activity coefficient (hand value)', 0.3733, activityCoefficient(2, 0.1, 25, 'davies'), 2e-3, 'divalent ion at I = 0.1 mol/L, 25 °C: log γ = −0.509 × 4 × (0.2402 − 0.03)');
+  { const r = scaleIndices({ ...SEAWATER, HCO3: 110 }, 25, 1.01325, { yCO2: 4.0e-4, model: 'truesdellJones' }); chk('Calcite saturation of surface seawater', 0.7, r.minerals[0].SI, 0.3, `surface seawater (1.8 mmol/L bicarbonate, 400 µatm CO₂) is 4–6 times supersaturated with calcite, SI 0.6–0.8; computed pH ${r.pH.toFixed(2)}`); }
+  { const c = 1.0351e-5, w = { Ba: c * 137327, SO4: c * 96060 }; chk('Barite at its solubility in pure water', -0.026, scaleIndices(w, 25, 1.01325).minerals[1].SI, 0.006, '√Ksp = 1.035×10⁻⁵ mol/L of each ion: SI = 2 log γ = −2 × 0.509 × 4 × √(4.14×10⁻⁵) = −0.026'); }
+  chk('Colloidal instability index (hand value)', 58 / 42, colloidalInstability({ sat: 55, aro: 28, res: 14, asp: 3 }).cii, 1e-12, '(55 + 3)/(28 + 14)');
+  // --- the marching solver on a uniform cold loop
+  { const S = labSetup({ n: 16, L: 1600, D: 0.1, T: 4, P: 80, U: 0, tAmb: 4 }), v = { ...DEF, regime: 'oil', nucA: 12 }, g = pbeGrid(12, 5e-6, 5e-3), ph = [{ dur: 1800, dt: 60, frac: 1 }];
+    const base = runHydrateMarch(S, hydrateParams(v, S), { phases: ph, grid: g, cheap: true }), L = base.ledger;
+    chk('Hydrate mass balance of the march', 1, L.out / L.in, 1e-9, 'suspended + deposited + exported + dissociated over formed');
+    let fa = 0; for (let i = 0; i < S.n; i++) fa += (PI / 4) * base.D[i] ** 2 * S.ds + base.mDep[i] / (HYDRATE.rho * (1 - base.por[i])); chk('Flow area + deposit area = clean bore', (PI / 4) * 0.01 * 1600, fa, 1e-9 + (base.ledger.deposited > 0 ? 0 : 1e9), 'pipe volume is conserved as the deposit grows');
+    const zero = runHydrateMarch(S, hydrateParams({ ...v, kinK: 0 }, S), { phases: ph, grid: g, cheap: true });
+    chk('Zero-kinetics limit: no hydrate', 0, Math.max(...zero.ser.phi), 1e-4, 'only the seed shells (0.01 % of the water) exist when the rate constant is zero');
+    const S2 = labSetup({ n: 16, L: 1600, D: 0.1, T: 4, P: 80, U: 5e4, tAmb: 4, wcut: 0.05 }), fast = runHydrateMarch(S2, hydrateParams({ ...v, kinK: 1e4, shellD: 1e5, mtMult: 1000, htMult: 20, adhesion: 0 }, S2), { phases: ph, grid: g, cheap: true });
+    chk('Fast-kinetics limit: the limiting reactant (water) is consumed', 1, Math.max(...fast.rec.X), 0.05, 'water conversion with very fast kinetics, mass transfer and heat removal');
+    const nd = runHydrateMarch(S, hydrateParams({ ...v, adhesion: 0, filmMult: 0 }, S), { phases: ph, grid: g, cheap: true });
+    chk('No-deposition limit', 0, nd.ledger.deposited, 1e-12, 'zero capture efficiency leaves the wall clean');
+    const na = runHydrateMarch(S, hydrateParams({ ...v, aggEff: 0, kBreak: 0 }, S), { phases: ph, grid: g, cheap: true }), pP = hydrateParams(v, S); let kP = 0; for (let j = 1; j < g.n; j++) if (Math.abs(Math.log(g.L[j] / pP.dPrim)) < Math.abs(Math.log(g.L[kP] / pP.dPrim))) kP = j;
+    chk('No-agglomeration limit: particles stay at the primary size', g.L[kP], Math.max(...na.rec.d43), 1e-9 * g.L[kP], 'd43 with zero collision efficiency equals the seeded size class');
+    // steady adiabatic loop: water conservation through the hydration number, and the latent heat carried by the stream
+    const Sa = labSetup({ n: 12, L: 1200, D: 0.1, T: 4, P: 80, U: 0, tAmb: 4 }), pa = hydrateParams({ ...v, hydNumber: 6, adhesion: 0, filmMult: 0, aggEff: 0, cohesion: 0 }, Sa), ad = runHydrateMarch(Sa, pa, { phases: [{ dur: 6 * 3600, dt: 120, frac: 1 }], grid: g, cheap: true }), prA = Sa.props(80, 4), K = ad.ser.t.length - 1;
+    const expRate = (ad.ser.exp[K] - ad.ser.exp[K - 5]) / (5 * 120), mcpA = prA.mG * prA.cpG + prA.mO * prA.cpO + prA.mW * prA.cpW, freeOut = ad.rec.freeW[Sa.n - 1] * prA.mW;
+    chk('Water balance through the hydration number', prA.mW, freeOut + expRate * ((6 * 18.015) / (18 + 6 * 18.015)), 0.01 * prA.mW, 'steady loop: water fed = free water leaving + 0.8572 × hydrate leaving (n = 6, gas 18 g/mol)');
+    chk('Energy balance with the heat of formation', expRate * HYDRATE.latent, mcpA * (ad.T[Sa.n - 1] - 4), 0.02 * expRate * HYDRATE.latent, 'adiabatic steady loop: ṁ cp (T_out − T_in) = hydrate formation rate × latent heat');
+    // lumped cooldown against the exponential and its time-step order
+    const Sc = labSetup({ n: 4, L: 400, D: 0.25, T: 60, P: 80, U: 3, tAmb: 4, C: 1e5 }), pc = hydrateParams({ ...v, kinK: 0, nucA: 0 }, Sc), tEnd = 6 * 3600, exact = 4 + 56 * Math.exp((-3 * PI * 0.25 * tEnd) / 1e5), Tn = (dt) => runHydrateMarch(Sc, pc, { phases: [{ dur: tEnd, dt, frac: 0 }], grid: g, cheap: true }).T[0];
+    const T1 = Tn(150), T2 = Tn(300), T4 = Tn(600);
+    chk('Shut-in cooldown against the exponential solution', exact, T1, 0.05, 'T = Tamb + (T₀ − Tamb) exp(−U π D t/C) after 6 h');
+    chk('Time-step convergence is first order', 1, Math.log2((T4 - T2) / (T2 - T1)), 0.1, 'observed order from three step sizes (150, 300, 600 s)'); }
+  return out;
+}
+
+// =====================================================================================================
+// 18. Suite declaration
+// =====================================================================================================
+const okNum = (x, lo, hi) => (typeof x === 'number' && Number.isFinite(x) && x >= lo && x <= hi ? x : null);
+export default {
+  id: 'solids', num: 4, title: 'Hydrate & Multiphase Solids Flow Assurance', short: 'Hydrate · Solids', icon: '❄️',
+  tagline: 'Where, when and how fast hydrates form, agglomerate, deposit and plug — with wax, scale, asphaltene and sand on the same line.',
+  description: 'The pressure–temperature picture of the line is carried through an operating scenario (steady production, turndown, shut-in cooldown, cold restart). Hydrate onset follows classical nucleation theory with a stochastic waiting time; growth is intrinsic kinetics in series with mass transfer, shell diffusion and heat removal; particles agglomerate and break in a sectional population balance and travel with the liquid; the wall captures them, the deposit ages, is sheared off and narrows the bore, which feeds back on velocity, shear and pressure. Wax, mineral scale, asphaltene stability and sand transport are evaluated for steady production and all layers are combined into one deposit profile for the network and flow suites.',
+  guide: [
+    'Choose the operating scenario. Steady production of the reference case is far outside the hydrate region, so use turndown, shutdown cooldown or cold restart to test the hydrate strategy.',
+    'Link the line, fluid and flow picture from the other suites (or leave the reference case) and enter the present inhibitor dose.',
+    'Review the kinetic, cohesion and wall-capture parameters; fit them to flow-loop or rocking-cell data on the Calibration tab when you have measurements.',
+    'Enter the produced-water analysis, wax data, SARA analysis and sand rate for the steady-production threats.',
+    'Run, then read the plugging probability with its interval, the inhibitor dose, the cooldown limit, the pigging interval and the governing threat by zone.',
+    'Use the mesh and step study to quantify the numerical uncertainty before relying on a time to plug.',
+  ],
+  implemented: [
+    'van der waals–platteeuw theory', 'langmuir occupancy equations', 'chemical-potential equality', 'fugacity equilibrium', 'hydrate phase-stability equations', 'classical nucleation theory', 'homogeneous nucleation', 'heterogeneous nucleation', 'stochastic/poisson nucleation models', 'induction-time distributions', 'kim–bishnoi kinetic model', 'englezos–bishnoi-type kinetic models', 'intrinsic kinetic growth equations', 'mass-transfer-limited growth', 'heat-transfer-limited growth', 'combined heat/mass-transfer growth', 'shrinking-core-type formulations', 'population balance equation', 'number-density transport equation', 'method of moments', 'sectional methods', 'smoluchowski coagulation equation', 'collision-frequency kernels', 'aggregation kernels', 'breakage kernels', 'shear-induced collision', 'turbulent collision', 'differential-settling collision', 'cohesive-force/agglomeration models', 'eulerian solids transport', 'drag-force equations', 'settling equations', 'stokes settling', 'hindered settling', 'mass-transfer deposition equations', 'wall-capture models', 'adhesion probability models', 'shear-removal models', 'deposition–erosion competition', 'moving-boundary equations', 'stefan-type moving-interface formulation', 'effective-diameter reduction', 'effective-area reduction', 'permeability models', 'darcy flow through porous deposits', 'darcy–forchheimer equation', 'kozeny–carman permeability model', 'evolving-roughness models', 'arrhenius kinetics', 'kim–bishnoi-type dissociation', 'heat-transfer-controlled dissociation', 'stefan moving-boundary models', 'molecular-diffusion deposition', 'shear dispersion', 'brownian diffusion', 'aging models', 'ionic activity equations', 'saturation-index equations', 'solubility-product equilibrium', 'precipitation kinetics', 'solubility models', 'flory–huggins theory', 'particle momentum equation', 'stokes/schiller–naumann drag', 'erosion/deposition models', 'thermodynamic hydrate stability + kinetic formation', 'deposition + evolving hydraulic diameter', 'hydrate + wax + scale + sand competing-solids framework', 'initial hydrate-free or hydrate-containing state of the system', 'initial deposited-hydrate thickness', 'initial effective pipe diameter and roughness', 'initial inhibitor concentration throughout the fluid', 'initial wax', 'sand and other solid concentrations where these phenomena are enabled', 'hydrate-forming gas', 'liquid and water entering the domain', 'inlet particle or solid concentrations where applicable', 'wall temperature and heat-transfer conditions controlling hydrate formation', 'wall adhesion', 'detachment and resuspension behaviour', 'particle behaviour at inlets', 'entrainment or escape as appropriate', 'local thermodynamic environment for hydrate formation and dissociation', 'while shutdown', 'restart', 'growth and melting to evolve with operations', 'coupled pressure/temperature/velocity/holdup fields from module 3', 'thermodynamic hydrate stability properties from module 1', 'water availability', 'hydrate nucleation, induction, growth and dissociation parameters', 'heat/mass-transfer parameters', 'particle density, size distribution and population parameters', 'agglomeration/breakage kernels', 'slurry rheology', 'wall adhesion/capture, deposition, erosion, detachment and resuspension parameters', 'inhibitor concentration/effectiveness', 'deposit porosity/permeability', 'wax/asphaltene/scale thermodynamic and kinetic properties where enabled', 'sand/solids properties', 'hydrate stability margin and exposure', 'onset/induction location and time', 'nucleation and growth rates', 'hydrate mass/volume fraction and water/gas conversion', 'particle number/concentration/size distribution', 'slurry properties and transport', 'wall-capture/deposition/removal rates', 'deposit thickness and distribution', 'dissociation/melting', 'pressure-drop increase', 'effective diameter/area reduction', 'evolving roughness/permeability', 'blockage/plugging indicator, location and time with stated uncertainty', 'inhibitor effectiveness', 'wax/scale/asphaltene/sand precipitation, transport, deposition, resuspension and erosion outputs where enabled', 'growth-rate constants', 'cohesion/adhesion parameters', 'wall-capture efficiency', 'deposition coefficient', 'wax precipitation parameters', 'wax deposition coefficient', 'wax diffusion coefficients', 'species mass conservation', 'solid-phase mass conservation', 'energy conservation including latent/reaction heat', 'population-balance conservation', 'particle-number conservation where applicable', 'analytical nucleation/growth cases', 'analytical deposition cases', 'zero-kinetics limit', 'infinite/very-fast kinetics limiting behaviour', 'no-deposition limit', 'no-agglomeration limit', 'equilibrium limit', 'dissociation-limit tests', 'particle transport benchmarks', 'population-balance benchmark solutions', 'mesh convergence', 'time-step convergence', 'moving-boundary verification', 'flow-area conservation as deposits evolve', 'thermodynamic/kinetic coupling consistency', 'high-pressure hydrate loop experiments', 'flow-loop experiments', 'hydrate growth measurements', 'wax flow-loop data',
+  ],
+  referenceOnly: [
+    'wall-adhesion measurement', 'restart experiment', 'kihara potential', 'gibbs-energy minimization', 'monte carlo population', 'eulerian–eulerian', 'eulerian–lagrangian', 'lagrangian', 'maxey–riley', 'mass-transfer-controlled dissociation', 'solid–liquid equilibrium', 'wax appearance thermodynamics', 'population-balance crystallization', 'eos-based precipitation', 'solid-phase equilibrium', 'cfd', 'slug-flow model', 'initial dissolved water and free-water distribution', 'hydrate saturation or concentration', 'hydrate particle number and size distribution', 'initial agglomerate population', 'chemical-injection points', 'outlets and equipment', 'depressurization and heating', 'reflection', 'trapping', 'advection-diffusion', 'reaction-diffusion', 'deposition-layer grid convergence', 'roughness-update consistency',
+  ],
+  equationsNote: 'Scope and limits. The hydrate curve is the kernel screening curve (gas-gravity correlation with salt and inhibitor depression) so that all suites agree; the van der Waals–Platteeuw model with Langmuir occupancies is solved for methane structure I only and supplies the hydration number and a cross-check. The line is one-dimensional: particles travel with the liquid (Eulerian inventories with implicit upwind transport), there is no slip between hydrate particles and the liquid, no Lagrangian tracking and no computational fluid dynamics. Kinetic, cohesion and capture constants are order-of-magnitude defaults that must be calibrated. Scale indices use single-ion activity coefficients with sulphate and bicarbonate ion pairs at their 25 °C association constants (no Pitzer interaction terms, so very concentrated brines above about 2 mol/L are outside the range); the de Boer boundaries and the low-dosage inhibitor, methanol-loss and erosion numbers are screening rules. The plugging probability reflects only the parameter uncertainty that is sampled.',
+  inputs: INPUTS,
+  presets: [
+    { name: 'Cold restart after a 48 h shutdown, uninhibited', values: { scenario: 'restart', shutHours: 48, restartPct: 50, inhibitor: 'none' } },
+    { name: 'MEG-inhibited steady production, under-insulated line', values: { scenario: 'steady', uValue: 16, inhibitor: 'MEG', inhWt: 40, simHours: 24 } },
+    { name: 'Gas-dominated wet-gas line', values: { scenario: 'steady', fluidSystem: 'wetgas', gasRate: 3, gasWater: 20, uValue: 12, simHours: 48, sandRate: 5, waxContent: 0 } },
+    { name: 'Waxy crude on a long tie-back', values: { scenario: 'steady', lengthScale: 2, wat: 52, waxContent: 9, depositDays: 60, waxLimitMm: 3 } },
+    { name: 'High-barium water with seawater breakthrough (scale)', values: { scenario: 'steady', swFrac: 40, water: [{ Na: 28000, K: 600, Ca: 2400, Mg: 300, Ba: 260, Sr: 420, Fe: 12, Cl: 49000, SO4: 5, HCO3: 480 }], co2Pct: 4 } },
+    { name: 'Sand-producing late-life well at turndown', values: { scenario: 'turndown', turndownPct: 25, fluidSystem: 'highwc', highWc: 70, sandRate: 900, sandUm: 300, simHours: 36 } },
+    { name: 'Shutdown cooldown for 24 h', values: { scenario: 'shutdown', shutHours: 24 } },
+  ],
+  pull: ({ fluid, outputs } = {}) => {
+    const pvt = outputs?.pvt, net = outputs?.net, ops = outputs?.ops, tm = okNum(net?.thermalMass, 1e-3, 1e9), inhOk = fluid?.inhibitor && fluid.inhibitor !== 'none' && INHIBITORS[fluid.inhibitor];
+    return [
+      okNum(pvt?.wat, -20, 90) !== null && { key: 'wat', value: pvt.wat, from: 'Fluid suite: wax appearance temperature' },
+      okNum(pvt?.waxContent, 0, 40) !== null && { key: 'waxContent', value: pvt.waxContent, from: 'Fluid suite: wax content' },
+      okNum(net?.id, 0.025, 1.5) !== null && { key: 'idMm', value: net.id * 1000, from: 'Network suite: inner diameter' },
+      okNum(net?.roughness, 5e-7, 3e-3) !== null && { key: 'roughUm', value: net.roughness * 1e6, from: 'Network suite: wall roughness' },
+      okNum(net?.uValue, 0.2, 200) !== null && { key: 'uValue', value: net.uValue, from: 'Network suite: overall heat-transfer coefficient' },
+      okNum(net?.tSeabed, -5, 40) !== null && { key: 'tSeabed', value: net.tSeabed, from: 'Network suite: seabed temperature' },
+      tm !== null && okNum(tm > 5000 ? tm / 1000 : tm, 0, 5000) !== null && { key: 'thermalMass', value: tm > 5000 ? tm / 1000 : tm, from: 'Network suite: thermal mass of pipe and contents' },
+      inhOk && { key: 'inhibitor', value: fluid.inhibitor, from: 'Case fluid: inhibitor' },
+      inhOk && okNum(fluid?.inhWt, 0, 90) !== null && { key: 'inhWt', value: fluid.inhWt, from: 'Case fluid: inhibitor concentration' },
+      inhOk && okNum(ops?.inhibitorDose, 0, 90) !== null && { key: 'inhWt', value: ops.inhibitorDose, from: 'Operations suite: inhibitor dose' },
+      okNum(ops?.maxShutdown, 0.5, 2000) !== null && { key: 'shutHours', value: ops.maxShutdown, from: 'Operations suite: longest planned shutdown' },
+      okNum(fluid?.comp?.CO2, 0.001, 40) !== null && { key: 'co2Pct', value: Math.min(fluid.comp.CO2 * 1.5, 60), from: 'Case fluid: CO₂ (enriched in the gas phase)' },
+    ].filter(Boolean);
+  },
+  site: (site) => [okNum(site?.data?.seabedTemp, -5, 40) !== null && (site.data.depth === undefined || site.data.depth > 0) && { key: 'tSeabed', value: site.data.seabedTemp, from: `Seabed temperature at site${isNum(site.data.depth) ? ` (${site.data.depth} m water depth)` : ''}` }].filter(Boolean),
+  run,
+  mesh: [
+    { name: 'Axial cells', keys: ['nAxial'], min: 8, note: 'First-order upwind transport of particles and heat along the line.', metrics: [
+      { label: 'Peak hydrate fraction', unit: 'vol fraction', get: (r) => r.outputs.hydrateFraction }, { label: 'Peak hydrate inventory', unit: 'kg', get: (r) => r.outputs.hydrateMass }, { label: 'Peak blockage', unit: 'area fraction', get: (r) => r.outputs.blockage }, { label: 'Wax mass', unit: 'kg', get: (r) => r.outputs.waxMass }] },
+    { name: 'Time step of the hydrate march', keys: ['dtMin'], refine: 'divide', note: 'Implicit first-order time integration; the shut-in steps scale with the same input.', metrics: [
+      { label: 'Peak hydrate inventory', unit: 'kg', get: (r) => r.outputs.hydrateMass }, { label: 'Peak blockage', unit: 'area fraction', get: (r) => r.outputs.blockage }, { label: 'Peak slurry viscosity factor', unit: '×', get: (r) => r.outputs.slurryViscosityFactor }, { label: 'Exposure inside the hydrate region', unit: 'h', get: (r) => r.outputs.exposureHours }] },
+    { name: 'Particle-size classes', keys: ['nClasses'], min: 6, note: 'Geometric size grid of the sectional population balance.', metrics: [
+      { label: 'Agglomerate d43 at the peak', unit: 'm', get: (r) => r.outputs.particleSize }, { label: 'Peak slurry viscosity factor', unit: '×', get: (r) => r.outputs.slurryViscosityFactor }, { label: 'Peak blockage', unit: 'area fraction', get: (r) => r.outputs.blockage }] },
+  ],
+  calibration: {
+    note: 'Fit growth, inhibitor, cohesion/breakage, rheology, wall-capture and wax parameters to flow-loop style tests (untick the parameters your data cannot separate — cohesion, breakage and packing fraction all act through the pressure drop, capture efficiency and deposit porosity through its slow rise, and the fit reports weak identifiability): hydrate fraction and pressure-drop ratio after a time at constant subcooling and velocity, and wax thickness after a time at a given oil-to-coolant temperature difference. Short tests (minutes) constrain the growth constants, long tests (hours) the capture efficiency through the pressure-drop rise; the intrinsic constant is only weakly identifiable once a shell has formed, and the fit reports that. The model is a 2-inch jacketed loop at 80 bara with 20 % water cut; the sample data are synthetic (generated with other parameter values plus noise).',
+    params: [{ key: 'kinK', label: 'Intrinsic rate constant (10⁻¹⁰ mol/m²/Pa/s)', lo: 0.01, hi: 100 }, { key: 'shellD', label: 'Shell diffusivity (10⁻¹³ m²/s)', lo: 0.05, hi: 500 }, { key: 'inhEff', label: 'Inhibitor effectiveness (%)', lo: 20, hi: 150 },
+      { key: 'cohesion', label: 'Cohesive force per particle size (mN/m)', lo: 0.01, hi: 100 }, { key: 'kBreak', label: 'Breakage coefficient', lo: 0.001, hi: 5 }, { key: 'phiMax', label: 'Maximum packing fraction (slurry rheology)', lo: 0.45, hi: 0.74 },
+      { key: 'adhesion', label: 'Wall-capture efficiency', lo: 0.0005, hi: 1 }, { key: 'porosity0', label: 'Fresh deposit porosity', lo: 0.2, hi: 0.9 }, { key: 'waxMult', label: 'Wax deposition multiplier', lo: 0.05, hi: 20 }, { key: 'waxSlope', label: 'Wax solubility slope (1/K)', lo: 0.01, hi: 0.15 }],
+    columns: [{ key: 'calT', label: 'Test time', unit: 'h' }, { key: 'calDT', label: 'Subcooling without inhibitor', unit: '°C' }, { key: 'calInh', label: 'MEG in the water', unit: 'wt %' }, { key: 'calV', label: 'Loop velocity', unit: 'm/s' }, { key: 'calDTw', label: 'Oil − coolant (wax test)', unit: '°C' }, { key: 'phi', label: 'Hydrate fraction', unit: 'vol %' }, { key: 'dpRatio', label: 'Pressure-drop ratio', unit: '–' }, { key: 'waxMm', label: 'Wax thickness', unit: 'mm' }],
+    targets: [{ key: 'phi', label: 'Hydrate fraction', unit: 'vol %' }, { key: 'dpRatio', label: 'Pressure-drop ratio', unit: '–' }, { key: 'waxMm', label: 'Wax thickness', unit: 'mm' }],
+    model: loopModel, sample: CAL_SAMPLE, validationSample: CAL_VALID,
+  },
+  verify,
+};

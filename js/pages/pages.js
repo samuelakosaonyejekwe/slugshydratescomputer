@@ -380,7 +380,7 @@ const COUPLED = [
 export function chainPage(root) {
   const rows = h('tbody'), bar = h('div', { class: 'progress', hidden: true }, h('i')), summary = h('div'), stat = h('span', { class: 'run-status', role: 'status', 'aria-live': 'polite' });
   const sel = Object.fromEntries(CHAIN.map((id) => [id, h('input', { type: 'checkbox', checked: store.pref('chain.' + id) !== false, 'aria-label': 'Include ' + byId(id).title, onchange: (e) => store.pref('chain.' + id, e.target.checked) })]));
-  const passes = h('select', { 'aria-label': 'Coupling passes' }, [[1, 'one forward pass (no feedback)'], [2, 'up to 2 passes'], [3, 'up to 3 passes'], [5, 'up to 5 passes']].map(([v, t]) => h('option', { value: v, selected: v === (store.pref('chain.passes') || 3) }, t)));
+  const passes = h('select', { 'aria-label': 'Coupling passes' }, [[1, 'one forward pass (no feedback)'], [2, 'up to 2 passes'], [3, 'up to 3 passes'], [5, 'up to 5 passes']].map(([v, t]) => h('option', { value: v, selected: v === (store.pref('chain.passes') || 5) }, t)));
   passes.addEventListener('change', () => store.pref('chain.passes', +passes.value));
   const cell = {};
   CHAIN.forEach((id, i) => { const s = byId(id); cell[id] = { st: h('td', null, store.case.outputs[id] ? badge('solved ' + ago(store.case.outputs[id]._at), 'ok') : badge('waiting', '')), kp: h('td', { class: 'kp' }, kpText(store.case.outputs[id])), ln: h('td', null, '') }; rows.append(h('tr', null, h('td', null, sel[id]), h('td', { class: 'num' }, i + 1), h('td', { class: 'lead' }, h('a', { href: '#/suite/' + id }, `${s.icon} ${s.num}. ${s.title}`)), cell[id].ln, cell[id].st, cell[id].kp)); });

@@ -5,8 +5,8 @@
 // SI inside the engines; bara, °C, h and mm at the interfaces.
 import { clamp, linspace, interp1, brent, tridiag, solveLinear, rk45, nelderMead, lstsq, rng, metrics, mean, sum, isNum, fmt } from '../core/num.js';
 import { fluidModel, inhibitorFor, hydrateDepression, INHIBITORS, R, VM_STD } from '../core/thermo.js';
-import { G, uValue, hInside, hOutside, frictionFactor } from '../core/pipe.js';
-import { flowPicture, caseLine, steadyCase } from '../core/caseflow.js';
+import { G, uValue, hInside, hOutside, frictionFactor, marchSteady } from '../core/pipe.js';
+import { flowPicture, caseLine, ambientAt } from '../core/caseflow.js';
 import { BASE } from '../data/basecase.js';
 
 const KEL = 273.15, HOUR = 3600, DAY = 86400;
@@ -356,7 +356,7 @@ export function slugModel(p) {
     const mGp = Math.max(y[0], 1e-6), mLp = y[1], mGr = Math.max(y[2], 1e-6), mLr = Math.max(y[3], 0);
     const rhoGp = mGp / Math.max(o.Vp - mLp / o.rhoL, 0.02 * o.Vp), Pp = rhoGp * RTp, h = hbar + (mLp - o.rhoL * o.Vp * aL) / dmdh;
     const VGr = Math.max(o.Vr - mLr / o.rhoL, 0.01 * o.Vr), rhoGr = mGr / VGr, aLr = clamp(mLr / (o.Vr * o.rhoL), 0, 1), rhoM = (mGr + mLr) / o.Vr;
-    const Prt = rhoGr * RTr + 2e8 * Math.max(aLr - 0.985, 0), Prb = Prt + rhoM * G * o.Lr + fricR(wGin, wLin, rhoM, aLr), [AG, AL] = areas(h);
+    const Prt = rhoGr * RTr + 2e8 * Math.max(mLr / (o.Vr * o.rhoL) - 0.985, 0), Prb = Prt + rhoM * G * o.Lr + fricR(wGin, wLin, rhoM, aLr), [AG, AL] = areas(h);
     const dPG = Pp - fricP(wLin) - Prb, wGlp = dPG > 0 ? o.kG * AG * Math.sqrt(rhoGp * dPG) : 0;
     const dPL = dPG + o.rhoL * G * clamp(h, 0, 4 * hc), wLlp = dPL > 0 ? o.kL * AL * Math.sqrt(o.rhoL * dPL) : 0;
     const aLt = clamp(2 * aLr - AL / A, 0, 1), rhoT = aLt * o.rhoL + (1 - aLt) * rhoGr, xL = (aLt * o.rhoL) / Math.max(rhoT, 1e-9), dPc = Prt - Ps, w = dPc > 0 ? Kc * z * Math.sqrt(rhoT * dPc) : 0;
@@ -366,7 +366,7 @@ export function slugModel(p) {
   const steady = (z, wG = o.wG, wL = o.wL, Ps = o.Ps) => {
     const w = wG + wL, xL = wL / w, top = (Prt) => { const rg = Prt / RTr, aLt = (xL * rg) / (o.rhoL - xL * (o.rhoL - rg)); return { rg, aLt, rhoT: aLt * o.rhoL + (1 - aLt) * rg }; };
     const gT = (Prt) => Kc * z * Math.sqrt(top(Prt).rhoT * (Prt - Ps)) - w;
-    let hi = Ps * 1.0001 + 10; while (gT(hi) < 0 && hi < 2e9) hi = Ps + (hi - Ps) * 2;
+    let hi = Ps * 1.0001 + 10; while (gT(hi) < 0 && hi < 1e13) hi = Ps + (hi - Ps) * 2;
     const Prt = brent(gT, Ps, hi, 1e-10), t = top(Prt);
     const at = (h) => {
       const [AG, AL] = areas(h), aLr = clamp(0.5 * (t.aLt + AL / A), 0, 0.99), rhoM = aLr * o.rhoL + (1 - aLr) * t.rg, Prb = Prt + rhoM * G * o.Lr + fricR(wG, wL, rhoM, aLr);
@@ -391,7 +391,7 @@ export function slugModel(p) {
     if (k === 0) return zLo;
     return brent(growth, zs[k - 1], zs[k], 1e-4);
   };
-  return { p: o, alg, f: (z) => (t, y) => alg(y, typeof z === 'function' ? z(t) : z).d, steady, linearise, poles, growth, critical, hc, A, dmdh };
+  return { p: o, alg, f: (z) => (t, y) => alg(y, typeof z === 'function' ? z(t) : z).d, steady, linearise, poles, growth, critical, hc, A, dmdh, zFloor: clamp((o.wG + o.wL) / (Kc * Math.sqrt(o.rhoL * 300e5)), 0.02, 0.9) }; // zFloor: opening below which the choke alone would take more than about 300 bar
 }
 
 // ---- PID, FOPDT identification and tuning rules -----------------------------------------------------------------
@@ -513,7 +513,8 @@ export function mpc({ A, B, C, x, uPrev = 0, r = 0, np = 20, nc = 5, q = 1, rDu 
   }
   const free = m.F.map((Fk, k) => dot(Fk, x) + m.stp[k] * uPrev - (Array.isArray(r) ? r[Math.min(k, r.length - 1)] : r)), f = new Array(nc).fill(0);
   for (let j = 0; j < nc; j++) { let v = 0; for (let k = 0; k < np; k++) v += m.Phi[k][j] * free[k]; f[j] = 2 * q * v; }
-  const unc = solveLinear(m.H, f.map((v) => -v));
+  let unc; try { unc = solveLinear(m.H, f.map((v) => -v)); } catch { unc = f.map((v, j) => -v / (m.H[j][j] || 1)); }
+  if (!unc.every(Number.isFinite)) unc = new Array(nc).fill(0);
   // bounds on the moves: rate limit directly, absolute limits through the running sum (tightened so every partial sum stays inside)
   const within = (d) => { let u = uPrev; for (const x of d) { if (Math.abs(x) > duMax + 1e-12) return false; u += x; if (u < uMin - 1e-12 || u > uMax + 1e-12) return false; } return true; };
   let seq = unc, active = false;
@@ -576,7 +577,11 @@ export function ekf({ F, h, x0, P0, Q, R: Rn, u, y, scale }) {
 export function ros2Step(f, t, y, h) {
   const n = y.length, g = 1 + Math.SQRT1_2, f0 = f(t, y), M = zeros(n, n);
   for (let j = 0; j < n; j++) { const e = 1e-7 * (Math.abs(y[j]) + 1e-3), yp = y.slice(); yp[j] += e; const fp = f(t, yp); for (let i = 0; i < n; i++) M[i][j] = (i === j ? 1 : 0) - (g * h * (fp[i] - f0[i])) / e; }
-  const k1 = solveLinear(M, f0), f1 = f(t + h, y.map((v, i) => v + h * k1[i])), k2 = solveLinear(M, f1.map((v, i) => v - 2 * k1[i]));
+  // one LU factorisation (partial pivoting) serves both stages
+  const A = M.map((r) => r.slice()), piv = [];
+  for (let k = 0; k < n; k++) { let p = k; for (let i = k + 1; i < n; i++) if (Math.abs(A[i][k]) > Math.abs(A[p][k])) p = i; piv.push(p); if (p !== k) { const tmp = A[k]; A[k] = A[p]; A[p] = tmp; } const d = A[k][k] || 1e-300; for (let i = k + 1; i < n; i++) { const l = (A[i][k] /= d); if (l !== 0) for (let j = k + 1; j < n; j++) A[i][j] -= l * A[k][j]; } }
+  const lu = (b) => { const x = b.slice(); for (let k = 0; k < n; k++) { const p = piv[k]; if (p !== k) { const tmp = x[k]; x[k] = x[p]; x[p] = tmp; } } for (let k = 0; k < n; k++) for (let i = k + 1; i < n; i++) x[i] -= A[i][k] * x[k]; for (let i = n - 1; i >= 0; i--) { let s = x[i]; for (let j = i + 1; j < n; j++) s -= A[i][j] * x[j]; x[i] = s / (A[i][i] || 1e-300); } return x; };
+  const k1 = lu(f0), f1 = f(t + h, y.map((v, i) => v + h * k1[i])), k2 = lu(f1.map((v, i) => v - 2 * k1[i]));
   return { y: y.map((v, i) => v + 1.5 * h * k1[i] + 0.5 * h * k2[i]), err: k1.map((v, i) => 0.5 * h * (v + k2[i])), M };
 }
 /** Adaptive ROS2 integration for stiff systems. Returns { t: [], y: [[]] }. opt: { rtol, atol, hInit, hMax, maxSteps }. */
@@ -617,14 +622,15 @@ export function slugControl(sm, c) {
   let mp = null; // MPC model: scaled deviation states, outputs in bar, input = opening deviation
   if (o.mode === 'mpc') {
     const lin = sm.linearise(o.zTarget), sc = lin.ys.map((v) => Math.abs(v) || 1), As = lin.A.map((r, i) => r.map((v, j) => (v * sc[j]) / sc[i])), Bs = lin.B.map((r, i) => [r[0] / sc[i]]), Cs = lin.C.map((r) => r.map((v, j) => (v * sc[j]) / 1e5)), d = c2d(As, Bs, o.tsMpc);
+    const gr = Math.max(...eig(lin.A).map((e) => e[0])); if (gr > 0) o.np = Math.max(3, Math.min(o.np, Math.ceil(6 / (gr * o.tsMpc)))); o.nc = Math.min(o.nc, o.np); // keep the prediction of an unstable model well conditioned
     mp = { lin, sc, Ad: d.Ad, Bd: d.Bd, C: Cs, Dy: lin.D.map((v) => v / 1e5), x: y.slice(0, 4).map((v, i) => (v - lin.ys[i]) / sc[i]), P: eye(4).map((r) => r.map((v) => v * 1e-4)), cache: {}, every: Math.max(1, Math.round(o.tsMpc / o.dt)), u: 0, yacc: [0, 0], nacc: 0, active: 0, moves: 0 };
   }
-  const n = Math.round(o.tEnd / o.dt), out = { t: [], pIn: [], pTop: [], z: [], wL: [], wG: [], level: [], pSep: [], mLr: [], mLrEst: [], qLout: [], sp: [] };
+  const n = Math.round(o.tEnd / o.dt), out = { t: [], pIn: [], pBase: [], pTop: [], z: [], wL: [], wG: [], level: [], pSep: [], mLr: [], mLrEst: [], qLout: [], sp: [] };
   let ovrCount = 0, maxLevel = 0, minLevel = 1, carry = 0, iae = 0, started = false;
   for (let k = 0; k <= n; k++) {
     const t = k * o.dt, Ps = psep(y), a = sm.alg(y, cmd.z, ...wOf(t), Ps), level = y[4] / o.sepV, pm = a.Pp / 1e5 + (o.bias || 0) + o.noise * rand.normal(), ptm = a.Prt / 1e5 + o.noise * rand.normal();
     const sp = (o.sp ?? eq.Pp) / 1e5 + (t >= o.tStep ? o.dSp : 0), auto = t < o.tOff && o.mode !== 'open';
-    out.t.push(t); out.pIn.push(a.Pp / 1e5); out.pTop.push(a.Prt / 1e5); out.z.push(cmd.z); out.wL.push(a.wLout); out.wG.push(a.wGout); out.level.push(level); out.pSep.push(Ps / 1e5); out.mLr.push(y[3]); out.qLout.push(y[6] * o.qDrain); out.sp.push(sp);
+    out.t.push(t); out.pIn.push(a.Pp / 1e5); out.pTop.push(a.Prt / 1e5); out.pBase.push(a.Prb / 1e5); out.z.push(cmd.z); out.wL.push(a.wLout); out.wG.push(a.wGout); out.level.push(level); out.pSep.push(Ps / 1e5); out.mLr.push(y[3]); out.qLout.push(y[6] * o.qDrain); out.sp.push(sp);
     maxLevel = Math.max(maxLevel, level); minLevel = Math.min(minLevel, level); carry += over(y) * o.dt; if (auto) iae += Math.abs(sp - a.Pp / 1e5) * o.dt;
     // separator loops (always in automatic; direct acting, so the gains are negative)
     cmd.xl = lvl.step(o.levelSp, level, o.feedForward ? a.wLout / p.rhoL / o.qDrain - xl0 : 0); cmd.xg = prs.step(1, Ps / p.Ps);
@@ -828,8 +834,8 @@ export function operatingEnvelope(scan, cons, qRef = 1) {
   let i0 = -1, j0 = -1, bestLen = 0; // feasible run containing qRef, else the longest
   for (let i = 0; i < n;) { if (!feas[i]) { i++; continue; } let j = i; while (j + 1 < n && feas[j + 1]) j++; if (qs[i] <= qRef && qs[j] >= qRef) { i0 = i; bestLen = Infinity; j0 = j; } else if (j - i + 1 > bestLen) { bestLen = j - i + 1; i0 = i; j0 = j; } i = j + 1; }
   const cross = (g, i) => (i < 0 || i + 1 >= n ? null : qs[i] + ((qs[i + 1] - qs[i]) * g[i]) / (g[i] - g[i + 1] || 1e-300));
-  const limits = cons.map((c, k) => { const g = ok[k], vRef = interp1(scan.q, scan[c.key], qRef); let bound = 'none', q = null; if (i0 >= 0) { if (i0 > 0 && g[i0 - 1] < 0) { bound = 'low'; q = cross(g, i0 - 1); } else if (j0 < n - 1 && g[j0 + 1] < 0) { bound = 'high'; q = cross(g, j0); } } else { const bad = g.findIndex((v) => v < 0); if (bad >= 0) bound = 'violated'; } return { name: c.name, key: c.key, type: c.type, limit: c.limit, unit: c.unit || '', bound, q, value: vRef, margin: c.type === 'min' ? vRef - c.limit : c.limit - vRef }; });
-  if (i0 < 0) return { qMin: null, qMax: null, feasible: false, limits, text: limits.filter((l) => l.bound === 'violated').map((l) => `${l.name} cannot be met at any scanned rate`) };
+  const limits = cons.map((c, k) => { const g = ok[k], vRef = interp1(scan.q, scan[c.key], qRef); let bound = 'none', q = null; if (i0 >= 0) { if (i0 > 0 && g[i0 - 1] < 0) { bound = 'low'; q = cross(g, i0 - 1); } else if (j0 < n - 1 && g[j0 + 1] < 0) { bound = 'high'; q = cross(g, j0); } } else if (g.every((v) => v < 0)) bound = 'violated'; return { name: c.name, key: c.key, type: c.type, limit: c.limit, unit: c.unit || '', bound, q, value: vRef, margin: c.type === 'min' ? vRef - c.limit : c.limit - vRef }; });
+  if (i0 < 0) { const never = limits.filter((l) => l.bound === 'violated'); return { qMin: null, qMax: null, feasible: false, limits, text: never.length ? never.map((l) => `${l.name} cannot be met at any scanned rate`) : ['the individual limits leave no common rate range'] }; }
   const lows = limits.filter((l) => l.bound === 'low'), highs = limits.filter((l) => l.bound === 'high'), qMin = lows.length ? Math.max(...lows.map((l) => l.q)) : qs[i0], qMax = highs.length ? Math.min(...highs.map((l) => l.q)) : qs[j0];
   const text = [...lows.map((l) => `minimum rate ${(100 * l.q).toFixed(0)} % set by ${l.name}`), ...highs.map((l) => `maximum rate ${(100 * l.q).toFixed(0)} % set by ${l.name}`)];
   if (!lows.length) text.push(`no lower limit down to ${(100 * qs[i0]).toFixed(0)} % (scan floor)`); if (!highs.length) text.push(`no upper limit up to ${(100 * qs[j0]).toFixed(0)} % (scan ceiling)`);
@@ -972,7 +978,20 @@ async function run(v0, ctx = {}) {
   progress(0.02, 'Steady starting point');
   const fm = fluidModel(ctx), id = v.idMm / 1000, wt = v.wtMm / 1000, A = (Math.PI * id * id) / 4, over = { id, wt, ...(v.uValue > 0 ? { uValue: v.uValue * v.uMult } : {}), tSeabed: v.tSeabed, tSeaSurface: v.tSurface, pOut: v.sepP };
   const line = caseLine(ctx, over);
-  const solve = (mScale, n = 40) => steadyCase(ctx, { ...over, mScale, n });
+  // steady solution at another rate: kernel marching with a bracketed regula falsi on the inlet pressure (outlet met within 0.02 bar)
+  let pGuess = null;
+  const solve = (mScale, n = 36) => {
+    const march = (pIn) => marchSteady({ fm, profile: line.profile, id: line.id, rough: line.roughness, U: line.uValue, tAmbOf: (s, z) => ambientAt(z, line), tIn: line.tIn, pIn, mScale, n }), res = (r) => (r.ok ? r.pOut - line.pOut : -1e3);
+    let a = Math.max(pGuess ?? line.pOut + 60, line.pOut + 1), ra = march(a), fa = res(ra), b, rb, fb;
+    if (Math.abs(fa) < 0.02) { pGuess = a; ra.line = line; ra.fm = fm; return ra; }
+    for (let k = 0, step = 0.12 * a; ; k++, step *= 1.8) { b = fa < 0 ? a + step : Math.max(a - step, line.pOut + 0.2); rb = march(b); fb = res(rb); if (fa * fb < 0) break; if (k > 16 || b > 1400) throw new Error('no inlet pressure delivers this rate to the outlet'); a = b; ra = rb; fa = fb; }
+    for (let k = 0; k < 40; k++) {
+      const useSecant = fa > -900 && fb > -900, c = useSecant ? clamp(a - (fa * (b - a)) / (fb - fa), Math.min(a, b) + 0.02 * Math.abs(b - a), Math.max(a, b) - 0.02 * Math.abs(b - a)) : 0.5 * (a + b), rc = march(c), fc = res(rc);
+      if (Math.abs(fc) < 0.02) { pGuess = c; rc.line = line; rc.fm = fm; return rc; }
+      if (fa * fc < 0) { b = c; rb = rc; fb = fc; fa = useSecant ? fa * 0.5 : fa; } else { a = c; ra = rc; fa = fc; fb = useSecant ? fb * 0.5 : fb; }
+    }
+    throw new Error('the inlet-pressure iteration did not converge');
+  };
   let pic;
   try { pic = Math.abs(rate - 1) < 1e-9 ? flowPicture(ctx, over) : { ...solve(rate, 100), source: 'kernel estimate' }; } catch (e) { throw new Error(`No steady flow solution at ${v.rateFrac} % of the case rate: ${e.message}`); }
   const st = buildStations(pic, nSt, A); st.xNodes = pic.x; st.zNodes = pic.z;
@@ -1016,12 +1035,13 @@ async function run(v0, ctx = {}) {
   // ---------- envelope scan (steady solutions over rate) — also feeds the ramp-up, pigging and optimisation ----------
   progress(0.22, 'Rate scan');
   const scan = { q: [], pIn: [], tArr: [], margin: [], eros: [], qLiq: [], inv: [], vMean: [], zCrit: [], dpChoke: [], pReq: [], res: [] };
-  const sm0 = slugModel(slugParams(st, fm, line, v, rate)), Kc = 2.403e-5 * v.chokeCv, qEnv = linspace(v.qLoPct / 100, v.qHiPct / 100, nEnv);
+  const sm0 = slugModel(slugParams(st, fm, line, v, rate)), Kc = 2.403e-5 * v.chokeCv, qEnv = linspace(v.qLoPct / 100, v.qHiPct / 100, nEnv), qPig = v.pigRatePct / 100;
+  { const k = qEnv.reduce((b, q, i) => (Math.abs(q - qPig) < Math.abs(qEnv[b] - qPig) ? i : b), 0); if (k > 0 && k < nEnv - 1 && qPig > qEnv[k - 1] && qPig < qEnv[k + 1]) qEnv[k] = qPig; } // the pigging rate becomes one of the scan points
   for (let k = 0; k < nEnv; k++) {
     let r; try { r = solve(qEnv[k]); } catch { continue; }
     const n = r.P.length, s2 = buildStations(r, Math.min(nSt, 30), A); s2.xNodes = r.x; s2.zNodes = r.z;
     let zc = null, dpc = 0;
-    try { const smk = slugModel(slugParams(s2, fm, line, v, qEnv[k], sm0.p)); zc = smk.critical(0.02, 1, 9); const zUse = zc === null ? 1 : Math.min(1, v.slugControl ? 2 * zc : 0.9 * zc), eq = smk.steady(zUse); dpc = (eq.Prt - smk.p.Ps) / 1e5; } catch { zc = null; }
+    try { const smk = slugModel(slugParams(s2, fm, line, v, qEnv[k], sm0.p)); zc = smk.critical(smk.zFloor, 1, 9); const zUse = zc === null ? 1 : Math.min(1, v.slugControl ? 2 * zc : 0.9 * zc), eq = smk.steady(zUse); dpc = (eq.Prt - smk.p.Ps) / 1e5; } catch { zc = null; }
     scan.q.push(qEnv[k]); scan.pIn.push(r.pIn); scan.tArr.push(r.tOut); scan.margin.push(-Math.max(...r.subcooling)); scan.eros.push(Math.max(...r.vm.map((x, i) => x / (122 / Math.sqrt(Math.max(r.rhoM[i], 1))))));
     scan.qLiq.push(r.qL[n - 1] * 3600); scan.inv.push(r.liquidInventory * volScale); scan.vMean.push(r.length / r.residence); scan.zCrit.push(zc === null ? 1 : zc); scan.dpChoke.push(dpc); scan.pReq.push(r.pIn + dpc); scan.res.push(r);
     if (k % 3 === 2) await tick();
@@ -1031,12 +1051,12 @@ async function run(v0, ctx = {}) {
 
   // ---------- G. slugging and control ----------
   progress(0.4, 'Slugging model and control');
-  const zCrit = sm0.critical(0.02, 1), zAuto = zCrit === null ? 1 : Math.min(1, 2 * zCrit), sensorFailed = v.sensorState === 'failed', zCmd = clamp(v.chokePct > 0 ? v.chokePct / 100 : zAuto, 0.03, 1);
+  const zCrit = sm0.critical(sm0.zFloor, 1), zAuto = zCrit === null ? 1 : Math.min(1, 2 * zCrit), sensorFailed = v.sensorState === 'failed', zCmd = clamp(v.chokePct > 0 ? v.chokePct / 100 : zAuto, 0.03, 1);
   // a failed inlet-pressure transmitter forces the loop to manual at an opening that is stable without feedback
-  const zTarget = clamp(sensorFailed && zCrit !== null ? Math.min(zCmd, 0.9 * zCrit) : zCmd, Math.max(v.zMinPct / 100, 0.03), Math.max(v.zMaxPct / 100, 0.05)), unstable = zCrit !== null && zTarget > zCrit;
+  const zTarget = clamp(sensorFailed && zCrit !== null ? Math.min(zCmd, 0.9 * zCrit) : zCmd, Math.max(v.zMinPct / 100, 0.03, sm0.zFloor), Math.max(v.zMaxPct / 100, 0.05, sm0.zFloor)), unstable = zCrit !== null && zTarget > zCrit;
   const lin = sm0.linearise(zTarget), eqT = lin.steady, polesOL = sm0.poles(zTarget), kStat = (sm0.steady(Math.min(1, zTarget * 1.02)).Pp - sm0.steady(zTarget * 0.98).Pp) / (Math.min(1, zTarget * 1.02) - zTarget * 0.98) / 1e5;
   // step test at a stable opening → first-order-plus-dead-time model → tuning rules
-  const zId = zCrit === null ? 0.5 * zTarget : 0.6 * zCrit, eqId = sm0.steady(zId), decay = Math.max(-sm0.growth(zId), 1e-5), tId = clamp(6 / decay, 0.5 * HOUR, 16 * HOUR), dz = 0.1 * zId;
+  const zId = Math.max(zCrit === null ? 0.5 * zTarget : 0.6 * zCrit, sm0.zFloor), eqId = sm0.steady(zId), decay = Math.max(-sm0.growth(zId), 1e-5), tId = clamp(6 / decay, 0.5 * HOUR, 16 * HOUR), dz = 0.1 * zId;
   const stepRun = integrateStiff(sm0.f(zId + dz), eqId.y, 0, tId, { rtol: 1e-4, atol: 1e-3, hInit: 5, hMax: tId / 150, maxSteps: 4000 });
   const stepY = stepRun.y.map((y) => sm0.alg(y, zId + dz).Pp / 1e5), fo = identifyFOPDT(stepRun.t, stepY, dz), foUse = { K: fo.K, tau: Math.max(fo.tau, 1), theta: Math.max(fo.theta, v.deadTime, dtCtl) };
   const rules = tuningRules(foUse, Math.max(foUse.theta, v.tauCFactor * foUse.theta)), gainRatio = kStat !== 0 ? fo.K / kStat : 1, pole = tuneByPoles(lin, { tis: v.ctlMode === 'P' ? [0] : [1800, 5400, 14400], theta: v.deadTime + dtCtl });
@@ -1053,10 +1073,10 @@ async function run(v0, ctx = {}) {
   const mpcRun = slugControl(sm0, { ...ctlCfg, mode: 'mpc', tEnd: ctlCfg.tOff, tOff: ctlCfg.tOff + 1 });
   // extended Kalman filter on the nonlinear model: riser liquid mass from the two noisy pressures
   const stride = Math.max(1, Math.ceil(pidRun.t.length / 1500)), hK = dtCtl * stride, rnd = rng(23), idx = pidRun.t.map((_, i) => i).filter((i) => i % stride === 0 && i > 0), g4 = 1 + Math.SQRT1_2;
-  const wTot = sm0.p.wG + sm0.p.wL, sc4 = eqT.y.map((x) => Math.abs(x) || 1), sig4 = [0.01 * sc4[0], 0.05 * sm0.hc * sm0.dmdh, 0.2 * sc4[2], 0.15 * sc4[3]], // prior uncertainties sized to the sensitivity of each state
+  const sc4 = eqT.y.map((x) => Math.abs(x) || 1), sig4 = [0.01 * sc4[0], 0.05 * sm0.hc * sm0.dmdh, 0.2 * sc4[2], 0.25 * sc4[3]], // prior uncertainties sized to the sensitivity of each state
     F4 = (x, u) => { const s = ros2Step((t, y) => sm0.alg(y, u[0], undefined, undefined, u[1]).d, 0, x, hK); const J = s.M.map((r, i) => r.map((m, j) => ((i === j ? 1 : 0) - m) / (g4 * hK))), Phi = inv(madd(eye(4), J.map((r) => r.map((x2) => x2 * hK)), -1)); return { x: s.y.map((y, i) => clamp(y, 1e-6, 50 * sc4[i])), J: Phi }; };
-  const ekfRes = ekf({ F: F4, h: (x, u) => { const a = sm0.alg(x, u[0], undefined, undefined, u[1]); return [a.Pp / 1e5, a.Prt / 1e5, a.w]; }, x0: eqT.y.map((x, i) => x * (i === 3 ? 1.1 : 1)), P0: eye(4).map((r, i) => r.map((x) => x * sig4[i] ** 2)), Q: eye(4).map((r, i) => r.map((x) => x * (0.03 * sig4[i]) ** 2)), R: [[v.noiseBar ** 2 + 1e-3, 0, 0], [0, v.noiseBar ** 2 + 1e-3, 0], [0, 0, (0.03 * wTot) ** 2]],
-    u: idx.map((i) => [pidRun.z[i], pidRun.pSep[i] * 1e5]), y: idx.map((i) => [pidRun.pIn[i] + v.noiseBar * rnd.normal(), pidRun.pTop[i] + v.noiseBar * rnd.normal(), (pidRun.wL[i] + pidRun.wG[i]) * (1 + 0.02 * rnd.normal())]) });
+  const ekfRes = ekf({ F: F4, h: (x, u) => { const a = sm0.alg(x, u[0], undefined, undefined, u[1]); return [a.Pp / 1e5, a.Prt / 1e5, a.Prb / 1e5]; }, x0: eqT.y.map((x, i) => x * (i === 3 ? 1.25 : 1)), P0: eye(4).map((r, i) => r.map((x) => x * sig4[i] ** 2)), Q: eye(4).map((r, i) => r.map((x) => x * (0.03 * sig4[i]) ** 2)), R: [[v.noiseBar ** 2 + 1e-3, 0, 0], [0, v.noiseBar ** 2 + 1e-3, 0], [0, 0, v.noiseBar ** 2 + 1e-3]],
+    u: idx.map((i) => [pidRun.z[i], pidRun.pSep[i] * 1e5]), y: idx.map((i) => [pidRun.pIn[i] + v.noiseBar * rnd.normal(), pidRun.pTop[i] + v.noiseBar * rnd.normal(), pidRun.pBase[i] + v.noiseBar * rnd.normal()]) });
   const mTrue = idx.map((i) => pidRun.mLr[i]), mEst = ekfRes.x.map((x) => x[3]), half = Math.floor(idx.length / 4), ekfRmse = Math.sqrt(mean(mEst.slice(half).map((x, i) => (x - mTrue[half + i]) ** 2))), ekfRel = ekfRmse / Math.max(mean(mTrue), 1e-9);
   const tf = ss2tf(lin.A, lin.B, lin.C[0].map((x) => x / 1e5)), marg = loopMargins(foUse, rules.rows[1]), clPoles = pole.poles2(sel.kc, sel.ti);
   const scS = lin.ys.map((x) => Math.abs(x) || 1), dS = c2d(lin.A.map((r, i) => r.map((x, j) => (x * scS[j]) / scS[i])), lin.B.map((r, i) => [r[0] / scS[i]]), ctlCfg.tsMpc), cS = lin.C[0].map((x, j) => (x * scS[j]) / 1e5);
@@ -1100,8 +1120,8 @@ async function run(v0, ctx = {}) {
 
   // ---------- D. pigging ----------
   progress(0.7, 'Pigging');
-  const qPig = v.pigRatePct / 100, pigDpFric = Math.max((4 * v.pigFric * v.pigContact * 1e5 * v.pigSealLen) / id, 100); // seal contact force: μ × contact pressure × seal area
-  let rPig; try { rPig = solve(qPig, 60); } catch (e) { throw new Error(`No steady flow solution at the pigging rate (${v.pigRatePct} %): ${e.message}`); }
+  const pigDpFric = Math.max((4 * v.pigFric * v.pigContact * 1e5 * v.pigSealLen) / id, 100); // seal contact force: μ × contact pressure × seal area
+  let rPig = scan.res[scan.q.indexOf(qPig)]; try { if (!rPig) rPig = solve(qPig); } catch (e) { throw new Error(`No steady flow solution at the pigging rate (${v.pigRatePct} %): ${e.message}`); }
   const pigOf = (r) => pigRun({ s: r.s, z: r.z, vm: r.vm, holdup: r.holdup, vsl: r.vsl, rhoG: r.rhoG, rhoM: r.rhoM, rhoL: mean(r.rhoL), D: id, fric: pigDpFric, mass: v.pigMass, bypass: v.pigBypass / 100, leak: v.pigLeak / 100, qDrain });
   const pig = pigOf(rPig), pigVsRate = scan.res.map((r, k) => { const p = pigOf(r); return { q: scan.q[k], v: p.vMean, transit: p.transit === null ? null : p.transit / HOUR, surge: p.surge }; }).filter((p) => p.transit !== null);
   const pigTransit = pig.transit === null ? null : pig.transit / HOUR, pigSurge = pig.surge * volScale, pigRuns = v.pigInterval > 0 ? 365 / v.pigInterval : 0;
@@ -1137,11 +1157,13 @@ async function run(v0, ctx = {}) {
 
   // ---------- I. envelope ----------
   progress(0.8, 'Operating envelope and optimisation');
-  const inhibitedSteady = v.dosingBasis !== 'shutdown' && doseWt > 0, cons = [
-    { key: 'margin', name: 'hydrate margin', type: 'min', limit: inhibitedSteady ? -1e3 : v.hydMargin, unit: '°C' }, { key: 'tArr', name: 'arrival temperature above WAT', type: 'min', limit: v.wat + v.watMargin, unit: '°C' },
+  const inhibitedSteady = v.dosingBasis !== 'shutdown' && doseWt > 0, waxByPig = !!v.waxByPigging && v.pigInterval > 0, cons = [
+    { key: 'margin', name: 'hydrate margin', type: 'min', limit: inhibitedSteady ? -1e3 : v.hydMargin, unit: '°C' }, { key: 'tArr', name: 'arrival temperature above WAT', type: 'min', limit: waxByPig ? -1e3 : v.wat + v.watMargin, unit: '°C' },
     { key: 'eros', name: 'erosional velocity', type: 'max', limit: 1, unit: '–' }, { key: 'pReq', name: 'inlet pressure (incl. slug-stabilising choke Δp)', type: 'max', limit: v.pAvail, unit: 'bara' }, { key: 'qLiq', name: 'separator liquid capacity', type: 'max', limit: v.qDrainM3h, unit: 'm³/h' }];
   const turndown = num(v.turndown, 0); if (turndown > 0) { scan.qSelf = scan.q.slice(); cons.push({ key: 'qSelf', name: 'minimum stable rate (flow suite)', type: 'min', limit: turndown, unit: '–' }); }
   const env = operatingEnvelope(scan, cons, clamp(rate, qLo, qHi));
+  if (waxByPig) env.text.push(`wax managed by pigging every ${v.pigInterval} d (arrival may fall below the WAT)`);
+  if (inhibitedSteady) env.text.push('hydrate margin provided by continuous inhibition');
   if (v.severeSlugging && !v.slugControl) env.text.push('severe slugging reported by the flow suite and no active slug control selected');
 
   // ---------- J. surrogate ----------
@@ -1151,7 +1173,7 @@ async function run(v0, ctx = {}) {
   const bblDay = fm.rates.qOilStd * 6.2898, mW1 = fm.rates.mW, depOf = (w) => hydrateDepression({ S, inhWt: clamp(w, 0, 90), inh }) - hydrateDepression({ S, inhWt: 0, inh });
   const chemCost = (q, w) => { const ww = clamp(w, 0, 90) / 100, vol = ((ww * mW1 * q) / Math.max(1 - ww / lean, 0.02) / lean / (lean * inh.rho + (1 - lean) * 1000)) * DAY; return megLoop ? vol * v.inhPrice * (v.megLossPct / 100) + (ww > 0 ? ((mW1 * q * 2.6e6) / 1000) * 24 * v.elecPrice : 0) : vol * v.inhPrice; }; // $/d; a glycol loop pays make-up and regeneration energy
   const heatCost = heatingPower * 24 * v.elecPrice, pigCostDay = (pigRuns * v.pigCost) / 365, needPig = (q) => sur.tArr.predict(q) < v.wat + v.watMargin;
-  const gOf = (q, w, heat, pigs) => [sur.margin.predict(q) + depOf(w) + (heat ? 100 : 0) - v.hydMargin, heat || pigs ? 1 : sur.tArr.predict(q) - v.wat - v.watMargin, 1 - sur.eros.predict(q), (v.pAvail - sur.pReq.predict(q)) / 10, (v.qDrainM3h - sur.qLiq.predict(q)) / Math.max(v.qDrainM3h, 1)];
+  const gOf = (q, w, heat, pigs) => [sur.margin.predict(q) + depOf(w) + (heat ? 100 : 0) - v.hydMargin, heat || pigs || waxByPig ? 1 : sur.tArr.predict(q) - v.wat - v.watMargin, 1 - sur.eros.predict(q), (v.pAvail - sur.pReq.predict(q)) / 10, (v.qDrainM3h - sur.qLiq.predict(q)) / Math.max(v.qDrainM3h, 1)];
   const profit = (q, w, heat, pigs) => q * bblDay * v.oilPrice - chemCost(q, w) - (heat ? heatCost : 0) - (pigs ? pigCostDay : 0), scaleP = Math.max(bblDay * v.oilPrice, 1);
   const pen = (heat, pigs) => (x) => { const g = gOf(x[0], x[1], heat, pigs); return -profit(x[0], x[1], heat, pigs) / scaleP + 20 * sum(g.map((c) => Math.max(0, -c) ** 2)) + 2 * sum(g.map((c) => Math.max(0, -c))); };
   const lo2 = [qLo, 0], hi2 = [qHi, 60], combos = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([h, p]) => { const r = nelderMead(pen(h, p), [clamp(rate, qLo, qHi), 10], { lo: lo2, hi: hi2, maxIter: 160, tol: 1e-9 }), g = gOf(r.x[0], r.x[1], h, p); return { heat: h, pigs: p, x: r.x, f: r.f, feasible: g.every((c) => c > -1e-3), profit: profit(r.x[0], r.x[1], h, p), evals: r.evals }; });
@@ -1172,10 +1194,10 @@ async function run(v0, ctx = {}) {
   const optBest = methods.filter((m) => m.x && isNum(m.f)).sort((a, b) => a.f - b.f)[0], qOpt = optBest.x[0], wOpt = optBest.x[1], profitOpt = profit(qOpt, wOpt, bestC.heat, bestC.pigs);
   // shutdown strategy: cheapest feasible preservation for the planned duration
   const gasValue = 0.2, strategies = [
-    { id: 'none', name: 'No action (restart inside the cooldown time)', feasible: v.tShut <= cooldownTime || neverCools, cost: 0, lead: 0 },
-    { id: 'inhibit', name: `${inh.name} bullheading`, feasible: doseGov.attainable && tBullhead + v.tDecision <= cooldownTime, cost: (batchVol + restartInj) * v.inhPrice, lead: tBullhead },
-    { id: 'blowdown', name: 'Depressurise through the blowdown valve', feasible: safeByTop && bdReached && blowdownTime + v.tDecision <= cooldownTime && Math.min(bdMinTw, bdMinTd) >= v.tMinDesign, cost: bd.discharged * gasValue + (blowdownTime / 24) * bblDay * rate * v.oilPrice * 0.25, lead: blowdownTime },
-    { id: 'heat', name: 'Electrical heating', feasible: heatingPower > 0 && heatingPower <= v.heatMaxKw, cost: heatingPower * v.tShut * v.elecPrice, lead: 0.5 }];
+    { id: 'none', phrase: 'restarting without preservation', name: 'No action (restart inside the cooldown time)', feasible: v.tShut <= cooldownTime || neverCools, cost: 0, lead: 0 },
+    { id: 'inhibit', phrase: `${inhId} bullheading`, name: `${inhId} bullheading`, feasible: doseGov.attainable && tBullhead + v.tDecision <= cooldownTime, cost: (batchVol + restartInj) * v.inhPrice, lead: tBullhead },
+    { id: 'blowdown', phrase: 'depressurising', name: 'Depressurise through the blowdown valve', feasible: safeByTop && bdReached && blowdownTime + v.tDecision <= cooldownTime && Math.min(bdMinTw, bdMinTd) >= v.tMinDesign, cost: bd.discharged * gasValue + (blowdownTime / 24) * bblDay * rate * v.oilPrice * 0.25, lead: blowdownTime },
+    { id: 'heat', phrase: 'switching on the heating', name: 'Electrical heating', feasible: heatingPower > 0 && heatingPower <= v.heatMaxKw, cost: heatingPower * v.tShut * v.elecPrice, lead: 0.5 }];
   if (neverCools) strategies[0].feasible = true;
   const stratBest = strategies.filter((s) => s.feasible).sort((a, b) => a.cost - b.cost)[0] || null, stratSel = strategies.find((s) => s.id === v.preserve) || strategies[0];
   await tick();
@@ -1250,11 +1272,11 @@ async function run(v0, ctx = {}) {
   if (pigVsRate.length > 1) plots.push({ type: 'line', title: 'Pig velocity and receiver surge against rate', xlabel: 'Rate (% of case)', ylabel: 'm/s · m³', series: [{ name: 'Mean pig velocity (m/s)', x: pigVsRate.map((p) => 100 * p.q), y: pigVsRate.map((p) => p.v), mode: 'both' }, { name: 'Surge above drain capacity (m³ / 10)', x: pigVsRate.map((p) => 100 * p.q), y: pigVsRate.map((p) => (p.surge * volScale) / 10), mode: 'both' }], hlines: [{ y: 5, label: 'upper pig velocity guide (5 m/s)' }] });
   { const kk = [0.25, 0.5, 0.75, 1].map((f) => Math.min(front.t.length - 1, Math.max(1, Math.round(f * (front.t.length - 1) * 0.5)))), ser = []; for (const k of kk) { ser.push({ name: `t = ${(front.t[k] / HOUR).toFixed(2)} h`, x: front.xc.map(km), y: front.c[k].slice() }); } const kA = kk[1]; ser.push({ name: `Analytic (mean velocity), t = ${(front.t[kA] / HOUR).toFixed(2)} h`, x: front.xc.map(km), y: front.xc.map((x) => frontAnalytic(x, front.t[kA], uMean, disp)), dash: true });
     plots.push({ type: 'line', title: 'Inhibitor front along the line', xlabel: 'Distance (km)', ylabel: 'Concentration / injected concentration', ymin: 0, ymax: 1.05, series: ser, hlines: [{ y: 0.95, label: 'protected' }] }); }
-  { const zs = linspace(0.03, 1, 24), gr = zs.map((z) => sm0.growth(z) * HOUR); plots.push({ type: 'line', title: 'Open-loop stability of the riser against choke opening', xlabel: 'Choke opening (%)', ylabel: 'Growth rate of the slowest mode (1/h)', series: [{ name: 'Largest real part of the poles', x: zs.map((z) => 100 * z), y: gr }], hlines: [{ y: 0, label: 'stability limit' }], vlines: [...(zCrit !== null ? [{ x: 100 * zCrit, label: 'limit cycle starts' }] : []), { x: 100 * zTarget, label: 'operating opening' }] }); }
+  { const zs = linspace(Math.max(0.03, sm0.zFloor), 1, 24), gr = zs.map((z) => sm0.growth(z) * HOUR); plots.push({ type: 'line', title: 'Open-loop stability of the riser against choke opening', xlabel: 'Choke opening (%)', ylabel: 'Growth rate of the slowest mode (1/h)', series: [{ name: 'Largest real part of the poles', x: zs.map((z) => 100 * z), y: gr }], hlines: [{ y: 0, label: 'stability limit' }], vlines: [...(zCrit !== null ? [{ x: 100 * zCrit, label: 'limit cycle starts' }] : []), { x: 100 * zTarget, label: 'operating opening' }] }); }
   { const th = pidRun.t.map((t) => t / HOUR); plots.push({ type: 'line', title: 'Inlet pressure: closed loop, then controller in manual', xlabel: 'Time (h)', ylabel: 'Inlet pressure (bara)', series: [{ name: `${v.ctlMode} control, then open loop`, x: thin(th, 400), y: thin(pidRun.pIn, 400) }, { name: 'Set-point', x: thin(th, 400), y: thin(pidRun.sp, 400), dash: true }], vlines: [{ x: ctlCfg.tOff / HOUR, label: 'controller to manual' }] });
     plots.push({ type: 'line', title: 'Choke opening and separator level', xlabel: 'Time (h)', ylabel: '%', series: [{ name: 'Choke opening (%)', x: thin(th, 400), y: thin(pidRun.z.map((z) => 100 * z), 400) }, { name: 'Separator level (%)', x: thin(th, 400), y: thin(pidRun.level.map((l) => 100 * l), 400) }], hlines: [{ y: 80, label: 'high level' }], vlines: [{ x: ctlCfg.tOff / HOUR, label: 'controller to manual' }] });
     const tm = mpcRun.t.map((t) => t / HOUR), nC = Math.min(tm.length, Math.round(ctlCfg.tOff / dtCtl) + 1); plots.push({ type: 'line', title: 'PID against model-predictive control (set-point step)', xlabel: 'Time (h)', ylabel: 'Inlet pressure (bara)', series: [{ name: v.ctlMode, x: thin(th.slice(0, nC), 300), y: thin(pidRun.pIn.slice(0, nC), 300) }, { name: 'Linear MPC + Kalman filter', x: thin(tm, 300), y: thin(mpcRun.pIn, 300) }, { name: 'Set-point', x: thin(tm, 300), y: thin(mpcRun.sp, 300), dash: true }] });
-    plots.push({ type: 'line', title: 'Extended Kalman filter: riser liquid mass from inlet pressure, topside pressure and choke flow', xlabel: 'Time (h)', ylabel: 'Liquid mass in the riser (t)', series: [{ name: 'Model (truth)', x: idx.map((i) => th[i]), y: mTrue.map((m) => m / 1000) }, { name: 'EKF estimate', x: idx.map((i) => th[i]), y: mEst.map((m) => m / 1000), dash: true }] }); }
+    plots.push({ type: 'line', title: 'Extended Kalman filter: riser liquid mass from the inlet, riser-base and topside pressures', xlabel: 'Time (h)', ylabel: 'Liquid mass in the riser (t)', series: [{ name: 'Model (truth)', x: idx.map((i) => th[i]), y: mTrue.map((m) => m / 1000) }, { name: 'EKF estimate', x: idx.map((i) => th[i]), y: mEst.map((m) => m / 1000), dash: true }] }); }
   { const q100 = scan.q.map((q) => 100 * q), vl = env.feasible ? [{ x: 100 * env.qMin, label: 'min' }, { x: 100 * env.qMax, label: 'max' }] : [];
     plots.push({ type: 'line', title: 'Operating envelope: pressure and temperature limits', xlabel: 'Rate (% of case)', ylabel: 'bara · °C', series: [{ name: 'Inlet pressure (bara)', x: q100, y: scan.pIn, mode: 'both' }, { name: 'Inlet pressure incl. stabilising choke (bara)', x: q100, y: scan.pReq, mode: 'both' }, { name: 'Arrival temperature (°C)', x: q100, y: scan.tArr, mode: 'both' }, { name: 'Smallest hydrate margin (°C)', x: q100, y: scan.margin, mode: 'both' }], hlines: [{ y: v.pAvail, label: 'available pressure' }, { y: v.wat + v.watMargin, label: 'WAT + margin' }, { y: v.hydMargin, label: 'hydrate margin' }], vlines: vl });
     plots.push({ type: 'line', title: 'Operating envelope: utilisation of the capacity limits', xlabel: 'Rate (% of case)', ylabel: 'Fraction of limit', zeroY: true, series: [{ name: 'Erosional velocity ratio', x: q100, y: scan.eros, mode: 'both' }, { name: 'Liquid rate / separator capacity', x: q100, y: scan.qLiq.map((q) => q / v.qDrainM3h), mode: 'both' }, { name: 'Critical choke opening (fraction)', x: q100, y: scan.zCrit, mode: 'both', dash: true }], hlines: [{ y: 1, label: 'limit' }], vlines: vl }); }
@@ -1326,10 +1348,10 @@ async function run(v0, ctx = {}) {
   for (const a of raised) warnings.push({ level: a.level === 'trip' ? 'bad' : 'warn', msg: `${a.tag}: ${a.msg}${a.action ? ' → ' + a.action : ''}` });
 
   if (neverCools) rec.push(`No point reaches the hydrate temperature within ${v.tHorizon} h of shut-in: no preservation is needed for shutdowns up to that duration.`);
-  else rec.push(`Act within ${noTouch.toFixed(1)} h of shut-in: the cold spot (${coldComp ? coldComp.name + ', ' : ''}${km(coldSpotX).toFixed(1)} km) reaches the hydrate temperature + ${v.hydMargin} °C after ${cooldownTime.toFixed(1)} h, and ${stratSel.name.toLowerCase()} takes ${stratSel.lead.toFixed(1)} h plus ${v.tDecision} h to decide.`);
-  if (stratBest && stratBest.id !== stratSel.id) rec.push(`For a ${v.tShut} h shutdown the lowest-cost feasible preservation is ${stratBest.name.toLowerCase()} (about $${fmt(stratBest.cost, 3)} per event against $${fmt(stratSel.cost, 3)} for the selected one${stratSel.feasible ? '' : ', which is not feasible'}).`);
-  if (doseWt > 0) rec.push(`Dose ${inh.name} to ${doseWt.toFixed(0)} wt % of the water phase (${dTgov.toFixed(0)} °C depression incl. ${v.inhMargin} °C margin): ${batchVol.toFixed(1)} m³ per shutdown${contRate > 0 ? ` and ${contRate.toFixed(1)} m³/d continuously` : ''}; start injection ${tProtect.toFixed(1)} h before a planned shut-in so the front covers the whole line.`);
-  rec.push(rampReq === null ? `Restart at ${v.qStartPct} % with ${restartPressure.toFixed(0)} bara available at the inlet; the liquid surge cannot be kept inside ${surgeAllow.toFixed(0)} m³ by ramping alone.` : `Restart at ${v.qStartPct} % (needs ${restartPressure.toFixed(0)} bara) and ${rampReq > 0.99 * v.rampHours || rampReq > 0.5 ? `ramp at ≤ ${((100 - v.qStartPct) / Math.max(rampReq, 0.05)).toFixed(0)} %/h (${rampReq.toFixed(1)} h to full rate) to keep the liquid surge below ${surgeAllow.toFixed(0)} m³` : `ramp as planned over ${v.rampHours} h: the liquid surge (${ramp.vMax.toFixed(0)} m³) stays below ${surgeAllow.toFixed(0)} m³ even for a fast ramp`}; keep ${inh.name} on for ${(tSafe ?? restartTime).toFixed(1)} h until the whole line is outside the hydrate region.`);
+  else rec.push(`Act within ${noTouch.toFixed(1)} h of shut-in: the cold spot (${coldComp ? coldComp.name + ', ' : ''}${km(coldSpotX).toFixed(1)} km) reaches the hydrate temperature + ${v.hydMargin} °C after ${cooldownTime.toFixed(1)} h, and ${stratSel.phrase} takes ${stratSel.lead.toFixed(1)} h plus ${v.tDecision} h to decide.`);
+  if (stratBest && stratBest.id !== stratSel.id) rec.push(`For a ${v.tShut} h shutdown the lowest-cost feasible preservation is ${stratBest.phrase} (about $${fmt(stratBest.cost, 3)} per event against $${fmt(stratSel.cost, 3)} for the selected one${stratSel.feasible ? '' : ', which is not feasible'}).`);
+  if (doseWt > 0) rec.push(`Dose ${inhId} to ${doseWt.toFixed(0)} wt % of the water phase (${dTgov.toFixed(0)} °C depression incl. ${v.inhMargin} °C margin): ${batchVol.toFixed(1)} m³ per shutdown${contRate > 0 ? ` and ${contRate.toFixed(1)} m³/d continuously` : ''}; start injection ${tProtect.toFixed(1)} h before a planned shut-in so the front covers the whole line.`);
+  rec.push(rampReq === null ? `Restart at ${v.qStartPct} % with ${restartPressure.toFixed(0)} bara available at the inlet; the liquid surge cannot be kept inside ${surgeAllow.toFixed(0)} m³ by ramping alone.` : `Restart at ${v.qStartPct} % (needs ${restartPressure.toFixed(0)} bara) and ${rampReq > 0.99 * v.rampHours || rampReq > 0.5 ? `ramp at ≤ ${((100 - v.qStartPct) / Math.max(rampReq, 0.05)).toFixed(0)} %/h (${rampReq.toFixed(1)} h to full rate) to keep the liquid surge below ${surgeAllow.toFixed(0)} m³` : `ramp as planned over ${v.rampHours} h: the liquid surge (${ramp.vMax.toFixed(0)} m³) stays below ${surgeAllow.toFixed(0)} m³ even for a fast ramp`}${(tSafe ?? restartTime) > 0.05 ? `; keep ${inhId} on for ${(tSafe ?? restartTime).toFixed(1)} h until the whole line is outside the hydrate region` : ''}.`);
   rec.push(safeByTop ? `Depressurise through the ${v.orificeMm} mm orifice to ${pEndB.toFixed(1)} bara: ${blowdownTime.toFixed(1)} h, peak flare ${bd.peak.toFixed(1)} kg/s, coldest metal ${Math.min(bdMinTw, bdMinTd).toFixed(0)} °C.` : `Do not rely on topside blowdown for hydrate protection: the settled liquid leaves ${seabedPAfter.toFixed(0)} bara at the seabed (hydrate-safe below ${pSafe.toFixed(0)} bara); plan inhibitor displacement or heating instead.`);
   if (pigTransit !== null) rec.push(`Pig at ${v.pigRatePct} % rate: ${pigTransit.toFixed(1)} h transit at ${pig.vMean.toFixed(1)} m/s; expect ${(pig.received * volScale).toFixed(0)} m³ of liquid over ${(pig.duration / 60).toFixed(0)} min${pigSurge > surgeAllow ? ` — ${pigSurge.toFixed(0)} m³ more than the drain can take, so lower the pigging rate or pre-drain the slug catcher` : ', inside the slug-catcher allowance'}${v.pigInterval > 0 ? `; every ${v.pigInterval} d (${pigRuns.toFixed(0)} runs a year)` : ''}.`);
   if (sensorFailed) rec.push(`Repair the inlet-pressure transmitter: until then keep the choke at ${(100 * zTarget).toFixed(0)} % in manual (costs ${Math.max(0, eqT.Pp / 1e5 - sm0.steady(Math.min(1, zAuto)).Pp / 1e5).toFixed(0)} bar of back-pressure against controlled operation at ${(100 * zAuto).toFixed(0)} %).`);
@@ -1364,6 +1386,8 @@ async function run(v0, ctx = {}) {
 
 // ---- declarations --------------------------------------------------------------------------------------------------
 const sel = (key, label, value, options, help) => ({ key, label, type: 'select', value, options: options.map((o) => (Array.isArray(o) ? { value: o[0], label: o[1] } : { value: o, label: o })), help });
+// synthetic 48 h historian extract: steady flow, turndown, a 4 h trip, restart and ramp, then 110 % (model + bias + noise)
+const LOG_SAMPLE = [{ t: 0, rate: 100, choke: 25, pIn: 107.2, tArr: 41.8 }, { t: 2, rate: 100, choke: 25, pIn: 106.9, tArr: 41.5 }, { t: 4, rate: 100, choke: 25, pIn: 107.2, tArr: 42 }, { t: 6, rate: 100, choke: 25, pIn: 108, tArr: 41.9 }, { t: 8, rate: 100, choke: 25, pIn: 106.8, tArr: 41.9 }, { t: 10, rate: 100, choke: 25, pIn: 107.5, tArr: 42.1 }, { t: 11, rate: 80, choke: 22, pIn: 96.9, tArr: 41.4 }, { t: 12, rate: 80, choke: 22, pIn: 96.9, tArr: 40.2 }, { t: 14, rate: 80, choke: 22, pIn: 97.1, tArr: 39.4 }, { t: 16, rate: 0, choke: 2, pIn: 81.1, tArr: 36.3 }, { t: 17, rate: 0, choke: 2, pIn: 81.1, tArr: 34.5 }, { t: 18, rate: 0, choke: 2, pIn: 80.1, tArr: 32.7 }, { t: 19, rate: 0, choke: 2, pIn: 81.6, tArr: 30.7 }, { t: 20, rate: 30, choke: 12, pIn: 112.9, tArr: 29.2 }, { t: 21, rate: 45, choke: 15, pIn: 98.7, tArr: 29.9 }, { t: 22, rate: 60, choke: 18, pIn: 93.8, tArr: 29 }, { t: 23, rate: 80, choke: 22, pIn: 96.7, tArr: 30.2 }, { t: 24, rate: 100, choke: 25, pIn: 107.5, tArr: 33 }, { t: 26, rate: 100, choke: 25, pIn: 106.7, tArr: 36.3 }, { t: 28, rate: 100, choke: 25, pIn: 106.1, tArr: 37.9 }, { t: 30, rate: 100, choke: 25, pIn: 107.7, tArr: 39.2 }, { t: 33, rate: 100, choke: 25, pIn: 107.1, tArr: 40.9 }, { t: 36, rate: 110, choke: 28, pIn: 111.7, tArr: 41.9 }, { t: 39, rate: 110, choke: 28, pIn: 112.3, tArr: 43.2 }, { t: 42, rate: 110, choke: 28, pIn: 111.7, tArr: 43.8 }, { t: 45, rate: 110, choke: 28, pIn: 112.8, tArr: 43.9 }, { t: 48, rate: 110, choke: 28, pIn: 111.4, tArr: 43.6 }];
 const INPUTS = [
   { group: 'Line and facilities', tab: 'inputs', help: 'Geometry and fluid come from the case (network and flow suites when they have been run, otherwise the reference tie-back). These values can be linked from the other suites.', fields: [
     { key: 'rateFrac', label: 'Operating rate', unit: '% of case rate', value: 100, min: 10, max: 200, typical: [40, 110], help: 'Rate at which the line runs before the shutdown and for the control study.' },
@@ -1433,6 +1457,7 @@ const INPUTS = [
     { key: 'pigBypass', label: 'Bypass area', unit: '% of bore', value: 2, min: 0, max: 30 },
     { key: 'pigLeak', label: 'Liquid leaking back past the pig', unit: '% of swept', value: 3, min: 0, max: 60 },
     { key: 'pigInterval', label: 'Pigging interval (0 = no routine pigging)', unit: 'd', value: 14, min: 0, max: 3650 },
+    { key: 'waxByPigging', label: 'Wax managed by pigging (arrival may be below the WAT)', type: 'bool', value: false },
     { key: 'waxThk', label: 'Wax thickness at pigging', unit: 'mm', value: 2, min: 0, max: 50 },
     { key: 'pigCost', label: 'Cost per pig run', unit: '$', value: 15000, min: 0, max: 1e7 },
   ] },
@@ -1505,7 +1530,7 @@ const INPUTS = [
     { key: 'qHiPct', label: 'Envelope scan: highest rate', unit: '% of case rate', value: 150, min: 100, max: 400 },
   ] },
   { group: 'Operating log (historical replay)', tab: 'inputs', help: 'Rows from a SCADA / historian export. The model is driven by the logged rate and choke opening and compared with the logged pressures and temperatures.', fields: [
-    { key: 'log', label: 'Operating log', type: 'table', columns: [{ key: 't', label: 'Time', unit: 'h' }, { key: 'rate', label: 'Rate', unit: '% of case rate' }, { key: 'choke', label: 'Choke opening', unit: '%' }, { key: 'pIn', label: 'Inlet pressure', unit: 'bara' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }], value: [] },
+    { key: 'log', label: 'Operating log', type: 'table', columns: [{ key: 't', label: 'Time', unit: 'h' }, { key: 'rate', label: 'Rate', unit: '% of case rate' }, { key: 'choke', label: 'Choke opening', unit: '%' }, { key: 'pIn', label: 'Inlet pressure', unit: 'bara' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }], value: LOG_SAMPLE },
     { key: 'useResidual', label: 'Fit a residual correction on the log', type: 'bool', value: true },
   ] },
   { group: 'Numerical resolution', tab: 'mesh', fields: [
@@ -1514,7 +1539,7 @@ const INPUTS = [
     { key: 'ntCool', label: 'Cooldown time steps', value: 144, min: 12, max: 2000 },
     { key: 'ntBlow', label: 'Blowdown time steps to the target', value: 300, min: 30, max: 6000 },
     { key: 'dtCtl', label: 'Control sample / integration step', unit: 's', value: 30, min: 2, max: 120 },
-    { key: 'nEnv', label: 'Rates in the envelope scan', value: 8, min: 4, max: 16 },
+    { key: 'nEnv', label: 'Rates in the envelope scan', value: 7, min: 4, max: 16 },
     { key: 'nxInh', label: 'Cells for the inhibitor front', value: 120, min: 20, max: 600 },
   ] },
 ];
@@ -1663,25 +1688,25 @@ const suite = {
   tagline: 'Shutdown, cooldown, restart, blowdown, pigging, chemicals, slug control, operating logic and the operating envelope in one study.',
   description: 'Starting from the steady flow picture of the case, the suite solves the cooldown of the line by radial finite-volume conduction, the settle-out, restart pressure, warm-up and ramp-up surge, the blowdown of the gas inventory, a pig run with the liquid it pushes, inhibitor dosing with the advection–dispersion of the front, and heating. A four-state riser model gives the choke opening where slugging starts and is stabilised by PID and by linear model-predictive control with Kalman filtering. The rate window, an optimised operating point, a timed shutdown–restart sequence with alarms, and a replay of the operating log complete the study.',
   guide: ['Run the fluid, network and flow suites first (or use the reference case) and link their values on the Inputs tab.', 'Set the shutdown duration, the preservation strategy and the restart ramp; check the cooldown and no-touch times.', 'Size the blowdown orifice and check the minimum temperatures and the seabed pressure left by the liquid head.', 'Review pigging surge against the slug-catcher and the inhibitor dose, volumes and front travel time.', 'On Model setup choose the controller and tuning; compare PID with MPC and read the critical choke opening.', 'Read the operating window, the optimised operating point and the event sequence; attach a historian export as the operating log to replay it.'],
-  implemented: ['transient mass balance', 'momentum balance', 'energy balance', 'component balances', 'equipment inventory', 'tank/separator level', 'valve actuator dynamics', 'pid control', 'pi control', 'p control', 'feedforward control', 'feedback control', 'cascade control', 'ratio control', 'override/selective control', 'anti-windup', 'model predictive control', 'optimal control', 'state-space model', 'transfer-function model', 'state observer', 'kalman filter', 'extended kalman filter',
+  implemented: ['transient mass balance', 'momentum balance', 'energy balance', 'component balances', 'equipment inventory', 'tank/separator level', 'valve actuator dynamics', 'pid control', 'pi control', 'p control', 'feedforward control', 'feedback control', 'cascade control', 'override/selective control', 'anti-windup', 'model predictive control', 'optimal control', 'state-space model', 'transfer-function model', 'state observer', 'kalman filter', 'extended kalman filter',
     'transient heat equation', 'fourier conduction', 'newton cooling', 'lumped-capacitance', 'multilayer cylindrical conduction', 'transient fluid energy equation', 'transient mass/energy balances', 'compressible-flow', 'critical-flow', 'homogeneous-equilibrium', 'joule–thomson cooling', 'pig force balance', 'differential-pressure equation', 'friction/contact-force', 'pig velocity equation', 'liquid inventory/displacement balance', 'bypass/leakage',
     'advection–diffusion equation', 'species conservation', 'mixing equations', 'partitioning models', 'inhibitor mass balance', 'linear programming', 'nonlinear programming', 'mixed-integer linear programming', 'mixed-integer nonlinear programming', 'dynamic optimization', 'interior-point', 'genetic algorithm', 'particle-swarm', 'bayesian optimization',
     'transient multiphase solver + mpc', 'hydrate-risk model + inhibitor optimizer', 'digital twin + state estimation', 'physics model + data-driven surrogate', 'mechanistic model + machine-learning residual correction', 'shutdown model + optimization', 'production optimization + flow-assurance constraints',
     'production rates', 'pressure and temperature', 'fluid inventories', 'current valve and choke openings', 'separator conditions', 'inhibitor injection rates', 'heating status', 'current alarm states', 'controller set points and operating mode', 'pressure', 'temperature', 'phase distribution', 'liquid accumulation',
     'production targets and permitted production ranges', 'startup and ramp-up profiles', 'shutdown sequences', 'restart schedules', 'minimum and maximum valve openings', 'choke limits', 'separator pressure and level constraints', 'depressurization and blowdown schedules', 'inhibitor injection limits', 'heating limits', 'pig-launch and pig-receive conditions', 'emergency shutdown actions', 'set points', 'allowable deviations', 'actuator limits', 'operating constraints', 'alarm thresholds and safety limits', 'minimum acceptable hydrate safety margin', 'maximum shutdown duration', 'acceptable liquid surge', 'heating', 'depressurization or production-rate adjustment',
-    'production schedules', 'startup/shutdown schedules', 'restart/ramp rates', 'valve/choke operations', 'depressurization/blowdown schedule', 'inhibitor injection rate/location', 'pigging schedule', 'heating strategy', 'separator/control settings',
-    'startup/shutdown response', 'cooldown time', 'restart requirements', 'depressurization time', 'transient liquid inventory', 'pig trajectory/liquid surge', 'inhibitor distribution', 'hydrate safety margin', 'required chemical dosage', 'operating envelope', 'maximum allowable shutdown duration', 'safe restart window', 'operational alarms and constraint violations',
+    'current state from modules 1-4', 'production targets and schedules', 'startup/shutdown/restart/ramp profiles', 'valve/choke commands and limits', 'depressurization/blowdown schedules', 'inhibitor/chemical injection rates, locations and capacity limits', 'pig geometry/friction/bypass and launch/receive schedule', 'separator/control settings', 'controller set points/gains', 'sensor states', 'alarm/interlock thresholds', 'operational and safety constraints',
+    'startup/shutdown/restart trajectories', 'cooldown/warm-up time', 'restart pressure/rate requirements', 'depressurization/blowdown time and minimum temperature', 'transient liquid/solid inventory', 'pig position/velocity and generated liquid surge', 'inhibitor concentration/distribution and required dosage', 'hydrate/solids safety margin', 'equipment/control response', 'feasible operating envelope', 'maximum allowable shutdown duration', 'safe restart window', 'constraint violations, alarms/interlocks and recommended/optimized operating actions',
     'valve cv', 'pig friction', 'cooldown parameters', 'thermal time constants',
     'steady-to-transient initialization', 'event scheduler verification', 'valve opening/closing logic', 'controller logic', 'interlock logic', 'alarm logic', 'constraint handling', 'pid benchmark tests', 'mass balance during switching events', 'energy balance during shutdown', 'depressurization conservation', 'restart conservation', 'pig-tracking conservation', 'event-time accuracy', 'time-step independence', 'state-machine tests', 'fault-handling tests', 'fail-safe tests', 'optimization convergence', 'operating-envelope boundary verification',
-    'shutdown records', 'blowdown/depressurization tests', 'cooldown measurements', 'pig arrival times', 'scada/historian data'],
-  referenceOnly: ['rotating-equipment', 'nonlinear mpc', 'adaptive control', 'robust control', 'unscented kalman', 'homogeneous-relaxation', 'sequential quadratic programming', 'pump and compressor', 'pump/compressor', 'chemical inventories', 'pig location if a pig is already', 'maximum solids accumulation', 'valve actuator response', 'choke characteristics', 'pump curves', 'compressor maps', 'controller gains', 'pid parameters', 'sensor dynamics', 'sensor bias', 'process dead time', 'actuator dead time', 'inhibitor mixing/dispersion parameters', 'chemical-injection efficiency', 'pig bypass', 'pig velocity parameters', 'restart friction/pressure parameters',
-    'commissioning data', 'startup records', 'restart records', 'emergency shutdowns', 'pigging records', 'liquid-surging measurements', 'chemical tracer measurements', 'meg/methanol concentration measurements', 'valve-response data', 'compressor transient data', 'pump transient data', 'separator-level histories', 'field alarm/event histories'],
-  equationsNote: 'Screening-level operations models. Cooldown: radial conduction with a lumped fluid node at every axial station (no axial conduction, no natural-circulation redistribution of heat; liquid settles into the low points between crests). Settle-out and cooling pressure assume a fixed gas mass with no inter-phase mass transfer. Blowdown treats the line gas as one lumped volume with a lumped wall-and-liquid heat sink (no axial pressure gradient, so long lines blow down somewhat slower than predicted); the two-phase option is the ω-method homogeneous-equilibrium model with a fixed inlet liquid fraction. Pigging is quasi-steady on the steady profile. The slugging model is a four-state riser model tuned to the steady solution: it reproduces the onset and period of riser-induced slugging and its response to the choke, not hydrodynamic slug statistics; its verdict should be confirmed with the transient flow suite. Rotating equipment, nonlinear/adaptive/robust MPC, the unscented filter, relaxation (non-equilibrium) discharge and SQP are not solved.',
+    'shutdown records', 'blowdown/depressurization tests', 'cooldown measurements', 'pig arrival times', 'scada/historian data', 'emergency shutdowns'],
+  referenceOnly: ['rotating-equipment', 'ratio control', 'heating/cooling strategy', 'nonlinear mpc', 'adaptive control', 'robust control', 'unscented kalman', 'homogeneous-relaxation', 'sequential quadratic programming', 'pump and compressor', 'pump/compressor', 'chemical inventories', 'pig location if a pig is already', 'maximum solids accumulation', 'valve actuator response', 'choke characteristics', 'pump curves', 'compressor maps', 'controller gains', 'pid parameters', 'sensor dynamics', 'sensor bias', 'process dead time', 'actuator dead time', 'inhibitor mixing/dispersion parameters', 'chemical-injection efficiency', 'pig bypass', 'pig velocity parameters', 'restart friction/pressure parameters',
+    'commissioning data', 'startup records', 'restart records', 'pigging records', 'liquid-surging measurements', 'chemical tracer measurements', 'meg/methanol concentration measurements', 'valve-response data', 'compressor transient data', 'pump transient data', 'separator-level histories', 'field alarm/event histories'],
+  equationsNote: 'Screening-level operations models. Cooldown: radial conduction with a lumped fluid node at every axial station (no axial conduction, no natural-circulation redistribution of heat; liquid settles into the low points between crests). Settle-out and cooling pressure assume a fixed gas mass with no inter-phase mass transfer. Blowdown treats the line gas as one lumped volume with a lumped wall-and-liquid heat sink (no axial pressure gradient, so long lines blow down somewhat slower than predicted); the two-phase option is the ω-method homogeneous-equilibrium model with a fixed inlet liquid fraction. Pigging is quasi-steady on the steady profile. The slugging model is a four-state riser model tuned to the steady solution: it reproduces the onset and period of riser-induced slugging and its response to the choke, not hydrodynamic slug statistics; its verdict should be confirmed with the transient flow suite. Pumps, compressors and their maps, ratio control, active cooling, nonlinear/adaptive/robust MPC, the unscented filter, relaxation (non-equilibrium) discharge and SQP are not solved.',
   inputs: INPUTS,
   presets: [
     { name: 'Planned shutdown and restart (reference tie-back)', values: { tShut: 24, preserve: 'inhibit', rampHours: 6, qStartPct: 30 } },
     { name: 'Emergency shutdown with blowdown', values: { tShut: 96, tHorizon: 96, preserve: 'blowdown', tBlowStart: 2, tDecision: 1, orificeMm: 45, pBack: 1.5, unplannedPerYear: 10, unplannedHours: 36, ntCool: 192 } },
-    { name: 'Pigging campaign for wax management', values: { wat: 46, pigRatePct: 60, pigInterval: 7, waxThk: 4, pigBypass: 4, pigFric: 0.45, pigLeak: 6, pigEff: 85, preserve: 'none', tShut: 6 } },
+    { name: 'Pigging campaign for wax management', values: { wat: 46, waxByPigging: true, pigRatePct: 90, pigInterval: 7, waxThk: 4, pigBypass: 4, pigFric: 0.45, pigLeak: 6, pigEff: 85, preserve: 'none', tShut: 6 } },
     { name: 'Severe-slugging control at low rate', values: { rateFrac: 40, chokePct: 0, ctlMode: 'PI', tuning: 'auto', cascade: true, tCtl: 24, dtCtl: 60, severeSlugging: true, qLoPct: 20, qHiPct: 120 } },
     { name: 'Continuous MEG injection with regeneration loop', values: { inhibitor: 'MEG', leanWt: 90, dosingBasis: 'max', inhPrice: 1100, megStorageDays: 5, megLossPct: 0.5, pumpMax: 40, preserve: 'inhibit' } },
     { name: 'Late-life turndown envelope', values: { rateFrac: 50, qLoPct: 15, qHiPct: 110, nEnv: 10, wat: 34, slugControl: false, pAvail: 140, plannedPerYear: 3, unplannedPerYear: 12, preserve: 'heat' } },
@@ -1724,8 +1749,8 @@ const suite = {
     columns: [{ key: 'tShutH', label: 'Time since shut-in', unit: 'h' }, { key: 't0', label: 'Temperature at shut-in', unit: '°C' }, { key: 'tCold', label: 'Fluid temperature', unit: '°C' }, { key: 'tBlowMin', label: 'Time since blowdown valve opened', unit: 'min' }, { key: 'p0', label: 'Pressure at opening', unit: 'bara' }, { key: 'pBlow', label: 'Line pressure', unit: 'bara' }, { key: 'vGas', label: 'Mixture velocity behind the pig', unit: 'm/s' }, { key: 'pigArrival', label: 'Pig arrival time', unit: 'h' }],
     targets: [{ key: 'tCold', label: 'Fluid temperature', unit: '°C' }, { key: 'pBlow', label: 'Line pressure', unit: 'bara' }, { key: 'pigArrival', label: 'Pig arrival time', unit: 'h' }],
     model: calModel,
-    sample: [],
-    validationSample: [],
+    sample: [{ tShutH: 2, t0: 52, tCold: 44.6, tBlowMin: 10, p0: 82, pBlow: 71.6, vGas: 1.6, pigArrival: 4.53 }, { tShutH: 4, t0: 52, tCold: 38.8, tBlowMin: 20, p0: 82, pBlow: 64.9, vGas: 1.9, pigArrival: 3.54 }, { tShutH: 6, t0: 52, tCold: 33.8, tBlowMin: 30, p0: 82, pBlow: 58.3, vGas: 2.2, pigArrival: 3.07 }, { tShutH: 8, t0: 52, tCold: 29.5, tBlowMin: 45, p0: 82, pBlow: 49.8, vGas: 2.5, pigArrival: 2.63 }, { tShutH: 10, t0: 48, tCold: 24.6, tBlowMin: 60, p0: 78, pBlow: 38.8, vGas: 2.8, pigArrival: 2.24 }, { tShutH: 12, t0: 48, tCold: 21.5, tBlowMin: 90, p0: 78, pBlow: 27.1, vGas: 3.1, pigArrival: 2.05 }, { tShutH: 16, t0: 48, tCold: 16.8, tBlowMin: 120, p0: 78, pBlow: 18.8, vGas: 3.4, pigArrival: 1.87 }, { tShutH: 20, t0: 45, tCold: 13.1, tBlowMin: 150, p0: 75, pBlow: 12.9, vGas: 2, pigArrival: 3.44 }, { tShutH: 24, t0: 45, tCold: 11.2, tBlowMin: 180, p0: 75, pBlow: 9, vGas: 2.6, pigArrival: 2.49 }, { tShutH: 30, t0: 45, tCold: 8.1, tBlowMin: 240, p0: 75, pBlow: 4.4, vGas: 3, pigArrival: 2.13 }],
+    validationSample: [{ tShutH: 3, t0: 50, tCold: 39.5, tBlowMin: 15, p0: 80, pBlow: 66.3, vGas: 1.8, pigArrival: 3.81 }, { tShutH: 7, t0: 50, tCold: 30, tBlowMin: 40, p0: 80, pBlow: 49.3, vGas: 2.4, pigArrival: 2.72 }, { tShutH: 11, t0: 50, tCold: 23.6, tBlowMin: 75, p0: 80, pBlow: 32.8, vGas: 2.9, pigArrival: 2.22 }, { tShutH: 15, t0: 46, tCold: 17.6, tBlowMin: 110, p0: 76, pBlow: 20.7, vGas: 3.2, pigArrival: 1.97 }, { tShutH: 22, t0: 46, tCold: 12.8, tBlowMin: 160, p0: 76, pBlow: 11.6, vGas: 2.3, pigArrival: 2.83 }, { tShutH: 28, t0: 46, tCold: 9.3, tBlowMin: 210, p0: 76, pBlow: 6.3, vGas: 2.7, pigArrival: 2.37 }],
   },
   verify,
   live: { key: 'log', label: 'Operating log', help: 'Follow a SCADA / historian export (CSV with time in hours, rate in % of the case rate, choke opening in %, inlet pressure in bara and arrival temperature in °C); the replay and the residual correction update as rows arrive.' },

@@ -401,9 +401,9 @@ export function binomialOption({ S, K, r, sigma, T, q = 0, steps = 100, type = '
   const n = Math.max(1, Math.round(steps)), pay = payoff || ((s) => (type === 'call' ? Math.max(s - K, 0) : Math.max(K - s, 0)));
   if (!(sigma > 0) || !(T > 0) || !(S > 0)) return { value: pay(Math.max(S, 0)), u: 1, d: 1, p: 0.5, steps: n };
   const dt = T / n, u = Math.exp(sigma * Math.sqrt(dt)), d = 1 / u, p = clamp((Math.exp((r - q) * dt) - d) / (u - d), 0, 1), disc = Math.exp(-r * dt);
-  const V = new Array(n + 1);
-  for (let i = 0; i <= n; i++) V[i] = pay(S * u ** (n - i) * d ** i);
-  for (let s = n - 1; s >= 0; s--) for (let i = 0; i <= s; i++) { const cont = disc * (p * V[i] + (1 - p) * V[i + 1]); V[i] = american ? Math.max(cont, pay(S * u ** (s - i) * d ** i)) : cont; }
+  const V = new Array(n + 1), d2 = d * d;
+  for (let i = 0, x = S * u ** n; i <= n; i++, x *= d2) V[i] = pay(x);
+  for (let s = n - 1; s >= 0; s--) for (let i = 0, x = S * u ** s; i <= s; i++, x *= d2) { const cont = disc * (p * V[i] + (1 - p) * V[i + 1]); V[i] = american ? Math.max(cont, pay(x)) : cont; }
   return { value: V[0], u, d, p, steps: n };
 }
 /** Minimax-regret choice. payoff[alt][scenario] (higher is better). Returns { regret, maxRegret: [], best (index) }. */
@@ -665,45 +665,47 @@ export function capexEstimate(c) {
  * detail = false returns only the NPV (fast path for sampling). Sign convention: receipts positive, payments negative in `fcf`.
  */
 export function cashflow(p, m = {}, detail = true) {
+  // every project field is read once into a local: the year loop then runs on plain variables
+  const { phase, life: lifeP, lifeCut, discount, regime, uptime, infl, costEsc, priceEsc, carbonEsc, abandon: abandonC, abandonProvision, capexSunk, residual, capex: capexT, mid, gearing, loanRate, oil: oilA, gas: gasA, deferFrac, water: waterA, oilPrice, gasPrice, royalty, opexFixed, opexVarBoe, waterCost, opexDown, opexBlock, carbonT, carbonPrice, includeRisk, haz, consequence, deprFrac, loanTenor, costOilCap, profitSplit, taxRate, wcDays } = p;
   const mPrice = m.price ?? 1, mProd = m.prod ?? 1, mCapex = m.capex ?? 1, mOpex = m.opex ?? 1, mDown = m.downtime ?? 1, mFail = m.failFreq ?? 1, mRep = m.repair ?? 1;
-  const nCon = p.phase.length, life = Math.max(1, Math.min(p.life, p.lifeCut ?? p.life)), K = nCon + life + 1, r = p.discount, psc = p.regime === 'psc';
-  const down = clamp((1 - p.uptime) * mDown, 0, 0.95), avail = 1 - down, cg = (1 + p.infl) * (1 + p.costEsc), pg = (1 + p.infl) * (1 + p.priceEsc), kg = (1 + p.infl) * (1 + p.carbonEsc);
-  const abNom = p.abandon * cg ** (nCon + life), accr = p.abandonProvision ? abNom / life : 0;
-  let deprBase = (p.capexSunk || 0) + (p.residual || 0);
-  for (let k = 0; k < nCon; k++) deprBase += p.capex * mCapex * p.phase[k] * cg ** k;
+  const nCon = phase.length, life = Math.max(1, Math.min(lifeP, lifeCut ?? lifeP)), K = nCon + life + 1, r = discount, psc = regime === 'psc', mPath = m.path, mEv = m.events;
+  const down = clamp((1 - uptime) * mDown, 0, 0.95), avail = 1 - down, cg = (1 + infl) * (1 + costEsc), pg = (1 + infl) * (1 + priceEsc), kg = (1 + infl) * (1 + carbonEsc);
+  const abNom = abandonC * cg ** (nCon + life), accr = abandonProvision ? abNom / life : 0;
+  let deprBase = (capexSunk || 0) + (residual || 0);
+  for (let k = 0; k < nCon; k++) deprBase += capexT * mCapex * phase[k] * cg ** k;
   let book = deprBase, pool = 0, poolL = 0, rec = 0, wcPrev = 0, defOil = 0, defGas = 0, npvSum = 0, cum = 0, cumD = 0, debt = 0, pay = 0;
   const D = detail ? Object.fromEntries(['year', 'oil', 'gas', 'boe', 'potBoe', 'lostBoe', 'defBoe', 'water', 'revenue', 'royalty', 'govShare', 'opex', 'carbon', 'risk', 'ocf', 'depreciation', 'taxable', 'tax', 'atcf', 'capex', 'dwc', 'abandon', 'fcf', 'cum', 'df', 'dcf', 'cumDcf', 'real', 'interest', 'debtService', 'equity', 'price'].map((k) => [k, zeros(K)])) : null;
   for (let k = 0; k < K; k++) {
-    const j = k - nCon, cgk = cg ** k, df = (1 + r) ** -(p.mid && k > 0 ? k - 0.5 : k), capex = k < nCon ? p.capex * mCapex * p.phase[k] * cgk : 0;
+    const j = k - nCon, cgk = cg ** k, df = (1 + r) ** -(mid && k > 0 ? k - 0.5 : k), capex = k < nCon ? capexT * mCapex * phase[k] * cgk : 0;
     let rev = 0, roy = 0, gov = 0, opex = 0, carbon = 0, risk = 0, ocf = 0, dep = 0, taxable = 0, tax = 0, taxL = 0, dwc = 0, ab = 0, oil = 0, gas = 0, boe = 0, pot = 0, lost = 0, defd = 0, water = 0, interest = 0, service = 0, draw = 0, priceF = 0;
     if (psc && capex > 0) rec += capex;
-    if (p.gearing > 0 && k < nCon) { draw = p.gearing * capex; debt = debt * (1 + p.loanRate) + draw; }
+    if (gearing > 0 && k < nCon) { draw = gearing * capex; debt = debt * (1 + loanRate) + draw; }
     if (j >= 0 && j < life) {
-      const pOil = p.oil[j] * mProd, pGas = p.gas[j] * mProd;
-      oil = pOil * avail; gas = pGas * avail; defOil += pOil * down * p.deferFrac; defGas += pGas * down * p.deferFrac;
-      pot = pOil + pGas / MMBTU_PER_BOE; defd = pot * down * p.deferFrac; lost = pot * down * (1 - p.deferFrac);
+      const pOil = oilA[j] * mProd, pGas = gasA[j] * mProd;
+      oil = pOil * avail; gas = pGas * avail; defOil += pOil * down * deferFrac; defGas += pGas * down * deferFrac;
+      pot = pOil + pGas / MMBTU_PER_BOE; defd = pot * down * deferFrac; lost = pot * down * (1 - deferFrac);
       if (j === life - 1) { oil += defOil; gas += defGas; defd -= (defOil + defGas / MMBTU_PER_BOE); } // deferred barrels come back in the last year
-      boe = oil + gas / MMBTU_PER_BOE; water = p.water[j] * mProd * avail;
-      priceF = pg ** k * mPrice * (m.path ? m.path[k] : 1);
-      rev = (oil * p.oilPrice + gas * p.gasPrice) * priceF; roy = p.royalty * rev;
-      opex = ((p.opexFixed + p.opexVarBoe * boe + p.waterCost * water) * mOpex + p.opexDown * mDown * mOpex + p.opexBlock * mFail * mRep) * cgk;
-      carbon = p.carbonT * p.carbonPrice * kg ** k;
-      if (p.includeRisk) risk = (m.events ? (m.events[j] < p.haz[j] * mFail ? 1 : 0) : p.haz[j] * mFail) * p.consequence * mRep * cgk;
-      dep = j === life - 1 ? book : Math.min(book, deprBase * p.deprFrac[j]); book -= dep;
-      if (j === 0 && debt > 0) pay = debt * capitalRecovery(p.loanRate, Math.max(1, Math.min(p.loanTenor, life)));
-      if (debt > 1e-6) { interest = debt * p.loanRate; service = Math.min(pay, debt + interest); debt -= service - interest; }
+      boe = oil + gas / MMBTU_PER_BOE; water = waterA[j] * mProd * avail;
+      priceF = pg ** k * mPrice * (mPath ? mPath[k] : 1);
+      rev = (oil * oilPrice + gas * gasPrice) * priceF; roy = royalty * rev;
+      opex = ((opexFixed + opexVarBoe * boe + waterCost * water) * mOpex + opexDown * mDown * mOpex + opexBlock * mFail * mRep) * cgk;
+      carbon = carbonT * carbonPrice * kg ** k;
+      if (includeRisk) risk = (mEv ? (mEv[j] < haz[j] * mFail ? 1 : 0) : haz[j] * mFail) * consequence * mRep * cgk;
+      dep = j === life - 1 ? book : Math.min(book, deprBase * deprFrac[j]); book -= dep;
+      if (j === 0 && debt > 0) pay = debt * capitalRecovery(loanRate, Math.max(1, Math.min(loanTenor, life)));
+      if (debt > 1e-6) { interest = debt * loanRate; service = Math.min(pay, debt + interest); debt -= service - interest; }
       if (psc) {
         const net = rev - roy; rec += opex + carbon + risk;
-        const costOil = Math.min(rec, p.costOilCap * net), profit = net - costOil; rec -= costOil;
-        gov = (1 - p.profitSplit) * profit; ocf = rev - roy - gov - opex - carbon - risk;
-        taxable = p.profitSplit * profit; tax = taxL = p.taxRate * Math.max(taxable, 0);
+        const costOil = Math.min(rec, costOilCap * net), profit = net - costOil; rec -= costOil;
+        gov = (1 - profitSplit) * profit; ocf = rev - roy - gov - opex - carbon - risk;
+        taxable = profitSplit * profit; tax = taxL = taxRate * Math.max(taxable, 0);
       } else {
         ocf = rev - roy - opex - carbon - risk; taxable = ocf - dep - accr;
-        if (taxable < 0) pool -= taxable; else { const use = Math.min(pool, taxable); pool -= use; tax = p.taxRate * (taxable - use); }
+        if (taxable < 0) pool -= taxable; else { const use = Math.min(pool, taxable); pool -= use; tax = taxRate * (taxable - use); }
         const tl = taxable - interest; // levered tax base for the equity view
-        if (tl < 0) poolL -= tl; else { const use = Math.min(poolL, tl); poolL -= use; taxL = p.taxRate * (tl - use); }
+        if (tl < 0) poolL -= tl; else { const use = Math.min(poolL, tl); poolL -= use; taxL = taxRate * (tl - use); }
       }
-      const wc = (p.wcDays / 365) * rev; dwc = wc - wcPrev; wcPrev = wc;
+      const wc = (wcDays / 365) * rev; dwc = wc - wcPrev; wcPrev = wc;
     } else if (k === K - 1) { ab = abNom; dwc = -wcPrev; wcPrev = 0; }
     const fcf = ocf - tax - capex - dwc - ab;
     npvSum += fcf * df;
@@ -712,7 +714,7 @@ export function cashflow(p, m = {}, detail = true) {
       const set = (key, val) => (D[key][k] = val);
       set('year', k); set('oil', oil); set('gas', gas); set('boe', boe); set('potBoe', pot); set('lostBoe', lost); set('defBoe', defd); set('water', water); set('revenue', rev); set('royalty', roy); set('govShare', gov); set('opex', opex); set('carbon', carbon); set('risk', risk);
       set('ocf', ocf); set('depreciation', dep); set('taxable', taxable); set('tax', tax); set('atcf', ocf - tax); set('capex', capex); set('dwc', dwc); set('abandon', ab); set('fcf', fcf); set('cum', cum); set('df', df); set('dcf', fcf * df); set('cumDcf', cumD);
-      set('real', fcf / (1 + p.infl) ** (p.mid && k > 0 ? k - 0.5 : k)); set('interest', interest); set('debtService', service); set('equity', ocf - taxL - capex - dwc - ab + draw - service); set('price', p.oilPrice * priceF);
+      set('real', fcf / (1 + infl) ** (mid && k > 0 ? k - 0.5 : k)); set('interest', interest); set('debtService', service); set('equity', ocf - taxL - capex - dwc - ab + draw - service); set('price', oilPrice * priceF);
     }
   }
   if (!detail) return npvSum;
@@ -751,18 +753,28 @@ export function hazardRate(t, { h0 = 0, beta = 3, remLife = 25, pEnd = 0.1 }) {
   return h0 + (t > 0 ? (beta / eta) * (t / eta) ** (beta - 1) : beta === 1 ? 1 / eta : 0);
 }
 /**
- * Lifecycle cost of an inspection interval (risk-based inspection). The wear-out age is reduced to (1 − PoD)·age at every
- * inspection (Kijima virtual age), so more frequent or better inspections cut the expected failure cost.
- * { interval (y), life, inspCost, consequence, h0, beta, remLife, pEnd, pod, rate, age0 }. Returns { total, inspection, failure, pFail (life sum of annual probabilities), hMax (largest annual failure probability) }.
+ * Annual failure probabilities over the life with periodic inspection. The wear-out age is reduced to (1 − PoD)·age at every
+ * inspection (Kijima virtual age), so more frequent or better inspections lower the later hazard.
+ * { interval (y), life, h0, beta, remLife, pEnd, pod, age0 }. Returns { haz: [], times: [] (inspection times, y) }.
  */
-export function inspectionCost({ interval, life, inspCost, consequence, h0, beta, remLife, pEnd, pod, rate, age0 = 0 }) {
-  let age = age0, insp = 0, fail = 0, pf = 0, hMax = 0, next = interval;
+export function hazardSchedule({ interval, life, h0, beta, remLife, pEnd, pod, age0 = 0 }) {
+  const haz = [], times = [];
+  let age = age0, next = interval > 0 ? interval : Infinity;
   for (let y = 0; y < life; y++) {
-    const h = Math.min(1, hazardRate(age + 0.5, { h0, beta, remLife, pEnd })), df = (1 + rate) ** -(y + 1);
-    fail += h * consequence * df; pf += h; hMax = Math.max(hMax, h); age += 1;
-    while (next <= y + 1 + 1e-9 && next < life - 1e-9) { insp += inspCost * (1 + rate) ** -next; age = y + 1 - next + (1 - pod) * (age - (y + 1 - next)); next += interval; }
+    haz.push(Math.min(1, hazardRate(age + 0.5, { h0, beta, remLife, pEnd })));
+    age += 1;
+    while (next <= y + 1 + 1e-9 && next < life - 1e-9) { times.push(next); age = y + 1 - next + (1 - pod) * (age - (y + 1 - next)); next += interval; }
   }
-  return { total: insp + fail, inspection: insp, failure: fail, pFail: pf, hMax };
+  return { haz, times };
+}
+/**
+ * Lifecycle cost of an inspection interval (risk-based inspection): discounted inspection campaigns plus expected failure cost.
+ * { interval, life, inspCost, consequence, h0, beta, remLife, pEnd, pod, rate, age0 }.
+ * Returns { total, inspection, failure, pFail (life sum of annual probabilities), hMax (largest annual failure probability) }.
+ */
+export function inspectionCost(o) {
+  const { haz, times } = hazardSchedule(o), fail = sum(haz.map((h, y) => h * o.consequence * (1 + o.rate) ** -(y + 1))), insp = sum(times.map((t) => o.inspCost * (1 + o.rate) ** -t));
+  return { total: insp + fail, inspection: insp, failure: fail, pFail: sum(haz), hMax: Math.max(...haz) };
 }
 
 // ================================================================================================================
@@ -876,7 +888,7 @@ function context(q, S) {
   const qLiq0 = q.qOil + (q.qOil * (q.wc0 / 100)) / (1 - Math.min(q.wc0, 98) / 100), pAvail = (x) => S.base.pIn + q.chokeDp + ((1 - x) * qLiq0) / q.pi;
   const X = { life, nCon, infl, r, rr, cg, pvf, up, prof, marginH, lossFrac, enPrice, enCarbon, heatPrice, capexArgs, qLiq0, pAvail, waterMean: mean(prof.water) / 365, waterPeak: Math.max(...prof.water) / 365, wcMean: prof.wcAt(life / 2) };
   const h0 = q.ealOverride > 0 && q.consequence > 0 ? q.ealOverride / q.consequence : q.pof;
-  X.h0 = h0; X.haz = prof.oil.map((_, j) => Math.min(1, hazardRate(j + 0.5, { h0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100 })));
+  X.h0 = h0; X.haz = hazardSchedule({ interval: q.inspInterval, life, h0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100, pod: q.pod / 100 }).haz; // failure probability with the current inspection programme
   X.deprFrac = q.deprMethod === 'uop' ? null : depreciation(q.deprMethod, 1, q.deprLife, { years: life, rate: q.dbRate / 100 });
   X.blockCost = q.remedDays * q.spreadRate * 1000 + (q.blockDays + q.vesselWait) * 24 * marginH * lossFrac; // remediation spread + outage, including the wait for a vessel
   X.capexNone = capexEstimate({ ...capexArgs, brief: true, strategy: 'none', insT: 0, megRate: 0, chemRate: 0, heatKW: 0 }).total;
@@ -922,7 +934,7 @@ function strategyModel(key, q, S, X, over = {}) {
       o.note = `continuous methanol ${rate.toFixed(1)} m³/d (${o.inhWt.toFixed(0)} wt %) because steady flow is ${need.toFixed(1)} °C inside the hydrate margin`;
     }
     if (key === 'deh') {
-      o.heatKW = (U * Math.PI * S.id * X.capexArgs.flowLen * Math.max(S.base.tHydShut + q.hydMargin + 5 - S.Ta, 0)) / 0.75 / 1000;
+      o.heatKW = q.heatKW > 0 ? q.heatKW : (U * Math.PI * S.id * X.capexArgs.flowLen * Math.max(S.base.tHydShut + q.hydMargin + 5 - S.Ta, 0)) / 0.75 / 1000; // hold power: published by operations, else heat loss at the hold temperature over 75 % efficiency
       o.kWh = nLong * q.shutdownMean * o.heatKW; o.energy = o.kWh * q.elecPrice; o.events = (nLong * 0.03 + (need > 0 ? 12 * (1 - av) : 0)) * q.plugProb; o.note = o.note || `${o.heatKW.toFixed(0)} kW of heating holds the line above the hydrate temperature`;
     } else {
       const vol = nLong * volShut * treat; o.chemRate = Math.max(o.chemRate, Math.min(volShut, 100)); // skid sized to dose the line contents within a day
@@ -934,7 +946,6 @@ function strategyModel(key, q, S, X, over = {}) {
     const meg = q.inhibitor === 'MEG', price = meg ? q.megPrice * (q.megLoss / 100) : q.inhibitor === 'LDHI' ? q.ldhiPrice : q.meohPrice;
     o.chem = over.inhibRate * price * 365 * up; o.chemT = over.inhibRate * 365 * up * (meg ? (1.113 * EF.MEG * q.megLoss) / 100 : q.inhibitor === 'LDHI' ? 0.95 * EF.LDHI : 0.792 * EF.MeOH); o.chemRate = Math.max(o.chemRate, over.inhibRate);
   }
-  if (over.heatKW > 0) { o.kWh += over.heatKW * 8760 * up; o.energy += over.heatKW * 8760 * up * X.enPrice; }
   o.pigRuns = q.pigRuns * (1 + Math.max(q.wat - th.tArr, 0) / 10); o.pig = o.pigRuns * q.pigCost * 1000;
   o.block = o.events * X.blockCost; o.deferral = o.extraDownH * X.marginH * X.lossFrac;
   o.carbonT = o.chemT + (o.kWh * X.enCarbon) / 1000 + (o.heatGJ * EF.fuelGJ) / 0.85 + o.events * q.remedDays * EF.vesselDay;
@@ -945,6 +956,7 @@ function strategyModel(key, q, S, X, over = {}) {
   if (v2 > 0) o.viol.push(`cooldown ${cdH.toFixed(1)} h shorter than the required ${q.minCooldown} h`);
   if (v3 > 0) o.viol.push(`continuous inhibitor demand ${o.contRate.toFixed(0)} m³/d above the ${q.maxInject} m³/d injection capacity`);
   if (key === 'risk' && need > 0) o.viol.push('steady flow inside the hydrate region with no inhibition');
+  if (key === 'risk' && shutNeed > 0 && nLong >= 0.05) o.viol.push(`${nLong.toFixed(1)} shutdowns a year outlast the ${cdH.toFixed(0)} h cooldown and would leave the line inside the hydrate region with no preservation`);
   if (!o.feasible) o.viol.push(o.note);
   o.vio = v1 * v1 + v2 * v2 + v3 * v3 + (o.viol.length > (v1 > 0) + (v2 > 0) + (v3 > 0) ? 1 : 0); o.safe = o.viol.length === 0;
   return o;
@@ -984,7 +996,7 @@ function buildProject(q, S, X, sm, capex, over = {}) {
 }
 /** Strategy → CAPEX → project in one call (used by every option study). */
 function optionProject(key, q, S, X, over = {}) {
-  const sm = strategyModel(key, q, S, X, over), capex = capexEstimate({ ...X.capexArgs, brief: !!over.brief, strategy: key, insT: sm.insT, megRate: sm.megRate, chemRate: sm.chemRate, heatKW: sm.heatKW, ...(over.capex || {}) });
+  const sm = strategyModel(key, q, S, X, over), capex = capexEstimate(Object.assign(Object.create(X.capexArgs), { brief: !!over.brief, strategy: key, insT: sm.insT, megRate: sm.megRate, chemRate: sm.chemRate, heatKW: sm.heatKW }, over.capex));
   return { sm, capex, p: buildProject(q, S, X, sm, capex, over) };
 }
 
@@ -1004,7 +1016,7 @@ async function run(v, ctx = {}) {
 
   // ---------------------------------------------------------------- base project, cash flow, metrics
   prog(0.42, 'Cash flow and investment metrics');
-  let base = optionProject(sel, q, S, X, { inhibRate: q.inhibRate, heatKW: q.heatKW }), p0 = base.p, cf = cashflow(p0), met = investmentMetrics(cf, p0), lifeEff = q.life;
+  let base = optionProject(sel, q, S, X, { inhibRate: q.inhibRate }), p0 = base.p, cf = cashflow(p0), met = investmentMetrics(cf, p0), lifeEff = q.life;
   const limit0 = met.economicLimit;
   if (q.stopAtLimit && limit0 !== null && limit0 >= 1 && limit0 < q.life) { lifeEff = limit0; p0 = { ...p0, lifeCut: lifeEff }; base.p = p0; cf = cashflow(p0); met = investmentMetrics(cf, p0); }
   X.lifeCut = lifeEff;
@@ -1014,14 +1026,14 @@ async function run(v, ctx = {}) {
   // break-evens (root finding on the fast cash-flow path)
   const up = X.up, inhPrice = q.inhibitor === 'MEG' ? q.megPrice : q.inhibitor === 'LDHI' ? q.ldhiPrice : q.meohPrice;
   const be = {
-    price: breakeven((x) => cashflow({ ...p0, oilPrice: x }, {}, false), 0, 3000),
+    price: cashflow({ ...p0, oilPrice: 0 }, {}, false) > 0 ? 0 : breakeven((x) => cashflow({ ...p0, oilPrice: x }, {}, false), 0, 3000),
     prod: breakeven((x) => cashflow(p0, { prod: x }, false), 0.005, 50),
     capex: breakeven((x) => cashflow(p0, { capex: x }, false), 0.01, 100),
     inhib: breakeven((x) => cashflow({ ...p0, opexFixed: p0.opexFixed + x * inhPrice * 365 * up }, {}, false), 0, 1e6),
     block: breakeven((x) => cashflow({ ...p0, opexBlock: x * X.blockCost }, {}, false), 0, 1e4),
     uptime: breakeven((x) => cashflow({ ...p0, uptime: x }, {}, false), 0.05, 1),
   };
-  const bePriceCheck = be.price === null ? 0 : cashflow({ ...p0, oilPrice: be.price }, {}, false);
+  const bePriceCheck = be.price === null || be.price === 0 ? 0 : cashflow({ ...p0, oilPrice: be.price }, {}, false);
 
   // ---------------------------------------------------------------- hybrid 1: flow-assurance strategies
   prog(0.48, 'Flow-assurance strategy comparison');
@@ -1035,7 +1047,7 @@ async function run(v, ctx = {}) {
   const byLcc = [...safeOpts.slice().sort(byCost), ...options.filter((o) => !o.sm.safe).sort(byCost)], bestOpt = byLcc[0], selOpt = options.find((o) => o.key === sel);
 
   // ---------------------------------------------------------------- hybrid 2: insulation thickness optimum
-  const tGrid = linspace(0, q.tMaxMm, Math.round(q.tMaxMm) + 1), insCurve = tGrid.map((t) => { const o = optionProject('wet', q, S, X, { insT: t / 1000, brief: true }), s = o.sm; return { t, safe: s.safe, capex: o.capex.total - X.capexNone, opex: pvfL * (s.chem + s.energy + s.pig + s.shutdown), defer: pvfL * s.deferral, block: pvfL * s.block, carbon: pvfK * s.carbonT * q.carbonPrice, tArr: s.tArr, sub: s.sub, cd: s.cooldownH, o }; });
+  const tGrid = linspace(0, q.tMaxMm, Math.round(q.tMaxMm / 2) + 1), insCurve = tGrid.map((t) => { const o = optionProject('wet', q, S, X, { insT: t / 1000, brief: true }), s = o.sm; return { t, safe: s.safe, capex: o.capex.total - X.capexNone, opex: pvfL * (s.chem + s.energy + s.pig + s.shutdown), defer: pvfL * s.deferral, block: pvfL * s.block, carbon: pvfK * s.carbonT * q.carbonPrice, tArr: s.tArr, sub: s.sub, cd: s.cooldownH, o }; });
   insCurve.forEach((c) => (c.lcc = c.capex + c.opex + c.defer + c.block + c.carbon));
   const insSafe = insCurve.filter((c) => c.safe), insPool = insSafe.length ? insSafe : insCurve, insOpt = insPool[argBest(insPool.map((c) => -c.lcc))], iOpt = insCurve.indexOf(insOpt), insFree = insCurve[argBest(insCurve.map((c) => -c.lcc))], insSel = insCurve[argBest(insCurve.map((c) => -Math.abs(c.t - q.insMm)))], insBare = insCurve[0];
 
@@ -1044,15 +1056,15 @@ async function run(v, ctx = {}) {
   const diam = S.diam.map((d) => {
     if (d.failed) return { ...d, feasible: false, npv: null, why: d.failed };
     const need = (x) => S.pInOf(x, d.dpFric, d.dpGrav) - X.pAvail(x), rate = need(1) <= 0 ? 1 : need(0.05) >= 0 ? 0.05 : brent(need, 0.05, 1, 1e-9), wtD = (S.wt * d.d) / S.id;
-    const o = optionProject(sel, q, S, X, { rate, thermal: { tArr: d.tArr, sub: d.sub }, profile: profileOf(q, rate), capex: { id: d.d, wt: wtD, slugVol: d.slugVol }, inhibRate: q.inhibRate, heatKW: q.heatKW, brief: true }), er = (d.eros * rate * S.base.eros) / Math.max(S.base.erosKernel, 1e-9), pInD = S.pInOf(rate, d.dpFric, d.dpGrav), feasible = er <= 1 && pInD <= q.mawp;
+    const o = optionProject(sel, q, S, X, { rate, thermal: sel === 'bare' || sel === 'pip' ? undefined : { tArr: d.tArr, sub: d.sub }, profile: profileOf(q, rate), capex: { id: d.d, wt: wtD, slugVol: d.slugVol }, inhibRate: q.inhibRate, brief: true }), er = (d.eros * rate * S.base.eros) / Math.max(S.base.erosKernel, 1e-9), pInD = S.pInOf(rate, d.dpFric, d.dpGrav), feasible = er <= 1 && pInD <= q.mawp;
     return { ...d, eros: er / Math.max(rate, 1e-9), pInD, rate, feasible, capexTotal: o.capex.total, slugCost: o.capex.items.find((i) => i.item.startsWith('Slug catcher'))?.cost ?? 0, npv: cashflow(cut(o.p), {}, false), why: feasible ? (rate < 0.999 ? 'back-pressure limits the rate' : 'full rate') : er > 1 ? 'excluded: erosional velocity exceeded' : 'excluded: inlet pressure above the design pressure' };
   });
   const dOk = diam.filter((d) => d.feasible && d.npv !== null), dBest = dOk.length ? dOk[argBest(dOk.map((d) => d.npv))] : null, dBase = diam.find((d) => d.mult === 1);
 
   // ---------------------------------------------------------------- hybrid 6: NPV-optimal operating point (rate, preservation fraction)
-  const pen = (x) => sum(X.constraints(x).map((c) => Math.max(0, c.g) ** 2)), opProj = (x, t, key = sel) => optionProject(key, q, S, X, { rate: x, treat: t, profile: profileOf(q, x), inhibRate: key === sel ? q.inhibRate : 0, heatKW: key === sel ? q.heatKW : 0, brief: true });
+  const pen = (x) => sum(X.constraints(x).map((c) => Math.max(0, c.g) ** 2)), opProj = (x, t, key = sel) => optionProject(key, q, S, X, { rate: x, treat: t, profile: profileOf(q, x), inhibRate: key === sel ? q.inhibRate : 0, brief: true });
   const evalOp = (x, t, key) => { const o = opProj(x, t, key); return { npv: cashflow(cut(o.p), {}, false), vio: o.sm.vio }; }, npvOp = (x, t, key) => evalOp(x, t, key).npv, vio0 = selOpt.sm.vio;
-  const penAll = (x, t, key) => pen(x) + Math.max(0, evalOp(x, t, key).vio - (key && key !== sel ? 0 : vio0)), fOp = (z) => { const e = evalOp(z[0], z[1]); return -e.npv / MM + 1e5 * (pen(z[0]) + Math.max(0, e.vio - vio0)); }, lo = [Math.max(0.2, X.rMin - 0.2), 0], hi = [X.rMax + 0.2, 1], z0 = [1, 1];
+  const penAll = (x, t, key) => pen(x) + Math.max(0, evalOp(x, t, key).vio - (key && key !== sel ? 0 : vio0)), W = 1e8, fOp = (z) => { const e = evalOp(z[0], z[1]); return -e.npv / MM + W * (pen(z[0]) + Math.max(0, e.vio - vio0)); }, lo = [Math.max(0.2, X.rMin - 0.2), 0], hi = [X.rMax + 0.2, 1], z0 = [1, 1];
   const solvers = [
     ['Nelder–Mead simplex', () => { const r = nelderMead(fOp, z0, { lo, hi, tol: 1e-9, maxIter: 70, scale: 0.15 }); return { x: r.x, f: r.f, evals: r.evals }; }],
     ['Projected gradient (finite differences)', () => gradientDescent(fOp, z0, { lo, hi, maxIter: 20 })],
@@ -1060,16 +1072,17 @@ async function run(v, ctx = {}) {
     ['Genetic algorithm', () => geneticAlgorithm(fOp, lo, hi, { pop: 14, gens: 11, seed: q.seed })],
     ['Particle swarm', () => particleSwarm(fOp, lo, hi, { n: 10, iters: 14, seed: q.seed })],
   ].map(([name, fn]) => { const r = fn(); return { name, x: r.x, f: r.f, evals: r.evals ?? null, npv: npvOp(r.x[0], r.x[1]), pen: penAll(r.x[0], r.x[1]) }; });
-  const feasS = solvers.filter((s) => s.pen < 1e-6), opBest = (feasS.length ? feasS : solvers).reduce((a, s) => (s.f < a.f ? s : a)), opCons = X.constraints(opBest.x[0]), active = opCons.filter((c) => Math.abs(c.g) < 0.01).map((c) => c.name);
-  const rGrid = linspace(lo[0], hi[0], 31), rateCurve = rGrid.map((x) => ({ r: x, npv: npvOp(x, 1), ok: pen(x) < 1e-9 })), envOk = rateCurve.filter((c) => c.ok && c.npv > 0), envelope = envOk.length ? { lo: envOk[0].r, hi: envOk[envOk.length - 1].r } : null;
+  const feasS = solvers.filter((s) => s.pen < 1e-7), opBest = (feasS.length ? feasS : solvers).reduce((a, s) => (s.f < a.f ? s : a)), opCons = X.constraints(opBest.x[0]), active = opCons.filter((c) => Math.abs(c.g) < 0.005).map((c) => c.name);
+  const rGrid = linspace(lo[0], hi[0], 31), inEnv = (x) => pen(x) < 1e-9 && npvOp(x, 1) > 0, rateCurve = rGrid.map((x) => ({ r: x, npv: npvOp(x, 1), ok: pen(x) < 1e-9 })), envOk = rateCurve.filter((c) => c.ok && c.npv > 0);
+  const edge = (a, b) => { for (let i = 0; i < 14; i++) { const mid = 0.5 * (a + b); if (inEnv(mid)) a = mid; else b = mid; } return a; }; // a inside, b outside
+  const envelope = envOk.length ? { lo: envOk[0].r > lo[0] + 1e-9 ? edge(envOk[0].r, envOk[0].r - (rGrid[1] - rGrid[0])) : envOk[0].r, hi: envOk[envOk.length - 1].r < hi[0] - 1e-9 ? edge(envOk[envOk.length - 1].r, envOk[envOk.length - 1].r + (rGrid[1] - rGrid[0])) : envOk[envOk.length - 1].r } : null;
   // mixed-integer nonlinear: enumerate the discrete strategy, optimise the continuous rate inside each
-  const minlp = keys.map((k) => { const f = (z) => { const e = evalOp(z[0], 1, k); return -e.npv / MM + 1e5 * (pen(z[0]) + e.vio); }, r = nelderMead(f, [1], { lo: [lo[0]], hi: [hi[0]], tol: 1e-7, maxIter: 25, scale: 0.1 }), e = evalOp(r.x[0], 1, k); return { key: k, name: STRATEGIES[k].name, rate: r.x[0], npv: e.npv, feasible: pen(r.x[0]) + e.vio < 1e-6 }; }).sort((a, b) => b.feasible - a.feasible || b.npv - a.npv);
+  const minlp = keys.map((k) => { const f = (z) => { const e = evalOp(z[0], 1, k); return -e.npv / MM + W * pen(z[0]) + 1e3 * e.vio; }, r = nelderMead(f, [1], { lo: [lo[0]], hi: [hi[0]], tol: 1e-7, maxIter: 25, scale: 0.1 }), e = evalOp(r.x[0], 1, k); return { key: k, name: STRATEGIES[k].name, rate: r.x[0], npv: e.npv, feasible: pen(r.x[0]) < 1e-7 && e.vio === 0 }; }).sort((a, b) => b.feasible - a.feasible || b.npv - a.npv);
   await tick();
 
   // ---------------------------------------------------------------- reliability economics: inspection interval, spares, replacement
   prog(0.6, 'Reliability economics');
-  const relArg = { life: lifeEff, inspCost: q.inspCost * MM, consequence: p0.consequence, h0: p0.haz[0] - (hazardRate(0.5, { h0: 0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100 })), beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100, pod: q.pod / 100, rate: X.rr };
-  relArg.h0 = Math.max(relArg.h0, 0);
+  const relArg = { life: lifeEff, inspCost: q.inspCost * MM, consequence: p0.consequence, h0: X.h0, beta: q.weibullBeta, remLife: q.remLife, pEnd: q.pEnd / 100, pod: q.pod / 100, rate: X.rr };
   const iGrid = linspace(0.5, Math.max(1, Math.min(lifeEff, 20)), Math.round(2 * Math.max(1, Math.min(lifeEff, 20)))), rbi = iGrid.map((t) => ({ t, ...inspectionCost({ ...relArg, interval: t }) })), rbiOk = rbi.filter((x) => x.hMax <= q.maxPof), rbiPool = rbiOk.length ? rbiOk : [rbi[argBest(rbi.map((x) => -x.hMax))]], rbiBest = rbiPool[argBest(rbiPool.map((x) => -x.total))], rbiFree = rbi[argBest(rbi.map((x) => -x.total))], rbiNow = inspectionCost({ ...relArg, interval: q.inspInterval }), rbiNone = inspectionCost({ ...relArg, interval: 1e9 });
   const dayValue = 24 * X.marginH * X.lossFrac, spare = { hold: q.spareCost * MM * (X.rr + 0.03), without: q.itemFailRate * q.leadNo * dayValue * (q.spareShare / 100), with: q.itemFailRate * q.leadWith * dayValue * (q.spareShare / 100) };
   spare.saving = spare.without - spare.with - spare.hold; spare.beRate = spare.hold / Math.max((q.leadNo - q.leadWith) * dayValue * (q.spareShare / 100), 1e-9);
@@ -1082,8 +1095,7 @@ async function run(v, ctx = {}) {
   const eff = q.inhEff / 100, crAs = q.corrRate, crUn = q.corrInhibited ? crAs / Math.max(1 - eff, 0.02) : crAs, crIn = q.corrInhibited ? crAs : crAs * (1 - eff), capArgs0 = { ...X.capexArgs, strategy: sel, insT: sm0.insT, megRate: sm0.megRate, chemRate: sm0.chemRate, heatKW: sm0.heatKW };
   const matOpt = (name, rate, ca, capOver, opexY, h0f) => {
     const caUse = Math.min(ca, 10), rl = rate > 1e-6 ? caUse / rate : 1e6, cap = capexEstimate({ ...capArgs0, brief: true, ...capOver, caExtra: Math.max(caUse - q.corrAllow, 0) / 1000 }), dCap = cap.total - capex.total;
-    let fail = 0;
-    for (let j = 0; j < lifeEff; j++) fail += Math.min(1, hazardRate(j + 0.5, { h0: q.pof * h0f, beta: q.weibullBeta, remLife: Math.max(rl, 0.5), pEnd: q.pEnd / 100 })) * p0.consequence * X.cg ** (nCon + j) * discountFactor(rf, nCon + j, dOpt);
+    const hz = hazardSchedule({ interval: q.inspInterval, life: lifeEff, h0: X.h0 * h0f, beta: q.weibullBeta, remLife: Math.max(rl, 0.5), pEnd: q.pEnd / 100, pod: q.pod / 100 }).haz, fail = sum(hz.map((h, j) => h * p0.consequence * X.cg ** (nCon + j) * discountFactor(rf, nCon + j, dOpt)));
     const repl = rl < lifeEff ? cap.pipeInstalled * X.cg ** (nCon + rl) * discountFactor(rf, nCon + rl) : 0;
     return { name, rate, ca: caUse, life: Math.min(rl, 999), dCap, opex: pvfL * opexY, fail, repl, lcc: dCap + pvfL * opexY + fail + repl, practical: ca <= 10 };
   };
@@ -1091,8 +1103,8 @@ async function run(v, ctx = {}) {
 
   // ---------------------------------------------------------------- uncertainty: sampling, scenarios, sensitivities
   prog(0.66, 'Monte Carlo simulation');
-  const ds = VARS.map((id) => q.dists[id]), Rm = rng(q.seed + 17), alpha = q.alpha / 100;
-  const mc = monteCarlo((x) => { const m = mOf(x); if (q.priceModel !== 'static') m.path = pricePath(q.priceModel, K, Rm, { sigma: q.priceVol / 100, kappa: q.priceKappa }); if (q.failEvents) m.events = Array.from({ length: lifeEff }, () => Rm.uniform()); return cashflow(pR, m, false); }, ds, { n: q.nMC, method: q.sampling, corr: q.corr, seed: q.seed, alpha });
+  const ds = VARS.map((id) => q.dists[id]), Rm = rng(q.seed + 17), alpha = q.alpha / 100, evBuf = zeros(lifeEff);
+  const mc = monteCarlo((x) => { const m = mOf(x); if (q.priceModel !== 'static') m.path = pricePath(q.priceModel, K, Rm, { sigma: q.priceVol / 100, kappa: q.priceKappa }); if (q.failEvents) { for (let j = 0; j < lifeEff; j++) evBuf[j] = Rm.uniform(); m.events = evBuf; } return cashflow(pR, m, false); }, ds, { n: q.nMC, method: q.sampling, corr: q.corr, seed: q.seed, alpha });
   if (mc.shrink > 0) warn('warn', `The correlation matrix is not positive definite; its off-diagonal terms were shrunk by ${(mc.shrink * 100).toFixed(0)} % before sampling.`);
   const conv = []; { let s = 0; const step = Math.max(1, Math.floor(mc.y.length / 60)); mc.y.forEach((y, i) => { s += y; if ((i + 1) % step === 0 || i === mc.y.length - 1) conv.push({ n: i + 1, mean: s / (i + 1) }); }); }
   const se = mc.sd / Math.sqrt(mc.n), ce = certaintyEquivalent(mc.y, q.riskTol * MM);
@@ -1105,7 +1117,7 @@ async function run(v, ctx = {}) {
 
   // ---------------------------------------------------------------- hybrid 7: insulation decision under uncertainty (common random numbers)
   prog(0.74, 'Probabilistic lifecycle optimisation');
-  const crn = sampleCorrelated(ds, { n: q.nMCopt, method: 'lhs', corr: q.corr, seed: q.seed + 5 }).X.map(mOf), probIns = insCurve.filter((c, i) => (i % Math.max(1, Math.round(insCurve.length / 15)) === 0 || i === iOpt) && (c.safe || !insSafe.length)).map((c) => { const pp = { ...cut(c.o.p), includeRisk: true }, st = riskStats(crn.map((m) => cashflow(pp, m, false)), alpha); return { t: c.t, mean: st.mean, cvar: st.cvar, p10: st.p10 }; });
+  const crn = sampleCorrelated(ds, { n: q.nMCopt, method: 'lhs', corr: q.corr, seed: q.seed + 5 }).X.map(mOf), probIns = insCurve.filter((c, i) => (i % Math.max(1, Math.round(insCurve.length / 10)) === 0 || i === iOpt) && (c.safe || !insSafe.length)).map((c) => { const pp = { ...cut(c.o.p), includeRisk: true }, st = riskStats(crn.map((m) => cashflow(pp, m, false)), alpha); return { t: c.t, mean: st.mean, cvar: st.cvar, p10: st.p10 }; });
   const pMean = probIns[argBest(probIns.map((c) => c.mean))], pCvar = probIns[argBest(probIns.map((c) => c.cvar))];
   await tick();
 
@@ -1129,7 +1141,7 @@ async function run(v, ctx = {}) {
   const invPV = sum(cf.capex.map((c, k) => c * cf.df[k])), Vop = Math.max(npv0 + invPV, 0), sig = q.optVol / 100, rfree = q.riskFree / 100, yld = q.optYield / 100, optArg = { S: Vop, K: Math.max(invPV, 1), r: rfree, sigma: sig, T: q.optYears, q: yld };
   const defer = binomialOption({ ...optArg, steps: q.nLattice, type: 'call', american: true }).value, deferEu = binomialOption({ ...optArg, steps: q.nLattice, type: 'call' }).value, bs = blackScholes({ ...optArg, type: 'call' });
   const expand = binomialOption({ ...optArg, steps: q.nLattice, payoff: (s) => Math.max((q.expandFrac / 100) * s - q.expandCost * MM, 0) }).value, abandonOpt = binomialOption({ S: Vop, K: (q.salvage / 100) * capex.total, r: rfree, sigma: sig, T: Math.min(lifeEff, 10), q: yld, steps: q.nLattice, type: 'put', american: true }).value;
-  const volCurve = linspace(5, 60, 12).map((s) => ({ s, lat: binomialOption({ ...optArg, sigma: s / 100, steps: q.nLattice, type: 'call' }).value, am: binomialOption({ ...optArg, sigma: s / 100, steps: q.nLattice, type: 'call', american: true }).value, bs: blackScholes({ ...optArg, sigma: s / 100, type: 'call' }) }));
+  const volCurve = linspace(6, 60, 10).map((s) => ({ s, lat: binomialOption({ ...optArg, sigma: s / 100, steps: q.nLattice, type: 'call' }).value, am: binomialOption({ ...optArg, sigma: s / 100, steps: q.nLattice, type: 'call', american: true }).value, bs: blackScholes({ ...optArg, sigma: s / 100, type: 'call' }) }));
   await tick();
 
   // ---------------------------------------------------------------- optimisation: LP, MILP, two-stage, Pareto
@@ -1137,7 +1149,7 @@ async function run(v, ctx = {}) {
   const pf = q.portfolio, lpArg = { c: pf.map((r) => r.npv), A: [pf.map((r) => r.capex), pf.map((r) => r.days), ...pf.map((_, i) => pf.map((__, j) => (i === j ? 1 : 0)))], b: [q.budget, q.vesselDays, ...pf.map(() => 1)] };
   const lp = pf.length ? simplex(lpArg) : { status: 'empty', x: [], value: 0 }, milp = pf.length ? branchAndBound(lpArg) : { status: 'empty', x: [], value: 0, nodes: 0 };
   const annF = annuityPV(1, X.rr, lifeEff), ts2 = twoStage({ c: q.waterCapCost * 1000, q: q.waterPenalty * 365 * annF, scenarios: scen.map((s) => ({ p: s.weight, demand: X.waterPeak * s.prod })) });
-  const tMaxM = q.tMaxMm / 1000, pfEval = (z) => { const o = optionProject('wet', q, S, X, { insT: z[0], rate: z[1], treat: z[2], profile: profileOf(q, z[1]), brief: true }), pe = pen(z[1]) + o.sm.vio; return [-cashflow(cut(o.p), {}, false) / MM + 1e5 * pe, (o.sm.block + o.sm.deferral + eal) / MM + 1e3 * pe, emissions(q, S, X, o.sm, z[1]).total + 1e7 * pe]; };
+  const tMaxM = q.tMaxMm / 1000, pfEval = (z) => { const o = optionProject('wet', q, S, X, { insT: z[0], rate: z[1], treat: z[2], profile: profileOf(q, z[1]), brief: true }), pe = 1e3 * pen(z[1]) + o.sm.vio; return [-cashflow(cut(o.p), {}, false) / MM + 1e5 * pe, (o.sm.block + o.sm.deferral + eal) / MM + 1e3 * pe, emissions(q, S, X, o.sm, z[1]).total + 1e7 * pe]; };
   const front = nsga2(pfEval, [0, lo[0], 0], [tMaxM, hi[0], 1], { pop: q.nPop, gens: q.nGens, seed: q.seed + 9 }).filter((s) => pen(s.x[1]) < 1e-9 && strategyModel('wet', q, S, X, { insT: s.x[0], rate: s.x[1], treat: s.x[2] }).safe).map((s) => ({ t: s.x[0] * 1000, rate: s.x[1], treat: s.x[2], npv: -s.f[0], risk: s.f[1], carbon: s.f[2] })).sort((a, b) => a.npv - b.npv);
 
   // ---------------------------------------------------------------- sustainability
@@ -1158,7 +1170,7 @@ async function run(v, ctx = {}) {
     { label: 'Payback', value: yrs(met.payback), unit: 'y', status: okPay ? 'ok' : met.payback === null ? 'bad' : 'warn', help: `From the evaluation date, interpolated; limit ${q.maxPayback} y. Discounted payback ${yrs(met.discountedPayback)} y` },
     { label: 'Profitability index', value: rd(met.pi, 2), unit: '–', status: met.pi !== null && met.pi >= 1 ? 'ok' : 'bad', help: 'Present value of the net inflows per dollar of discounted CAPEX' },
     { label: 'Unit technical cost', value: rd(met.utc, 2), unit: '$/boe', status: met.utc !== null && met.utc < q.oilPrice * 0.6 ? 'ok' : 'warn', help: 'Discounted CAPEX + OPEX + abandonment over discounted production' },
-    { label: 'Break-even oil price', value: rd(be.price, 1), unit: '$/bbl', status: be.price !== null && be.price < q.oilPrice * 0.8 ? 'ok' : be.price !== null && be.price < q.oilPrice ? 'warn' : 'bad', help: 'Flat real oil price at which the after-tax NPV is zero' },
+    { label: 'Break-even oil price', value: rd(be.price, 1), unit: '$/bbl', status: be.price !== null && be.price < q.oilPrice * 0.8 ? 'ok' : be.price !== null && be.price < q.oilPrice ? 'warn' : 'bad', help: be.price === 0 ? 'The project is profitable on gas revenue alone: NPV stays positive at a zero oil price' : 'Flat real oil price at which the after-tax NPV is zero' },
     { label: 'NPV P10 / P50 / P90', value: `${mUSD(mc.p10, 0)} / ${mUSD(mc.p50, 0)} / ${mUSD(mc.p90, 0)}`, unit: 'M$', status: mc.p10 >= 0 ? 'ok' : 'warn', help: `${q.sampling === 'lhs' ? 'Latin-hypercube' : 'Monte Carlo'} sample of ${mc.n}; P10 is the low case` },
     { label: 'Probability of loss', value: pct(mc.probLoss), unit: '%', status: mc.probLoss < 0.1 ? 'ok' : mc.probLoss < 0.3 ? 'warn' : 'bad', help: 'Share of simulated outcomes with a negative NPV' },
     { label: `CVaR (${q.alpha} %)`, value: mUSD(mc.cvar), unit: 'M$', status: mc.cvar >= 0 ? 'ok' : 'warn', help: `Mean NPV of the worst ${rd(100 - q.alpha, 1)} % of outcomes; value at risk ${mUSD(mc.var)} M$` },
@@ -1175,7 +1187,7 @@ async function run(v, ctx = {}) {
   if (S.base.pIn > q.mawp) flags.push(`inlet pressure ${rd(S.base.pIn, 0)} bara exceeds the allowable ${q.mawp} bara`);
   if (q.integUtil > 1) flags.push(`structural utilisation ${rd(q.integUtil, 2)} exceeds 1.0`);
   if (q.integViol > 0) flags.push(`${q.integViol} integrity code check(s) fail`);
-  if (p0.haz[0] > q.maxPof) flags.push(`annual failure probability ${rd(p0.haz[0], 4)} exceeds the tolerable ${q.maxPof}`);
+  { const hM = Math.max(...p0.haz.slice(0, lifeEff)); if (hM > q.maxPof) flags.push(`annual failure probability reaches ${rd(hM, 4)} with the current inspection interval, above the tolerable ${q.maxPof}`); }
   if (q.severeSlug) flags.push('severe slugging is predicted and not suppressed');
   if (!selOpt.sm.safe) flags.push(...selOpt.sm.viol.map((x) => `case strategy: ${x}`));
   flags.forEach((f) => warn('bad', `Safety constraint: ${f}.`));
@@ -1198,8 +1210,8 @@ async function run(v, ctx = {}) {
   if (S.kCd !== 1) warn('info', `Cooldown model scaled by ${rd(S.kCd, 2)} to match the published cooldown time of ${q.cooldownBase} h.`);
 
   // ---- recommendations (decision-support voice)
-  recs.push(okNpv && okIrr ? `Sanction case holds: NPV ${mUSD(npv0)} M$, IRR ${pct(met.irr)} %, payback ${yrs(met.payback)} y, break-even oil price ${rd(be.price, 1)} $/bbl against ${q.oilPrice} $/bbl assumed.` : `The project does not meet the investment criteria (NPV ${mUSD(npv0)} M$, IRR ${pct(met.irr)} %); it needs an oil price above ${rd(be.price, 1)} $/bbl or ${be.prod === null ? 'a larger resource' : pct(be.prod - 1, 0) + ' % more production'} to break even.`);
-  if (flags.length) recs.push(`Resolve the safety findings before using the economics: ${flags.join('; ')}.`);
+  recs.push(okNpv && okIrr ? `${flags.length ? 'Economic criteria are met' : 'Sanction case holds'}: NPV ${mUSD(npv0)} M$, IRR ${pct(met.irr)} %, payback ${yrs(met.payback)} y, break-even oil price ${rd(be.price, 1)} $/bbl against ${q.oilPrice} $/bbl assumed.` : `The project does not meet the investment criteria (NPV ${mUSD(npv0)} M$, IRR ${pct(met.irr)} %); it needs an oil price above ${rd(be.price, 1)} $/bbl or ${be.prod === null ? 'a larger resource' : pct(be.prod - 1, 0) + ' % more production'} to break even.`);
+  if (flags.length) recs.unshift(`Resolve the safety findings first — the economics below are conditional on them: ${flags.join('; ')}.`);
   recs.push(noneSafe ? `No flow-assurance strategy meets the safety limits (cooldown ≥ ${q.minCooldown} h, blockage ≤ ${q.maxBlockFreq} per year, injection ≤ ${q.maxInject} m³/d); the least-cost one, "${bestOpt.name}", fails on: ${bestOpt.sm.viol.join('; ')}.` : bestOpt.key === sel ? `Keep "${sm0.name}": it has the lowest lifecycle cost (${mUSD(bestOpt.lcc)} M$), ${mUSD(byLcc[1].lcc - bestOpt.lcc)} M$ below "${byLcc[1].name}"${byLcc[1].sm.safe ? '' : ' (which fails the safety screen)'}.` : !selOpt.sm.safe ? `Replace "${sm0.name}", which fails the safety screen (${selOpt.sm.viol.join('; ')}), with "${bestOpt.name}": lifecycle cost ${mUSD(selOpt.lcc)} → ${mUSD(bestOpt.lcc)} M$, NPV ${bestOpt.npv >= selOpt.npv ? '+' : ''}${mUSD(bestOpt.npv - selOpt.npv)} M$.` : `Switch from "${sm0.name}" to "${bestOpt.name}": lifecycle cost falls by ${mUSD(selOpt.lcc - bestOpt.lcc)} M$ (${mUSD(selOpt.lcc)} → ${mUSD(bestOpt.lcc)} M$) and NPV changes by ${mUSD(bestOpt.npv - selOpt.npv)} M$.`);
   { const cheaper = options.filter((o) => !o.sm.safe && o.lcc < bestOpt.lcc && !noneSafe); if (cheaper.length) recs.push(`Not recommended although cheaper: ${cheaper.map((o) => `"${o.name}" (${mUSD(o.lcc)} M$; ${o.sm.viol[0]})`).join(', ')}.`); }
   { const thin = insCurve.find((c) => c.t >= Math.min(20, insOpt.t)) || insBare, dC = insOpt.capex - thin.capex, dO = thin.lcc - thin.capex - (insOpt.lcc - insOpt.capex);
@@ -1290,9 +1302,9 @@ async function run(v, ctx = {}) {
     ['Option to defer (American, lattice)', mUSD(defer, 2), 'M$', `${q.nLattice} steps, σ ${q.optVol} %, ${q.optYears} y, value leakage ${q.optYield} %/y`], ['Option to defer (European, lattice)', mUSD(deferEu, 2), 'M$', `Black–Scholes ${mUSD(bs, 2)} M$`], ['Value of waiting', mUSD(defer - Math.max(npv0, 0), 2), 'M$', 'option − invest-now NPV'], ['Option to expand', mUSD(expand, 2), 'M$', `+${q.expandFrac} % for ${q.expandCost} M$ at year ${q.optYears}`], ['Option to abandon', mUSD(abandonOpt, 2), 'M$', `salvage ${q.salvage} % of CAPEX`], ['Flexible NPV', mUSD(npv0 + expand + abandonOpt, 2), 'M$', 'static NPV + expansion + abandonment options'],
   ] });
   tables.push({ title: 'Optimisation results', columns: ['Problem', 'Method', 'Solution', 'Objective', 'Note'], rows: [
-    ...solvers.map((s) => ['Operating point (NPV-optimal rate and preservation)', s.name, `rate ${pct(s.x[0], 1)} %, preservation ${pct(s.x[1], 0)} %`, `NPV ${mUSD(s.npv, 2)} M$`, `${s.evals ?? '—'} evaluations${s.pen > 1e-6 ? ', constraint violated' : ''}`]),
-    ['Operating envelope', 'constraint scan', envelope ? `${pct(envelope.lo, 0)}–${pct(envelope.hi, 0)} % of the case rate` : 'no feasible profitable rate', `optimum ${pct(opBest.x[0], 0)} %`, opCons.map((c) => `${c.name} ${c.g <= 0 ? 'ok' : 'violated'}`).join('; ')],
-    ...minlp.slice(0, 3).map((mR, i) => ['Strategy × rate (mixed-integer nonlinear)', 'enumeration + Nelder–Mead', `${mR.name} at ${pct(mR.rate, 0)} %`, `NPV ${mUSD(mR.npv, 2)} M$`, i === 0 ? 'best combination' : `rank ${i + 1}`]),
+    ...solvers.map((s) => ['Operating point (NPV-optimal rate and preservation)', s.name, `rate ${pct(s.x[0], 1)} %, preservation ${pct(s.x[1], 0)} %`, `NPV ${mUSD(s.npv, 2)} M$`, `${s.evals ?? '—'} evaluations${s.pen > 1e-7 ? ', outside the constraints' : ''}`]),
+    ['Operating envelope', 'constraint scan', envelope ? `${pct(envelope.lo, 0)}–${pct(envelope.hi, 0)} % of the case rate` : 'no feasible profitable rate', `optimum ${pct(opBest.x[0], 0)} %`, opCons.map((c) => `${c.name} ${c.g <= 1e-3 ? (Math.abs(c.g) < 0.005 ? 'at its limit' : 'ok') : 'violated'}`).join('; ')],
+    ...minlp.map((mR, i) => ['Strategy × rate (mixed-integer nonlinear)', 'enumeration + Nelder–Mead', `${mR.name} at ${pct(mR.rate, 0)} %`, `NPV ${mUSD(mR.npv, 2)} M$`, !mR.feasible ? 'excluded: breaks a safety or operating constraint' : i === 0 ? 'best combination' : `rank ${i + 1}`]),
     ['Project portfolio (linear relaxation)', 'two-phase simplex', lp.status === 'optimal' ? pf.map((r, i) => (lp.x[i] > 1e-6 ? `${r.name} ${pct(lp.x[i], 0)} %` : null)).filter(Boolean).join(', ') || 'none' : lp.status, lp.status === 'optimal' ? `NPV ${rd(lp.value, 2)} M$` : '—', `budget ${q.budget} M$, ${q.vesselDays} vessel days`],
     ['Project portfolio (go / no-go)', 'branch and bound', milp.status === 'optimal' ? pf.filter((_, i) => milp.x[i] > 0.5).map((r) => r.name).join(', ') || 'none' : milp.status, milp.status === 'optimal' ? `NPV ${rd(milp.value, 2)} M$` : '—', `${milp.nodes} nodes`],
     ['Water-handling capacity (two-stage stochastic)', 'deterministic-equivalent LP', ts2.status === 'optimal' ? `${rd(ts2.x, 0)} m³/d installed` : ts2.status, ts2.status === 'optimal' ? `expected cost ${mUSD(ts2.cost, 2)} M$` : '—', `${q.waterCapCost} k$ per m³/d now against ${q.waterPenalty} $/m³ later`],
@@ -1308,7 +1320,7 @@ async function run(v, ctx = {}) {
     ['Design', 'Insulation thickness', `${rd(insOpt.t, 0)} mm`, `lifecycle cost ${mUSD(insOpt.lcc)} M$`, 'same limits as the strategy', insSafe.length ? (insFree === insOpt ? 'constraints not binding' : `binding (cost minimum alone: ${rd(insFree.t, 0)} mm)`) : 'no thickness passes'],
     ['Design', 'Inner diameter', dBest ? `${rd(dBest.d * 1000, 0)} mm` : '—', dBest ? `NPV ${mUSD(dBest.npv)} M$` : '—', `erosional ratio ≤ 1; inlet pressure ≤ ${q.mawp} bara; deliverability`, dBest ? `${dOk.length} of ${diam.length} diameters pass` : 'no diameter passes'],
     ['Design', 'Corrosion control / material', matBest.name, `lifecycle cost ${mUSD(matBest.lcc)} M$`, 'corrosion allowance ≤ 10 mm', `${matPool.length} of ${mats.length} options pass`],
-    ['Operation', 'Production rate', `${pct(opBest.x[0], 0)} % of the case rate`, `NPV ${mUSD(opBest.npv)} M$`, opCons.map((c) => c.name).join('; '), opBest.pen < 1e-6 ? (active.length ? 'binding: ' + active.join(', ') : 'inside all limits') : 'limits cannot all be met'],
+    ['Operation', 'Production rate', `${pct(opBest.x[0], 0)} % of the case rate`, `NPV ${mUSD(opBest.npv)} M$`, opCons.map((c) => c.name).join('; '), opBest.pen < 1e-7 ? (active.length ? 'binding: ' + active.join(', ') : 'inside all limits') : 'limits cannot all be met'],
     ['Operation', 'Long shutdowns preserved', `${pct(opBest.x[1], 0)} %`, `${rd(opProj(opBest.x[0], opBest.x[1]).sm.events, 3)} blockages a year`, `blockage ≤ ${q.maxBlockFreq} /y`, ''],
     ['Inspection', 'In-line inspection interval', `${rd(rbiBest.t, 1)} y`, `PV ${mUSD(rbiBest.total, 2)} M$`, `annual failure probability ≤ ${q.maxPof}`, rbiOk.length ? (rbiFree === rbiBest ? 'constraint not binding' : `binding (cost minimum alone: ${rd(rbiFree.t, 1)} y)`) : 'limit cannot be met by inspection'],
     ['Intervention', 'Pigging interval', `${rd(pigBest.tau, 0)} d`, `${mUSD(pigBest.total, 3)} M$/y`, `deposit ≤ ${q.waxCrit} mm`, pigOk.length ? 'passes' : 'limit cannot be met'],
@@ -1320,7 +1332,7 @@ async function run(v, ctx = {}) {
     ...diam.map((d) => (d.npv === null ? ['Diameter', `${rd(d.d * 1000, 0)} mm`, '—', '—', '—', '—', '—', '—', '—', '—', d.why] : ['Diameter', `${rd(d.d * 1000, 0)} mm`, rd(d.U, 2), rd(d.tArr, 1), rd(d.sub, 1), pct(d.rate, 0), rd(d.eros * d.rate, 2), rd(d.slugVol, 0), mUSD(d.capexTotal), mUSD(d.npv), `NPV; ${d.why}`])),
   ], note: `${S.calls} steady solutions of the case line on the flow kernel (${q.nCells} cells). Rate response fitted from the kernel: friction ∝ rate^${rd(S.nf, 2)}, thermal exponent ${rd(S.mExp, 2)}.` });
   tables.push({ title: 'Integrity and reliability economics', columns: ['Item', 'Value', 'Unit', 'Note'], rows: [
-    ['Annual failure probability (year 1)', rd(p0.haz[0], 5), '1/y', 'base rate + wear-out hazard'], ['Annual failure probability (last year)', rd(p0.haz[lifeEff - 1], 5), '1/y', `Weibull shape ${q.weibullBeta}, ${q.pEnd} % cumulative at ${q.remLife} y`], ['Consequence per failure', q.consequence, 'M$', ''], ['Expected annual loss (year 1)', mUSD(eal, 3), 'M$/y', 'probability × consequence'], ['Lifecycle expected failure cost', mUSD(lifeFail, 2), 'M$', 'present value, = NPV − risk-adjusted NPV'],
+    ['Annual failure probability (year 1)', rd(p0.haz[0], 5), '1/y', 'base rate + wear-out hazard'], ['Largest annual failure probability', rd(Math.max(...p0.haz.slice(0, lifeEff)), 5), '1/y', `with inspection every ${q.inspInterval} y (detection ${q.pod} %); Weibull shape ${q.weibullBeta}, ${q.pEnd} % cumulative at ${q.remLife} y without inspection`], ['Consequence per failure', q.consequence, 'M$', ''], ['Expected annual loss (year 1)', mUSD(eal, 3), 'M$/y', 'probability × consequence'], ['Lifecycle expected failure cost', mUSD(lifeFail, 2), 'M$', 'present value, = NPV − risk-adjusted NPV'],
     ['Downtime cost of one failure', mUSD(q.repairDays * dayValue, 2), 'M$', `${q.repairDays} d at ${mUSD(dayValue, 2)} M$/d after deferral credit`], ['Optimum inspection interval', rd(rbiBest.t, 1), 'y', `PV ${mUSD(rbiBest.total, 2)} M$ (inspection ${mUSD(rbiBest.inspection, 2)}, failure ${mUSD(rbiBest.failure, 2)})`], ['Current inspection interval', q.inspInterval, 'y', `PV ${mUSD(rbiNow.total, 2)} M$`],
     ...mats.map((mR) => [`Material: ${mR.name}`, mUSD(mR.lcc, 2), 'M$ lifecycle', `rate ${rd(mR.rate, 3)} mm/y, allowance ${rd(mR.ca, 1)} mm${mR.practical ? '' : ' (capped; line replaced at year ' + rd(mR.life, 0) + ')'}, ΔCAPEX ${mUSD(mR.dCap, 2)}, PV OPEX ${mUSD(mR.opex, 2)}, PV failure ${mUSD(mR.fail, 2)}${mR.repl > 0 ? ', PV replacement ' + mUSD(mR.repl, 2) : ''}`]),
   ] });
@@ -1442,7 +1454,7 @@ const INPUTS = [
     N('slugVol', 'Slug-catcher volume', 'm³', BASE.slugCatcherVol, 1, 5000, 'Surge volume the receiving vessel must hold.'),
     N('pumpKW', 'Pumping power', 'kW', 0, 0, 1e5, 'Continuous pump power.'),
     N('compKW', 'Compression power', 'kW', 2000, 0, 2e5, 'Continuous compressor power.'),
-    N('heatKW', 'Continuous heating power', 'kW', 0, 0, 1e5, 'Heating that runs all year (0 when none).'),
+    N('heatKW', 'Heating power for electrical heating', 'kW', 0, 0, 1e5, 'Power that holds the line above the hydrate temperature during a shutdown; 0 lets the model size it from the heat loss.'),
     N('shutdowns', 'Unplanned shutdowns', '1/y', 6, 0, 100, 'Shutdowns a year that can lead to cooldown.'),
     N('shutdownMean', 'Mean shutdown duration', 'h', 12, 0.5, 500, 'Durations are taken as exponentially distributed.'),
     N('reactH', 'Time needed to preserve the line', 'h', 4, 0, 100, 'Part of the cooldown time used up before the line is safe.'),
@@ -1580,14 +1592,14 @@ const INPUTS = [
   { group: 'Resolution', tab: 'mesh', help: 'Sample sizes and grid counts. The kernel studies cost about 0.1 s for each steady solution.', fields: [
     N('nMC', 'Simulation samples', '', 2000, 100, 400000, 'Monte Carlo / Latin-hypercube sample size.', { int: true }),
     N('nLattice', 'Lattice steps', '', 120, 5, 4000, 'Time steps of the binomial lattice.', { int: true }),
-    N('nSobol', 'Base sample of the Sobol study', '', 256, 16, 20000, 'Model runs = this × (inputs + 2).', { int: true }),
-    N('nMCopt', 'Samples per design under uncertainty', '', 300, 50, 20000, '', { int: true }),
-    N('nPop', 'Population of the Pareto search', '', 36, 8, 400, '', { int: true }),
-    N('nGens', 'Generations of the Pareto search', '', 16, 2, 400, '', { int: true }),
+    N('nSobol', 'Base sample of the Sobol study', '', 192, 16, 20000, 'Model runs = this × (inputs + 2).', { int: true }),
+    N('nMCopt', 'Samples per design under uncertainty', '', 200, 50, 20000, '', { int: true }),
+    N('nPop', 'Population of the Pareto search', '', 30, 8, 400, '', { int: true }),
+    N('nGens', 'Generations of the Pareto search', '', 12, 2, 400, '', { int: true }),
     N('nCells', 'Cells along the line (flow kernel)', '', 40, 20, 400, '', { int: true }),
-    N('nThick', 'Insulation thicknesses solved on the kernel', '', 5, 3, 8, '', { int: true }),
+    N('nThick', 'Insulation thicknesses solved on the kernel', '', 4, 3, 8, '', { int: true }),
     N('tMaxMm', 'Largest insulation thickness studied', 'mm', 140, 20, 300, ''),
-    N('nDiam', 'Diameters solved on the kernel', '', 5, 1, 7, '', { int: true }),
+    N('nDiam', 'Diameters solved on the kernel', '', 4, 1, 7, '', { int: true }),
     N('nRates', 'Extra rates solved on the kernel', '', 1, 0, 2, '0 uses standard exponents for the rate response.', { int: true }),
     N('erosC', 'Erosional constant C', '(lb/ft³)^½·ft/s', 100, 50, 400, 'API RP 14E.'),
   ] },
@@ -1666,7 +1678,7 @@ function pull({ fluid, outputs } = {}) {
   add('ealOverride', isNum(o.integ?.riskCostPerYear) ? o.integ.riskCostPerYear / MM : undefined, 'Integrity suite: risk cost per year'); add('remLife', o.integ?.remainingLife, 'Integrity suite: remaining life');
   add('inspInterval', o.integ?.inspectionInterval, 'Integrity suite: inspection interval'); add('corrRate', o.integ?.corrosionRate, 'Integrity suite: corrosion rate');
   add('mawp', o.integ?.mawp, 'Integrity suite: maximum allowable working pressure'); add('mawp', o.net?.designPressure, 'Network suite: design pressure');
-  { const u = [o.integ?.hoopUtil, o.integ?.vmUtil, o.integ?.collapseUtil, o.integ?.upheavalUtil].filter(isNum); add('integUtil', u.length ? Math.max(...u) : undefined, 'Integrity suite: largest utilisation'); }
+  { const u = [o.integ?.hoopUtil, o.integ?.vmUtil, o.integ?.collapseUtil].filter(isNum); add('integUtil', u.length ? Math.max(...u) : undefined, 'Integrity suite: largest strength utilisation (hoop, combined, collapse)'); }
   add('integViol', o.integ?.violations, 'Integrity suite: failed code checks');
   { const e = [o.flow?.erosionalRatio, o.integ?.erosionalRatio].filter(isNum); add('erosIn', e.length ? Math.max(...e) : undefined, 'Flow / integrity suite: erosional velocity ratio'); }
   if (typeof o.flow?.severeSlugging === 'boolean') items.push({ key: 'severeSlug', value: o.flow.severeSlugging && !o.ops?.slugSuppressed, from: 'Flow and operations suites: severe slugging not suppressed' });
@@ -1807,7 +1819,7 @@ export default {
     'Edit the distributions, correlations and scenarios, then read P10/P50/P90, probability of loss, CVaR, the tornado and the Sobol indices.',
     'Use the convergence tab to confirm that the sample size and the lattice steps are large enough for the decision.',
   ],
-  equationsNote: 'Screening-level (class 4–5) cost models in 2023 US dollars with editable reference costs; a single-field, single-line project; one price multiplier drives oil and gas together. The thermal and hydraulic response between the kernel solutions is interpolated (arrival temperature as an exponential in U and in 1/rate, friction as a power of rate). Cooldown uses a lumped thermal mass. Downtime volume marked as deferred is recovered in the last production year. The production-sharing option has one cost-oil cap and one profit split (no R-factor or sliding scale). Hazard is a constant rate plus a Weibull wear-out term; inspection acts through a virtual-age reduction. Real options assume a lognormal project value. Bayesian optimisation, time-series and maximum-likelihood calibration of price and cost histories are not implemented.',
+  equationsNote: 'Screening-level (class 4–5) cost models in 2023 US dollars with editable reference costs; a single-field, single-line project; one price multiplier drives oil and gas together. The thermal and hydraulic response between the kernel solutions is interpolated (arrival temperature as an exponential in U and in 1/rate, friction as a power of rate). Cooldown uses a lumped thermal mass. Downtime volume marked as deferred is recovered in the last production year. The production-sharing option has one cost-oil cap and one profit split (no R-factor or sliding scale). Hazard is a constant rate plus a Weibull wear-out term; inspection acts through a virtual-age reduction. Real options assume a lognormal project value. The mixed-integer nonlinear problem (strategy × rate) is solved by enumerating the strategies with a continuous search inside each. Safety screening uses the limits entered here (cooldown, blockage frequency, injection capacity, erosional ratio, allowable pressure, failure probability, utilisation); it does not replace the checks of the engineering suites. Bayesian optimisation, time-series and maximum-likelihood calibration of price and cost histories are not implemented.',
   implemented: IMPLEMENTED,
   referenceOnly: REFERENCE_ONLY,
   inputs: INPUTS,

@@ -293,7 +293,7 @@ export function marchPipe({ fm, mHC, mW, cells, pIn, tIn, model = 'beggsBrill', 
   let prev = null; // midpoint rule; the predictor reuses the gradient of the previous cell (one closure call per cell after the first)
   for (const c of cells) {
     const i = P.length - 1, a = prev || state(P[i], T[i], c), pm = P[i] - (0.5 * c.ds * a.gr.dpdx) / 1e5, tm = tOf ? tOf((sAcc + 0.5 * c.ds) / sTot) : tStep(T[i], c, a, 0.5 * c.ds);
-    const b = state(pm, tm, c), pn = P[i] - (c.ds * b.gr.dpdx) / 1e5;
+    const b = cells.length === 1 ? a : state(pm, tm, c), pn = P[i] - (c.ds * b.gr.dpdx) / 1e5; // a single-cell connector takes one explicit step
     prev = b;
     if (pn < 1) dead = true;
     P.push(pn); T.push(clamp(tOf ? tOf((sAcc + c.ds) / sTot) : tStep(T[i], c, b, c.ds), -60, 250)); sAcc += c.ds;
@@ -775,6 +775,7 @@ const INPUTS = [
     { key: 'network', label: 'Connections', type: 'table', columns: [{ key: 'from', label: 'From', type: 'text' }, { key: 'to', label: 'To', type: 'text' }, { key: 'type', label: 'Type', type: 'text' }, { key: 'length', label: 'Length', unit: 'm' }, { key: 'diameter', label: 'Diameter', unit: 'mm' }, { key: 'k', label: 'K-factor', unit: '–' }, { key: 'param', label: 'Parameter', unit: '' }], value: DEF_NETWORK, help: 'Diameters below 5 are read as metres. Zero diameter means the main pipe diameter.' },
     { key: 'netNodes', label: 'Node data (optional)', type: 'table', columns: [{ key: 'id', label: 'Node', type: 'text' }, { key: 'kind', label: 'Kind (source / sink / junction)', type: 'text' }, { key: 'share', label: 'Share of the case rate', unit: '%' }, { key: 'p', label: 'Fixed pressure', unit: 'bara' }, { key: 'z', label: 'Elevation', unit: 'm' }], value: DEF_NODES, help: 'Blank cells are inferred: nodes with no inflow are sources, nodes with no outflow are sinks at the arrival pressure, elevations follow the route.' },
     { key: 'fittings', label: 'Fittings on the main line', type: 'table', columns: [{ key: 'type', label: `Fitting (${Object.keys(FITTINGS).join(', ')})`, type: 'text' }, { key: 'count', label: 'Count', unit: '' }], value: DEF_FITTINGS },
+    { key: 'kMult', label: 'Local-loss calibration multiplier', unit: '–', value: 1, min: 0, max: 20, help: 'Scales every fitting and bend K-factor of the main line.' },
     { key: 'cErosion', label: 'Erosional velocity constant C', unit: '(kg/m)^½/s', value: 122, min: 60, max: 300, help: 'API RP 14E: v = C/√ρ; 122 corresponds to C = 100 in field units.' },
   ] },
   { group: 'Liquid export pump', tab: 'inputs', fields: [
@@ -826,7 +827,7 @@ const INPUTS = [
     { key: 'bendMinAngle', label: 'Smallest direction change listed as a bend', unit: '°', value: 2, min: 0.2, max: 45 },
   ] },
   { group: 'Discretisation', tab: 'mesh', fields: [
-    { key: 'nCells', label: 'Cells along the flowline', unit: '', value: 24, min: 6, max: 400, help: 'The riser gets half as many again; jumpers a twelfth.' },
+    { key: 'nCells', label: 'Cells along the flowline', unit: '', value: 24, min: 6, max: 400, help: 'The riser gets half as many again; jumpers and spools one cell per 24.' },
     { key: 'nTubing', label: 'Cells along the tubing', unit: '', value: 24, min: 6, max: 400 },
     { key: 'netTol', label: 'Network residual tolerance (relative)', unit: '–', value: 1e-8, min: 1e-12, max: 1e-3 },
   ] },
@@ -947,7 +948,7 @@ function caseNetwork(I) {
       const dz = nodes[b].z - nodes[a].z; e.D = r.dia > 0 ? (r.dia < 5 ? r.dia : r.dia / 1000) : I.D;
       if (!(r.length > 0)) notes.push(`Connection ${r.from} → ${r.to} has no length: ${rd(Math.max(Math.abs(dz), 1), 1)} m was assumed.`);
       e.L = Math.max(r.length > 0 ? r.length : 1, Math.abs(dz) * 1.0005);
-      const nc = Math.max(2, Math.round(v.nCells / 12)), theta = Math.asin(clamp(dz / e.L, -1, 1));
+      const nc = Math.max(1, Math.round(v.nCells / 24)), theta = Math.asin(clamp(dz / e.L, -1, 1));
       for (let j = 0; j < nc; j++) e.cells.push({ ds: e.L / nc, theta, zMid: nodes[a].z + (dz * (j + 0.5)) / nc, xMid: 0 });
       dress(e.cells, false);
     } else if (r.kind === 'choke') { e.cv = r.param > 0 ? r.param : v.chokeCvMax; } else if (r.kind === 'pump') e.series = r.param > 0 ? r.param : 1;
@@ -1007,7 +1008,7 @@ function intersect(xa, ya, xb, yb) {
   let last = null;
   for (let i = 0; i < n; i++) { const a = lo + ((hi - lo) * i) / n, b = lo + ((hi - lo) * (i + 1)) / n; if (g(a) >= 0 && g(b) < 0) last = [a, b]; }
   if (last) return { x: brent(g, last[0], last[1], 1e-9), limited: null };
-  return g(hi) >= 0 ? { x: hi, limited: 'inflow' } : { x: 0, limited: 'dead' };
+  return g(hi) >= 0 ? { x: hi, limited: hi < xa[xa.length - 1] - 1e-9 ? 'range' : 'inflow' } : { x: 0, limited: 'dead' };
 }
 const mode = (a) => { const c = new Map(); let best = a[0] ?? '—', nb = 0; for (const q of a) { const k = (c.get(q) || 0) + 1; c.set(q, k); if (k > nb) { nb = k; best = q; } } return best; };
 
@@ -1040,7 +1041,7 @@ function run(vIn, ctx = {}) {
   const env = (xm, zm, onMain) => { const c = catOf(xm, zm, onMain); return { U: W[c].U, cat: c, tAmb: c === 'seaB' ? v.tSeabed : c === 'airB' ? v.tGround : c === 'sea' ? seaTemperature(-zm, v.tSeaSurface, v.tSeabed) : v.tAir }; };
 
   // ---- local losses and bends ------------------------------------------------------------------------------------
-  const fit = fittingsLoss(v.fittings, D, rough / D), bends = bendInventory(x, z, v.bendMinAngle).map((b) => ({ ...b, plane: 'vertical' })).concat(route.plan ? bendInventory(route.plan.e, route.plan.n, v.bendMinAngle).map((b) => ({ ...b, x: x[b.i], z: z[b.i], plane: 'plan' })) : []).sort((a, b) => a.x - b.x), bendsK = bends.reduce((s, b) => s + bendK(b.radius / D, b.angle, fit.fT), 0), kLoss = fit.K + bendsK;
+  const fit = fittingsLoss(v.fittings, D, rough / D), bends = bendInventory(x, z, v.bendMinAngle).map((b) => ({ ...b, plane: 'vertical' })).concat(route.plan ? bendInventory(route.plan.e, route.plan.n, v.bendMinAngle).map((b) => ({ ...b, x: x[b.i], z: z[b.i], plane: 'plan' })) : []).sort((a, b) => a.x - b.x), bendsK = bends.reduce((s, b) => s + bendK(b.radius / D, b.angle, fit.fT), 0), kLoss = (fit.K + bendsK) * v.kMult;
 
   // ---- network at the case rate ------------------------------------------------------------------------------------
   prog(0.2, 'Network hydraulics');
@@ -1213,6 +1214,7 @@ function run(vIn, ctx = {}) {
   if (!aCase) warnings.push({ level: 'bad', msg: `The case rate (${rd(qWell, 0)} ${wellUnit} per well) is above the absolute open-flow potential of the well (${rd(ipr.qMax, 0)} ${wellUnit}).` });
   else if (!canDeliver) warnings.push({ level: 'bad', msg: `At the case rate the well delivers ${rd(whpAvail, 1)} bara at the wellhead but the network needs ${rd(whpReq, 1)} bara: the wells cannot sustain the case rate (natural-flow rate ${rd(operatingRate, 0)} Sm³/d liquid).` });
   if (op.limited === 'dead') warnings.push({ level: 'bad', msg: 'The well cannot flow naturally against the network back-pressure at any rate: artificial lift, boosting or a lower arrival pressure is needed.' });
+  if (op.limited === 'range') warnings.push({ level: 'info', msg: `The natural-flow rate is at least ${rd(operatingRate, 0)} Sm³/d of liquid: the network back-pressure curve could not be extended beyond ${rd(sOp * 100, 0)} % of the case rate.` });
   if (canDeliver && chokeCv > v.chokeCvMax) warnings.push({ level: 'warn', msg: `The choke needs Cv ${rd(chokeCv, 1)} at the case rate, above the rated Cv ${v.chokeCvMax}: it would be wide open and still restrict the well.` });
   if (canDeliver && chokeOpening < 15) warnings.push({ level: 'warn', msg: `The choke would run only ${rd(chokeOpening, 0)} % open: poor control and trim erosion — a smaller trim (rated Cv about ${rd(chokeCv / 0.3, 0)}) suits this duty.` });
   if (canDeliver && critical) warnings.push({ level: 'info', msg: `Choke flow is critical: pressure ratio ${rd(p2c / p1c, 2)} is below the two-phase critical ratio ${rd(sach.yc, 2)} (Sachdeva); downstream pressure changes do not reach the well.` });
@@ -1323,7 +1325,7 @@ function assemble(S) {
   tables.push(T('Segments', ['#', 'From x (m)', 'To x (m)', 'From z (m)', 'To z (m)', 'Length (m)', 'Inclination (°)', 'Cumulative length (m)', 'Volume (m³)'], sp.segs.map((s, i) => [i + 1, rd(s.x0, 1), rd(s.x1, 1), rd(s.z0, 1), rd(s.z1, 1), rd(s.L, 2), rd(s.incl, 3), rd(sp.s[i + 1], 1), rd(area(D) * s.L, 2)]), segShown ? `The route has ${prof.segs.length} segments; the table lists the simplified ${sp.segs.length}-segment route that keeps every high and low point.` : null));
   tables.push(T('Cross-sections and hydraulic diameters', ['Section', 'Flow area (m²)', 'Hydraulic diameter (m)'], S.sections.map((q) => [q[0], sg(q[1], 5), sg(q[2], 5)]), 'Hydraulic diameter = 4 × area / wetted perimeter (the free surface counts as perimeter for the separator sections).'));
   if (prof.highs.length + prof.lows.length) tables.push(T('High and low points', ['Type', 'x (m)', 'z (m)', 'Mixture velocity (m/s)', 'Liquid holdup'], [...prof.highs.map((q) => ['High', rd(q.x, 0), rd(q.z, 1), ml.x.length ? rd(interp1(ml.x, ml.vm, q.x), 2) : '—', ml.x.length ? rd(interp1(ml.x, ml.holdup, q.x), 3) : '—']), ...S.lowPts.map((q) => ['Low', rd(q.x, 0), rd(q.z, 1), rd(q.vm, 2), rd(q.holdup, 3)])].slice(0, 80)));
-  tables.push(T('Bends and fittings', ['Item', 'Location x (m)', 'Angle (°) / count', 'Radius (m)', 'K each', 'K total'], [...S.bends.slice(0, 40).map((b) => [b.plane === 'plan' ? 'Plan-view bend' : 'Direction change (elevation)', rd(b.x, 0), rd(b.angle, 2), rd(Math.min(b.radius, 1e7), 0), sg(bendK(b.radius / D, b.angle, S.fit.fT), 3), sg(bendK(b.radius / D, b.angle, S.fit.fT), 3)]), ...S.fit.rows.map((r) => [r.label, '—', r.count, '—', sg(r.k, 3), sg(r.total, 3)]), ['Total', '—', '—', '—', '—', sg(S.kLoss, 4)]], `Equivalent length of the fittings: ${rd(S.fit.eqLength + (S.bendsK * D) / S.fit.fT, 1)} m of straight pipe (fully turbulent friction factor ${sg(S.fit.fT, 3)}). Direction changes with r/D above 20 are field curvature and add no loss.`));
+  tables.push(T('Bends and fittings', ['Item', 'Location x (m)', 'Angle (°) / count', 'Radius (m)', 'K each', 'K total'], [...S.bends.slice(0, 40).map((b) => [b.plane === 'plan' ? 'Plan-view bend' : 'Direction change (elevation)', rd(b.x, 0), rd(b.angle, 2), rd(Math.min(b.radius, 1e7), 0), sg(bendK(b.radius / D, b.angle, S.fit.fT), 3), sg(bendK(b.radius / D, b.angle, S.fit.fT), 3)]), ...S.fit.rows.map((r) => [r.label, '—', r.count, '—', sg(r.k, 3), sg(r.total, 3)]), ['Total (× calibration multiplier ' + v.kMult + ')', '—', '—', '—', '—', sg(S.kLoss, 4)]], `Equivalent length of the fittings: ${rd(S.fit.eqLength + (S.bendsK * D) / S.fit.fT, 1)} m of straight pipe (fully turbulent friction factor ${sg(S.fit.fT, 3)}). Direction changes with r/D above 20 are field curvature and add no loss.`));
   tables.push(T('Wall layers and thermal resistances', ['Layer', 'Thickness (mm)', 'Conductivity (W/m/K)', 'Resistance on ID (m²K/W)', 'Share (%)'], wall.resistances.map((r) => { const l = r.name === 'Pipe wall' ? { t: wt, k: S.mat.k } : wall.layers.find((q) => q.name === r.name); return [r.name, l ? rd(l.t * 1000, 2) : '—', l ? l.k : '—', sg(r.R, 4), rd((100 * r.R) / rTot, 1)]; }), `Inside film ${rd(S.hIn, 0)} W/m²K (Gnielinski on the no-slip mixture), outside film ${rd(S.mainCat.startsWith('sea') ? S.hSea : S.hAir, 0)} W/m²K (Churchill–Bernstein).${v.uMult !== 1 ? ` The U-value is multiplied by the calibration factor ${v.uMult}.` : ''}`));
   tables.push(T('Wall design summary', ['Quantity', 'Value', 'Unit'], [['U exposed in sea water', rd(W.sea.U, 3), 'W/m²K'], ['U buried under the seabed', v.burialDepth > 0 ? rd(W.seaB.U, 3) : '—', 'W/m²K'], ['U exposed in air', rd(W.air.U, 3), 'W/m²K'], ['U buried onshore', v.burialDepth > 0 ? rd(W.airB.U, 3) : '—', 'W/m²K'], ['Length-weighted U of the route', rd(S.uMean, 3), 'W/m²K'], ['Thermal mass of wall and coatings', rd(wall.thermalMass, 0), 'J/m/K'], ['Mass of pipe and coatings', rd(wall.massPerM, 1), 'kg/m'], ['Submerged weight, operating', rd(wall.submerged, 0), 'N/m'], ['Specific gravity, empty', rd(S.sgEmpty, 3), '–'], ['Specific gravity, operating', rd(S.sgOp, 3), '–'], ['Bending stiffness EI', sg(wall.EI, 4), 'N·m²'], ['Material', S.mat.label, ''], ['SMYS / SMTS', `${S.mat.smys} / ${S.mat.smts}`, 'MPa'], ['Hoop stress at design pressure (Barlow)', rd(S.hoop, 1), 'MPa'], ['Hoop utilisation against 0.72·SMYS', rd(S.hoopUtil, 3), '–']]));
   tables.push(T('Network nodes', ['Node', 'Kind', 'Elevation (m)', 'Pressure (bara)', 'Temperature (°C)', 'Boundary', 'Net flow at node (kg/s)'], net.nodes.map((n, k) => [n.id, n.kind, rd(n.z, 1), rd(sol.p[k], 3), rd(S.base.t[k], 2), n.pFixed !== null ? `fixed ${rd(n.pFixed, 2)} bara` : n.rate > 0 ? `fixed ${rd(n.rate, 3)} kg/s` : 'mass balance', sg(sol.balance[k], 4)]), 'For fixed-pressure nodes the net flow is what leaves the network there; for all other nodes it is the mass-balance residual.'));
@@ -1353,7 +1355,7 @@ function assemble(S) {
   const outputs = {
     profile: { x: simp.x, z: simp.z }, length: prof.length, id: D, wt, od: S.od, roughness: rough, uValue: S.uMean, layers: wall.layers.map((l) => ({ name: l.name, t: l.t, k: l.k })), volume: S.volume,
     waterDepth: S.waterDepth, riserHeight: rb.height, riserBaseX: rb.x, tSeabed: v.tSeabed, tSeaSurface: v.tSeaSurface, burial: v.burialDepth > 0 ? v.burialDepth : 0, kLoss: S.kLoss,
-    bends: S.bends.slice(0, 60).map((b) => ({ x: b.x, angle: b.angle, radius: Math.min(b.radius, 1e7), plane: b.plane })), spans: S.spans.map((s) => ({ x: s.x, length: s.length, gap: s.gap })),
+    bends: S.bends.slice(0, 60).map((b) => ({ x: b.x, angle: b.angle, radius: Math.min(b.radius, 1e7), plane: b.plane })), spans: S.spans.map((s) => ({ x: s.x, length: s.length, gap: s.gap })), spanSource: S.spanSource || 'none',
     ipr: { type: ipr.type, pRes: ipr.pRes, tRes: v.tRes, pi: ipr.pi, qMax: ipr.qMax, pb: ipr.pb, basis: ipr.basis, wells: nWells, qMaxTotal: ipr.qMax / S.share },
     wellTVD: traj.tvd, wellMD: traj.md, tubingId: v.tubingIdMm / 1000, whp: S.canDeliver ? S.whpAvail : S.whpReq, operatingRate: S.operatingRate, chokeCv: S.chokeCv, chokeOpening: S.chokeOpening, separatorP: v.pSep, slugCatcherVol: S.scVol,
     network: { nodes: net.nodes.map((n, k) => ({ id: n.id, type: n.kind, p: sol.p[k], z: n.z, t: S.base.t[k] })), edges: eInfo.map((q, i) => ({ from: q.e.from, to: q.e.to, type: q.e.kind === 'link' ? 'connector' : q.e.kind, length: q.e.L, id: q.e.D, q: q.m, dp: sol.dp[i], v: q.vMax, area: q.A, incl: q.incl, reversed: q.rev, k: q.e.k })), converged: sol.usable, residual: sol.residual, massResidual: sol.massResidual, loops: sol.loops.length },
@@ -1379,7 +1381,7 @@ function assemble(S) {
 function calModel(v0 = {}) {
   const v = readInputs(v0), route = routeOf(v), L = analyseProfile(route.x, route.z).length, D = v.idMm / 1000, rho = 1027, mu = 1.6e-3;
   const qLine = num(v0.qLine, 300), qTest = num(v0.qTest, 800), wChoke = num(v0.wChoke, 9), rhoChoke = num(v0.rhoChoke, 350), bean = num(v0.bean, 48), mCp = num(v0.mCp, 120), tHot = num(v0.tHot, 70);
-  const dpLine = pipeDp({ m: (qLine / 3600) * rho, rho, mu, L, D, rough: v.roughUm * 1e-6, model: v.fModel }) / 1e5;
+  const dpLine = pipeDp({ m: (qLine / 3600) * rho, rho, mu, L, D, rough: v.roughUm * 1e-6, k: fittingsLoss(v.fittings, D, (v.roughUm * 1e-6) / D).K * v.kMult, model: v.fModel }) / 1e5;
   const needFluid = ['darcy', 'jones', 'gas'].includes(v.iprType), fm = needFluid ? fluidModel({}) : null, ipr = makeIpr(v, fm, fm ? fm.rates.mHC : 0, fm ? fm.rates.mW : 0), pwf = iprPwf(qTest, ipr) ?? 0;
   const dpChoke = (wChoke / (v.chokeCd * area((bean / 64) * UNIT.in))) ** 2 / (2 * rhoChoke) / 1e5;
   const mat = material(v.grade), base = { id: D, wt: v.wtMm / 1000, kSteel: mat.k, layers: v.layers.map((l) => ({ name: l?.name, t: Math.max(num(l?.tMm, 0), 0) / 1000, k: num(l?.k, 0) })), pipWt: v.pip ? v.pipWtMm / 1000 : 0, concrete: { t: v.concreteMm / 1000, k: 2, rho: v.concreteRho }, hIn: 1500, uMult: v.uMult };
@@ -1527,18 +1529,18 @@ export default {
     'node mass balance + branch momentum equations', 'pressure-flow network equations', 'nonlinear network solution', 'graph-based incidence-matrix formulation',
     'geometry + network hydraulics', 'well ipr + vertical-lift performance', 'reservoir–well–pipeline coupling', 'separator flash + dynamic inventory balance',
     // initial and boundary conditions represented by inputs
-    'initial configuration and availability of every pipeline', 'riser', 'well', 'branch', 'manifold and item of equipment', 'initial pipe internal diameter and wall thickness', 'initial roughness', 'initial insulation condition', 'initial burial and seabed-contact state', 'initial valve and choke positions', 'initial pump and compressor operating states', 'initial slug-catcher inventory', 'initial equipment connectivity', 'any pre-existing deposits', 'restrictions', 'damage or effective diameter reductions',
+    'initial configuration and availability of every pipeline', 'manifold and item of equipment', 'initial pipe internal diameter and wall thickness', 'initial roughness', 'initial insulation condition', 'initial burial and seabed-contact state', 'initial valve and choke positions', 'initial pump and compressor operating states', 'initial slug-catcher inventory', 'initial equipment connectivity', 'any pre-existing deposits', 'restrictions', 'damage or effective diameter reductions',
     'inlet and outlet locations', 'well/reservoir connections', 'terminal and separator connections', 'branch and junction connectivity', 'closed ends', 'pressure boundaries', 'equipment interfaces and environmental interfaces', 'fixed pipeline and riser coordinates', 'elevation and bathymetric profiles', 'water depth', 'equipment capacities', 'valve and choke operating limits', 'pump and compressor operating envelopes', 'separator constraints', 'slug-catcher capacity', 'physical limits governing flow through connected components',
     // inputs
     'pipeline/riser/well centrelines and coordinates', 'lengths', 'id/od', 'wall thickness', 'roughness', 'elevation/bathymetry', 'inclination', 'bends, tees, branches and junctions', 'riser configuration', 'insulation/coatings', 'burial and seabed contact', 'pipe/material properties', 'well trajectory and completion geometry', 'network topology', 'manifolds', 'valves/chokes', 'pumps/compressors', 'separators', 'slug catchers', 'equipment dimensions, capacities, performance curves/maps and connectivity', 'coordinate reference system and units',
     // outputs
     'validated computational geometry/network', 'segment lengths', 'elevations and inclinations', 'cross-sectional areas', 'hydraulic diameters', 'internal volumes', 'node-edge connectivity', 'well/network topology', 'equipment connectivity and orientation', 'local-loss coefficients', 'equipment operating characteristics', 'derived geometric/thermal parameters', 'geometry-quality/topology diagnostics', 'computational discretization or mesh-ready representation',
     // calibration, verification, validation actually supported
-    'pipe roughness from pressure-drop data', 'choke coefficients', 'well productivity index', 'heat-transfer coefficients',
+    'pipe roughness from pressure-drop data', 'local-loss coefficients', 'choke coefficients', 'well productivity index', 'heat-transfer coefficients',
     'length conservation', 'elevation-profile verification', 'bathymetry reconstruction checks', 'inclination calculations', 'internal-volume calculations', 'cross-sectional-area calculations', 'hydraulic-diameter calculations', 'connectivity/topology tests', 'node-edge consistency', 'branch connectivity', 'flow-direction consistency', 'junction conservation', 'coordinate-system transformations', 'unit-conversion tests', 'boundary-condition assignment', 'duplicate/disconnected-node detection', 'zero-length-element detection', 'negative/invalid-volume detection', 'mesh/network independence', 'analytical geometry benchmarks', 'round-trip geometry tests',
     'field pressure-drop measurements', 'well-test data', 'valve/choke flow tests',
   ],
-  referenceOnly: ['pump/compressor map + transient network equations', 'cad/geometry consistency', 'geometry-import regression tests', 'equipment orientation', 'pipe-support conditions', 'initial separator liquid and gas inventories', 'initial well completion status'],
+  referenceOnly: ['tubing roughness', 'separator performance', 'slug-catcher effective capacity', 'well deviation surveys', 'pump/compressor map + transient network equations', 'cad/geometry consistency', 'geometry-import regression tests', 'equipment orientation', 'pipe-support conditions', 'initial separator liquid and gas inventories', 'initial well completion status'],
   inputs: INPUTS,
   presets: PRESETS,
   pull: ({ fluid, outputs } = {}) => okNum([
@@ -1572,8 +1574,8 @@ export default {
       metrics: [{ label: 'Flowline inlet pressure', unit: 'bara', get: (r) => r.outputs.inletPressure }, { label: 'Wellhead pressure needed', unit: 'bara', get: (r) => r.outputs.whpRequired }] },
   ],
   calibration: {
-    note: 'Four independent field tests, one parameter each: a single-phase (sea-water) flow test of the main line gives the wall roughness; a well test gives the productivity index; a bean-choke test gives the discharge coefficient; a single-phase thermal test (known heat-capacity rate and inlet temperature) gives the U-value multiplier. Fit only the parameters for which you have data.',
-    params: [{ key: 'roughUm', label: 'Wall roughness (µm)', lo: 1, hi: 1000 }, { key: 'piWell', label: 'Productivity index (Sm³/d/bar)', lo: 0.5, hi: 500 }, { key: 'chokeCd', label: 'Bean discharge coefficient', lo: 0.4, hi: 1.05 }, { key: 'uMult', label: 'U-value multiplier', lo: 0.3, hi: 3 }],
+    note: 'Four independent field tests, one parameter each: a single-phase (sea-water) flow test of the main line gives the wall roughness; a well test gives the productivity index; a bean-choke test gives the discharge coefficient; a single-phase thermal test (known heat-capacity rate and inlet temperature) gives the U-value multiplier. The local-loss multiplier acts on the same line test as the roughness and can only be told apart from it on short, fitting-dominated lines: leave it unticked for long pipelines. Fit only the parameters for which you have data.',
+    params: [{ key: 'roughUm', label: 'Wall roughness (µm)', lo: 1, hi: 1000 }, { key: 'piWell', label: 'Productivity index (Sm³/d/bar)', lo: 0.5, hi: 500 }, { key: 'chokeCd', label: 'Bean discharge coefficient', lo: 0.4, hi: 1.05 }, { key: 'kMult', label: 'Local-loss multiplier', lo: 0, hi: 20 }, { key: 'uMult', label: 'U-value multiplier', lo: 0.3, hi: 3 }],
     columns: [{ key: 'qLine', label: 'Line test flow', unit: 'm³/h' }, { key: 'dpLine', label: 'Line frictional pressure drop', unit: 'bar' }, { key: 'qTest', label: 'Well-test rate', unit: 'Sm³/d' }, { key: 'pwf', label: 'Flowing bottom-hole pressure', unit: 'bara' }, { key: 'wChoke', label: 'Choke mass rate', unit: 'kg/s' }, { key: 'rhoChoke', label: 'Mixture density at the choke', unit: 'kg/m³' }, { key: 'bean', label: 'Bean size', unit: '1/64 in' }, { key: 'dpChoke', label: 'Choke pressure drop', unit: 'bar' }, { key: 'mCp', label: 'Heat-capacity rate', unit: 'kW/K' }, { key: 'tHot', label: 'Inlet temperature', unit: '°C' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }],
     targets: [{ key: 'dpLine', label: 'Line pressure drop', unit: 'bar' }, { key: 'pwf', label: 'Flowing bottom-hole pressure', unit: 'bara' }, { key: 'dpChoke', label: 'Choke pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }],
     model: calModel, sample: CAL_SAMPLE, validationSample: CAL_VALID,

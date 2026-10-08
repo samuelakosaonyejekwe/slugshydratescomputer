@@ -6,7 +6,7 @@
 // SI units inside; bara, °C, mm and µm at the interfaces.
 import { clamp, brent, interp1, tridiag, rng, mean, std, quantile, linspace, histogram, gci, isNum } from '../core/num.js';
 import { fluidModel } from '../core/thermo.js';
-import { G, frictionFactor, hInside, hOutside, uValue, seaTemperature, stratifiedLevel, flowPattern, slugVelocity, slugBodyHoldup, slugFrequency, slugLength, severeSlugging, gradient, discretise } from '../core/pipe.js';
+import { G, frictionFactor, hInside, hOutside, uValue, seaTemperature, stratifiedLevel, flowPattern, slugVelocity, slugBodyHoldup, slugFrequency, slugLength, severeSlugging, gradient, discretise, marchSteady } from '../core/pipe.js';
 import { BASE } from '../data/basecase.js';
 
 const PI = Math.PI, DEG = PI / 180, FT = 0.3048, P_ATM = 101325, RGAS = 8.314462618;
@@ -304,15 +304,15 @@ export function steadySolve(o) {
   const run = (p) => { marches++; return steadyMarch({ ...base, pIn: p }); };
   if (o.pOut !== undefined && o.pOut !== null && (o.pIn === undefined || o.pIn === null)) {
     const target = o.pOut, res = (p) => { const r = run(p); sol = r; return r.ok ? r.P[N] - target : -1e3 - (N - r.reached); };
-    let pIn = null, guess = o.pGuess;
-    if (!isNum(guess) && N > 40) { const c = steadySolve({ ...o, grid: undefined, n: 30, hydrate: false }); if (!c.ok) return c; guess = c.pIn; marches += c.marches; }
+    let pIn = null, guess = o.pGuess; const tol = o.tolP || 1e-6;
+    if (!isNum(guess) && N > 40) { const c = steadySolve({ ...o, grid: undefined, n: 30, hydrate: false, tolP: 1e-3 }); if (!c.ok) return c; guess = c.pIn; marches += c.marches; }
     if (isNum(guess)) { // secant from the guess
       let p0 = Math.max(guess, 1.05), f0 = res(p0), p1 = f0 > -900 ? Math.max(p0 - f0, 1.05) : null;
-      if (Math.abs(f0) < 1e-6) pIn = p0;
+      if (Math.abs(f0) < tol) pIn = p0;
       for (let k = 0; pIn === null && p1 !== null && k < 12; k++) {
         const f1 = res(p1);
         if (f1 <= -900 || p1 === p0) break;
-        if (Math.abs(f1) < 1e-6) { pIn = p1; break; }
+        if (Math.abs(f1) < tol) { pIn = p1; break; }
         const slope = (f1 - f0) / (p1 - p0), pn = slope > 0.05 ? p1 - f1 / slope : p1 - f1;
         p0 = p1; f0 = f1; p1 = clamp(pn, Math.max(1.05, 0.5 * p1), 2 * p1 + 5);
       }
@@ -322,7 +322,7 @@ export function steadySolve(o) {
       if (res(lo) > 0) return { ok: false, reason: `The line gains more pressure from elevation than it loses to friction: even ${lo} bara at the inlet arrives above the ${target} bara outlet pressure.` };
       while (fhi < 0 && hi < 1400 && g++ < 40) { lo = hi; hi = hi * 1.35 + 10; fhi = res(hi); }
       if (fhi < 0) return { ok: false, reason: 'No inlet pressure below 1,400 bara can deliver this rate: the line is too small, too long or blocked.' };
-      pIn = brent(res, lo, hi, 1e-7);
+      pIn = brent(res, lo, hi, Math.min(tol, 1e-4));
     }
     sol = run(pIn);
     if (!sol.ok) { sol = run(pIn * (1 + 1e-9) + 1e-7); if (!sol.ok) return { ok: false, reason: 'The shooting on the inlet pressure did not converge for this rate.' }; }
@@ -397,8 +397,9 @@ export function flowConfig(v = {}, ctx = {}) {
   const energy = v.energy === 'cpjt' ? 'cpjt' : 'enthalpy', n = Math.round(num(v.nSteady, 150, 8, 4000)), zEnd = profile.z[profile.z.length - 1], zBase = interp1(profile.x, profile.z, riserBaseX);
   const riserHeight = zEnd - zBase, hasRiser = riserBaseX < L - 1e-6 && riserHeight > 20 * id0;
   const fittings = (Array.isArray(v.fittings) ? v.fittings : []).map((r) => ({ x: +r?.x, K: +r?.K * (isNum(+r?.open) && +r.open > 0 && +r.open < 100 ? (100 / +r.open) ** 2 : 1) })).filter((r) => Number.isFinite(r.x) && r.K > 0).map((r) => ({ s: sOfX(clamp(r.x, 0, L)), K: r.K })), kTotal = num(v.kLoss, 0, 0, 1e5);
-  const cfg = { fm, profile, length: L, fittings, kTotal, id, id0, idMin, wt, rough, idOf, od, layers, thermal, uMode, uOf, U: uIn * uMult, uMult, network, tAmbOf, heat, tIn: num(v.tIn, BASE.tIn, -40, 250), pOut: num(v.pOut, BASE.pOut, 1.05, 1300), model, fModel, mp, energy, n, riserBaseX, riserBaseS: sOfX(riserBaseX), hasRiser, riserHeight, sOfX, xOfS, burialDepth, kSoil, insT, insK, kWall, current, wind, cErosion: num(v.cErosion, 100, 30, 400), buriedAt };
-  cfg.base = { fm, profile, n, id, rough, idOf, kTotal, fittings, tIn: cfg.tIn, model, fModel, mp, energy, uOf, U: cfg.U, tAmbOf, heatOf: heat > 0 ? () => heat : null, cErosion: cfg.cErosion };
+  const chokeDp = num(v.chokeDp, 0, 0, 500), chokeOpening = num(v.chokeOpening, 100, 1, 100);
+  const cfg = { fm, profile, length: L, fittings, kTotal, chokeDp, chokeOpening, chokeLoss: (m) => chokeDp * m * m * (100 / chokeOpening) ** 2, id, id0, idMin, wt, rough, idOf, od, layers, thermal, uMode, uOf, U: uIn * uMult, uMult, network, tAmbOf, heat, tIn: num(v.tIn, BASE.tIn, -40, 250), pSep: num(v.pOut, BASE.pOut, 1.05, 1300), pOut: num(v.pOut, BASE.pOut, 1.05, 1300) + chokeDp * num(v.rateFrac, 1, 1e-4, 20) ** 2 * (100 / chokeOpening) ** 2, model, fModel, mp, energy, n, riserBaseX, riserBaseS: sOfX(riserBaseX), hasRiser, riserHeight, sOfX, xOfS, burialDepth, kSoil, insT, insK, kWall, current, wind, cErosion: num(v.cErosion, 100, 30, 400), buriedAt };
+  cfg.base = { fm, profile, n, id, rough, idOf, kTotal, fittings, tolP: num(v.tolP, 1e-6, 1e-9, 0.1), tIn: cfg.tIn, model, fModel, mp, energy, uOf, U: cfg.U, tAmbOf, heatOf: heat > 0 ? () => heat : null, cErosion: cfg.cErosion };
   return cfg;
 }
 
@@ -525,7 +526,7 @@ export function mandhaneRegime(vsl, vsg) {
  * Hydrodynamic slug unit cell at one location with selectable closures.
  * p: { vsl, vsg, rhoL, rhoG, muL, muG, sigma, D, theta }
  * o: { freqModel: 'zabaras' | 'gregory' | 'heywood' | 'unitCell', lengthModel: 'scott' | 'brill' | 'norris', vtModel: 'bendiksen' | 'nicklin',
- *      bodyModel: 'gregory' | 'barnea', freqMult, lenMult }
+ *      bodyModel: 'gregory' | 'barnea', freqMult, lenMult, filmMult (multiplier on the film holdup) }
  * Returns { vt, C0, vd, holdupSlug, holdupFilm, holdup, slugFraction, freq, period, length, lengthFromFreq, lengthMax, unitLength,
  *           volume (m³ liquid per slug), filmThickness (m), filmVelocity, vBody (liquid velocity in the slug body), pickup (m³/s scooped at the front) }.
  */
@@ -539,7 +540,7 @@ export function slugUnitCell(p, o = {}) {
   const vGb = 1.2 * vm + 1.53 * ((G * sigma * dRho) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * sinP;
   const holdup = clamp((vt * HLS + vGb * (1 - HLS) - vsg) / vt, vsl / Math.max(vm, 1e-9), 1);
   let HLF = clamp(stratifiedLevel({ ...p, vsl: Math.max(vsl * 0.3, 1e-4), theta: Math.min(theta, 0.15) }).holdup, 0.01, 0.9 * HLS);
-  HLF = Math.min(HLF, holdup * 0.98);
+  HLF = clamp(Math.min(HLF, holdup * 0.98) * (o.filmMult || 1), 0.005, Math.min(0.95 * HLS, 0.98 * holdup));
   const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), dIn = D / 0.0254;
   const length = (o.lenMult || 1) * (o.lengthModel === 'norris' ? Math.exp(-2.099 + 4.859 * Math.sqrt(Math.log(Math.max(dIn, 1.01)))) * FT : slugLength(D, vm, o.lengthModel === 'brill' ? 'brill' : 'scott'));
   const unitLength = length / beta, lam = vsl / Math.max(vm, 1e-9);
@@ -558,7 +559,7 @@ export function slugUnitCell(p, o = {}) {
  * (thicker film on upward slopes → growth, thinner on downward slopes → decay). Slugs that catch the one ahead merge and
  * slugs that shrink below two diameters dissipate.
  * f: { s[] (uniform), vt[], holdupSlug[], shed[] (developed shedding = pick-up rate per area, m/s), mod[] (pick-up ratio of the terrain-equilibrium film to the developed film), D, A }
- * o: { sites: [{ s, freq (1/s), length (m mean at initiation) }], nSlugs, seed, sigmaL, sigmaT, prefill, qDrain (m³/s), qSlugOut, qFilmOut (m³/s), relax (m), maxOps }
+ * o: { sites: [{ s, freq (1/s), length (m mean at initiation) }], nSlugs, seed, sigmaL, sigmaT, prefill, qDrain (m³/s) | drainFactor (× the mean liquid arrival rate), qSlugOut, qFilmOut (m³/s), relax (m), maxOps }
  * Returns { n, arrivals: [{ t, length, volume, velocity }], meanLength, stdLength, p50, p90, p99, maxLength, lognormal { mu, sigma }, length1000,
  *           freqArrival, period, merges, dissipated, generated, surge, surgeSingle (m³), hist, from (m), tSim (s) }.
  */
@@ -577,7 +578,7 @@ export function slugTracking(f, o = {}) {
   if (prefill) { let x = Ltot - R.uniform(0, 1) * unit0; while (x > sites[0].s + unit0) { const sp = at(f.vt, x) * lnT(sites[0].freq), L = Math.min(lnL(sites[0].length), 0.9 * sp); slugs.push({ xt: x - L, L, rec: null }); x -= sp; } }
   sites.forEach((q) => { q.next = lnT(q.freq) * R.uniform(0, 1); });
   const fMax = Math.max(...sites.map((q) => q.freq)), tMax = (prefill ? 0 : (Ltot - from) / Math.max(at(f.vt, from), 0.1)) + (2.5 * nSlugs) / sites[0].freq;
-  const lCap = 40 * Math.max(...sites.map((q) => q.length));
+  const lCap = 12 * Math.max(...sites.map((q) => q.length)); // liquid available to one slug
   let steps = 0, dt = clamp(Math.min(0.2 / fMax, (0.5 * sites[0].length) / Math.max(at(f.vt, Ltot), 0.1)), 0.05, 30), t = 0, ops = 0, merges = 0, dissipated = 0, generated = slugs.length;
   const arrivals = [], wake = (L, th) => (Math.abs(th) > 0.8 ? 1 + 8 * Math.exp((-1.06 * L) / D) : 1 + 0.56 * Math.exp((-0.46 * L) / D)); // Moissis–Griffith (steep) / Cook–Behnia (near horizontal)
   while (arrivals.length < nSlugs && t < tMax && ops < maxOps && steps++ < 60000) {
@@ -606,7 +607,9 @@ export function slugTracking(f, o = {}) {
   arrivals.sort((a, b) => a.t - b.t);
   const Ls = arrivals.map((q) => q.length), lg = Ls.map(Math.log), mu = mean(lg), sgm = std(lg), span = arrivals[arrivals.length - 1].t - arrivals[0].t, freqArrival = span > 0 ? (arrivals.length - 1) / span : 0;
   // receiving-vessel surge: slug bodies arrive at the slug liquid rate, the film in between, the vessel drains at qDrain
-  const qS = o.qSlugOut ?? 0, qF = Math.max(o.qFilmOut ?? 0, 0), qD = o.qDrain ?? 0;
+  const qS = o.qSlugOut ?? 0, qF = Math.max(o.qFilmOut ?? 0, 0);
+  let qD = o.qDrain ?? 0;
+  if (o.drainFactor) { let vIn = 0, tS = 0; for (const a of arrivals) { const dur = a.length / Math.max(a.velocity, 1e-6); vIn += qS * dur; tS += dur; } qD = (o.drainFactor * (vIn + qF * Math.max(span - tS, 0))) / Math.max(span, 1e-9); } // drain relative to the mean liquid arrival of the record
   let lvl = 0, surge = 0, tPrev = arrivals[0].t;
   for (const a of arrivals) { lvl = Math.max(lvl - (qD - qF) * Math.max(a.t - tPrev, 0), 0); const dur = a.length / Math.max(a.velocity, 1e-6); lvl = Math.max(lvl + (qS - qD) * dur, 0); surge = Math.max(surge, lvl); tPrev = a.t + dur; }
   const maxLength = Math.max(...Ls), hs = arrivals[arrivals.length - 1].hs, vOut = arrivals[arrivals.length - 1].velocity, single = (L) => Math.max(L * A * hs * (1 - (qS > 0 ? Math.min(qD / qS, 1) : 0)), 0);
@@ -683,6 +686,7 @@ export function riserSluggingCycle(o) {
   const sinB = Math.sin(Math.max(o.feedAngle || 0, 0)), sinG = hR / Lr, al = clamp(1 - (o.alphaL ?? 0.3), 0.05, 0.98), gasK = (zG * RGAS * T) / (mwG * 1e-3), qL = wL / rhoL, phi = clamp(o.fallback ?? 0.12, 0, 0.6), zc = clamp((o.chokeOpening ?? 100) / 100, 0.02, 1);
   const muL = o.muL || 2e-3, rel = rough / D, fH = (Re) => (Re < 2000 ? 64 / Math.max(Re, 1) : 1 / (-1.8 * log10((rel / 3.7) ** 1.11 + 6.9 / Re)) ** 2);
   const rhoG0 = pSep / gasK, u0 = (qL + wG / rhoG0) / A, lam0 = qL / (u0 * A), chokeK = (o.chokeDp ?? 1e5) / ((lam0 * rhoL + (1 - lam0) * rhoG0) * u0 * u0) / (zc * zc); // Δp_choke = chokeK ρ u²
+  const gasFr = (0.015 * Lp) / 3 / (2 * D); // gas-side friction coefficient of the feed line (the pocket empties over about a third of its length)
   const Vg = (x) => al * A * (Lp - x), head = rhoL * G, tFill = (A * Lr) / qL, pTopL = pSep + chokeK * rhoL * (qL / A) ** 2;
   const ts = [], pb = [], pf = [], wl = [], wg = [], lv = [], sg = [], rec = (t, P, Pg, ql, wgo, lev, st) => { ts.push(t); pb.push(P); pf.push(Pg); wl.push(ql * rhoL); wg.push(wgo); lv.push(lev); sg.push(st); };
   // liquid front in the feed line from the hydrostatic balance (−1 when the gas pressure exceeds the liquid head: gas penetrates)
@@ -718,9 +722,9 @@ export function riserSluggingCycle(o) {
     let Ls = Math.min(full ? Lr : Math.max(ell - al * x, 0.02 * Lr), Lr), b = 0, u = qL / A, pool = 0, t3 = 0, blown = false;
     for (n = 0; n < 60000 && t3 < 4 * tFill; n++) {
       const top = b + Ls >= Lr - 1e-9, Pg = (mg * gasK) / (Vg(0) + A * b * (1 - phi)), h = Math.min(0.5, (0.01 * Lr) / Math.max(Math.abs(u), 0.2), tFill / 200), au = Math.abs(u);
-      const drive = (Pg - pSep - head * Ls * sinG) / (rhoL * Ls), damp = (fH((rhoL * au * D) / muL) * au) / (2 * D) + (top ? (chokeK * au) / Ls : 0);
+      const drive = (Pg - pSep - head * Ls * sinG) / (rhoL * Ls), damp = (fH((rhoL * au * D) / muL) * au) / (2 * D) + (top ? (chokeK * au) / Ls : 0) + (gasFr * (Pg / gasK) * au) / (rhoL * Ls); // wall friction, choke, friction of the gas feeding the bubble
       u = (u + h * drive) / (1 + h * damp); b = Math.max(b + u * h, 0); if (b + Ls >= Lr) { Ls = Math.max(Lr - b, 0); } mg += wG * h; pool += (qL / A) * h; t += h; t3 += h; c.d[2] += h;
-      const P = Pg, qo = b + Ls >= Lr - 1e-9 ? A * Math.max(u, 0) : 0; note(P, qo, 0); rec(t, P, Pg, qo, 0, Ls / Lr, 2);
+      const P = Pg, qo = b + Ls >= Lr - 1e-9 ? A * Math.max(u, 0) : 0; note(P, Ls > 0.3 * Lr ? qo : 0, 0); rec(t, P, Pg, qo, 0, Ls / Lr, 2); // the peak rate is taken while the bulk of the column is still in the riser
       if (Ls < 0.05 * Lr) { blown = true; break; }
       if (b <= 0 && u < 0) break; // the column settled back: the low point is blocked again
     }
@@ -729,7 +733,7 @@ export function riserSluggingCycle(o) {
     if (blown) for (n = 0; n < 20000; n++) {
       const Pg = (mg * gasK) / Vg(0), block = pSep + head * ell * sinG;
       if (Pg <= block) break;
-      const rg = Pg / gasK, ug = Math.min(Math.sqrt((Pg - pSep) / (rg * ((0.02 * Lr) / (2 * D) + chokeK))), Math.sqrt(gasK)), wo = rg * A * ug, h = clamp((0.03 * mg) / Math.max(Math.abs(wo - wG), 1e-9), 0.01, tFill / 300);
+      const rg = Pg / gasK, ug = Math.min(Math.sqrt((Pg - pSep) / (rg * ((0.02 * Lr) / (2 * D) + gasFr + chokeK))), Math.sqrt(gasK)), wo = rg * A * ug, h = clamp((0.03 * mg) / Math.max(Math.abs(wo - wG), 1e-9), 0.01, tFill / 300);
       mg += (wG - wo) * h; ell += (qL / A) * h; t += h; c.d[3] += h; note(Pg, 0, wo); rec(t, Pg, Pg, 0, wo, ell / Lr, 3);
     }
     mg = Math.max(mg, ((pSep + head * ell * sinG) * Vg(0)) / gasK * 0.999);
@@ -794,12 +798,13 @@ export function makeTransient(o) {
     const pr = fm.at(o.init.P[i], o.init.T[i]), H = clamp(o.init.holdup[i], 0, 1), rs = rsOf(pr);
     P[i] = o.init.P[i] * 1e5; T[i] = o.init.T[i]; md[i] = (H * pr.rhoL) / (1 + rs); Gc[i] = (1 - H) * pr.rhoG + rs * md[i];
   }
-  { const W = (o.mdot0 ?? mdotOf(0)) / A; for (let f = 0; f <= N; f++) { const i = Math.min(f, N - 1), pr = fm.at(P[i] / 1e5, T[i]), xg = xgOf(pr); jf[f] = W * (xg / pr.rhoG + (1 - xg) / pr.rhoL); vgF[f] = vlF[f] = jf[f]; } }
+  let last0 = { qL: 0, qG: 0, mOut: 0 };
+  { const W = (o.mdot0 ?? mdotOf(0)) / A; for (let f = 0; f <= N; f++) { const i = Math.min(f, N - 1), pr = fm.at(P[i] / 1e5, T[i]), xg = xgOf(pr); jf[f] = W * (xg / pr.rhoG + (1 - xg) / pr.rhoL); vgF[f] = vlF[f] = jf[f]; if (f === N) last0 = { qL: (W * (1 - xg) * A) / pr.rhoL, qG: (W * xg * A) / pr.rhoG, mOut: W * A }; } }
   const total = () => { let m = 0, e = 0; for (let i = 0; i < N; i++) { m += (Gc[i] + md[i]) * grid.ds[i] * A; e += (cG * Gc[i] + cD * md[i] + wallC) * T[i] * grid.ds[i] * A; } return { m, e }; };
   const pCap = (2.5 * Math.max(...o.init.P) + 50) * 1e5, start = total(), bal = { mIn: 0, mOut: 0, eIn: 0, eOut: 0, eLoss: 0, volErr: 0 };
   const ser = { t: [], pIn: [], pOutCell: [], qLiqOut: [], qGasOut: [], holdupOut: [], mOut: [], inv: [], tOut: [] }, fld = { t: [], holdup: [], P: [], T: [] };
   const nField = o.nField || 60, nSeries = o.nSeries || 400;
-  let t = 0, dt = Math.min(dtMax, 1), steps = 0, relax = 1, rejected = 0, nextField = 0, last = { qL: 0, qG: 0, mOut: 0 };
+  let t = 0, dt = Math.min(dtMax, 1), steps = 0, relax = 1, rejected = 0, aborted = null, nextField = 0, last = last0;
   const record = () => {
     let inv = 0; for (let i = 0; i < N; i++) inv += Hh[i] * grid.ds[i] * A;
     ser.t.push(t); ser.pIn.push((P[0] + ((P[0] - P[1]) * grid.ds[0]) / (grid.ds[0] + grid.ds[1])) / 1e5); ser.pOutCell.push(P[N - 1] / 1e5); ser.qLiqOut.push(last.qL); ser.qGasOut.push(last.qG); ser.holdupOut.push(Hh[N - 1]); ser.mOut.push(last.mOut); ser.inv.push(inv); ser.tOut.push(T[N - 1]);
@@ -843,7 +848,7 @@ export function makeTransient(o) {
     for (let i = 0; i < N; i++) { // pressure (volume-conservation) equation
       const r = dt / grid.ds[i], cm = gG[i] * AGf[i] + gD[i] * ADf[i], cp = gG[i] * AGf[i + 1] + gD[i] * ADf[i + 1];
       sub[i] = i > 0 ? r * cm * bco[i] : 0; sup[i] = i < N - 1 ? r * cp * bco[i + 1] : 0; dia[i] = kap[i] - r * (cp * bco[i + 1] + (i > 0 ? cm * bco[i] : 0));
-      rhs[i] = kap[i] * P[i] - 0.5 * clamp(Vv[i], -0.03, 0.03) + r * (gG[i] * (BGf[i + 1] - BGf[i]) + gD[i] * (BDf[i + 1] - BDf[i])) + r * (cp * jst[i + 1] - (i > 0 ? cm * jst[i] : 0)) - (i === N - 1 ? r * cp * bco[N] * pOut : 0);
+      rhs[i] = kap[i] * P[i] - clamp(Vv[i], -0.1, 0.1) + r * (gG[i] * (BGf[i + 1] - BGf[i]) + gD[i] * (BDf[i + 1] - BDf[i])) + r * (cp * jst[i + 1] - (i > 0 ? cm * jst[i] : 0)) - (i === N - 1 ? r * cp * bco[N] * pOut : 0);
     }
     const Pn = tridiag(sub, dia, sup, rhs);
     for (let i = 0; i < N; i++) Pn[i] = Number.isFinite(Pn[i]) ? clamp(Pn[i], 5e4, pCap) : P[i];
@@ -889,6 +894,7 @@ export function makeTransient(o) {
       if (ve <= 0.05 || dt <= 0.5 || k === 3) break;
       state.forEach((a, i) => a.set(keep[i])); Object.assign(bal, b0); t = t0; steps = s0; last = l0; dtTry = 0.4 * dt; rejected++; cellProps();
     }
+    if (ve > 0.25) { aborted = t; return false; } // outside the validity range of the scheme (liquid-full line with pressure surges)
     bal.volErr = Math.max(bal.volErr, ve); relax = ve > 0.01 ? Math.max(0.7 * relax, 0.05) : Math.min(1, relax * 1.1);
     record();
     return t < tEnd - 1e-9;
@@ -899,7 +905,7 @@ export function makeTransient(o) {
     result() {
       const end = total(), every = Math.max(1, Math.ceil(ser.t.length / nSeries)), pick = (a) => a.filter((_, i) => i % every === 0 || i === a.length - 1);
       const series = Object.fromEntries(Object.entries(ser).map(([k, a]) => [k, pick(a)]));
-      return { ...series, steps, rejected, dtMean: steps ? t / steps : 0, tEnd: t, xgMax, field: { s: grid.sc.slice(), x: grid.xc.slice(), t: fld.t, holdup: fld.holdup, P: fld.P, T: fld.T },
+      return { ...series, steps, rejected, aborted, dtMean: steps ? t / steps : 0, tEnd: t, xgMax, field: { s: grid.sc.slice(), x: grid.xc.slice(), t: fld.t, holdup: fld.holdup, P: fld.P, T: fld.T },
         mass: { initial: start.m, final: end.m, inflow: bal.mIn, outflow: bal.mOut, error: (end.m - start.m - bal.mIn + bal.mOut) / Math.max(start.m, 1e-9) },
         energy: { initial: start.e, final: end.e, inflow: bal.eIn, outflow: bal.eOut, loss: bal.eLoss, error: (end.e - start.e - bal.eIn + bal.eOut + bal.eLoss) / Math.max(Math.abs(start.e) + Math.abs(bal.eIn), 1e-9) },
         volErrMax: bal.volErr, final: { P: Array.from(P, (p) => p / 1e5), T: Array.from(T), holdup: Array.from(Hh), j: Array.from(jf) } };
@@ -909,7 +915,742 @@ export function makeTransient(o) {
 }
 /**
  * Run the transient drift-flux solver to the end time (options as makeTransient).
- * Returns { t[], pIn[] (bara), qLiqOut[], qGasOut[] (actual m³/s), holdupOut[], mOut[] (kg/s), inv[] (m³ liquid in the line), tOut[], steps, dtMean,
+ * Returns { aborted (s | null: time at which the run left the validity range and was stopped), t[], pIn[] (bara), qLiqOut[], qGasOut[] (actual m³/s), holdupOut[], mOut[] (kg/s), inv[] (m³ liquid in the line), tOut[], steps, dtMean,
  *   field: { s[], x[], t[], holdup[][], P[][], T[][] }, mass: { initial, final, inflow, outflow, error }, energy: { …, loss, error }, volErrMax, final: { P, T, holdup, j } }.
  */
 export function transientDriftFlux(o) { const sim = makeTransient(o); while (!sim.done) sim.advance(200); return sim.result(); }
+
+// =====================================================================================================
+// 7. Local high-resolution models: 1-D radial RANS of developed pipe flow, 1-D interface capturing
+// =====================================================================================================
+/**
+ * Fully developed turbulent flow in a smooth pipe by a 1-D radial Reynolds-averaged solve in wall units.
+ * model: 'laminar' | 'mixing' (Nikuradse mixing length with van Driest damping) | 'komega' (Wilcox 1988, low-Reynolds wall treatment by
+ * the analytic near-wall ω) | 'kepsilon' (Chien 1982 low-Reynolds k–ε). The total shear stress is linear in r, so the momentum equation
+ * reduces to du⁺/dy⁺ = (1 − y/R)/(1 + ν_t⁺); k and ω or ε are solved by under-relaxed finite-volume iteration.
+ * o: { reTau (R u_τ / ν), model, n, maxIter, tol }. Returns { Re, f (Darcy), reTau, y[] (y⁺), u[] (u⁺), r[] (r/R), uRel[] (u / U_bulk), nut[], k[], iterations, residual, converged }.
+ */
+export function ransPipe(o = {}) {
+  const Rp = Math.max(o.reTau || 1000, 5), model = o.model || 'komega', n = o.n || 120, maxIter = o.maxIter || 6000, tol = o.tol || 1e-9;
+  // geometric grid from the wall, first node at y⁺ ≈ 0.1
+  const y1 = Math.min(0.1, Rp / (4 * n)), g = (q) => (y1 * (q ** n - 1)) / (q - 1) - Rp, q = g(1 + 1e-9) >= 0 ? 1 + 1e-9 : brent(g, 1 + 1e-9, 3, 1e-13), y = [0];
+  for (let j = 1; j <= n; j++) y.push(j === n ? Rp : (y1 * (q ** j - 1)) / (q - 1));
+  const r = y.map((v) => Rp - v), nut = new Array(n + 1).fill(0), u = new Array(n + 1).fill(0), S = new Array(n + 1).fill(0);
+  const mix = (yy) => { const e = 1 - yy / Rp, l = Rp * (0.14 - 0.08 * e * e - 0.06 * e ** 4) * (1 - Math.exp(-yy / 26)); return l; };
+  const velocity = () => { // integrate du/dy with mid-point eddy viscosity; returns the bulk velocity
+    for (let j = 0; j <= n; j++) S[j] = (1 - y[j] / Rp) / (1 + nut[j]);
+    for (let j = 1; j <= n; j++) u[j] = u[j - 1] + 0.5 * (S[j] + S[j - 1]) * (y[j] - y[j - 1]);
+    let ub = 0; for (let j = 1; j <= n; j++) ub += 0.5 * (u[j] * r[j] + u[j - 1] * r[j - 1]) * (y[j] - y[j - 1]);
+    return (2 * ub) / (Rp * Rp);
+  };
+  const mixingNut = () => { for (let j = 0; j <= n; j++) { const l = mix(y[j]), e = 1 - y[j] / Rp, s = (2 * e) / (1 + Math.sqrt(1 + 4 * l * l * e)); nut[j] = l * l * s; } };
+  let ub, it = 0, res = 0, k = null;
+  if (model === 'laminar') ub = velocity();
+  else if (model === 'mixing') { mixingNut(); ub = velocity(); }
+  else {
+    mixingNut(); ub = velocity();
+    const ke = model === 'kepsilon', bS = 0.09, kk = y.map((_, j) => Math.max((nut[j] * S[j]) / 0.3, 1e-10)), ww = y.map((yy, j) => (ke ? Math.max((0.09 * kk[j] * kk[j]) / Math.max(nut[j], 1e-6), 1e-10) : j === 0 ? 0 : Math.max(kk[j] / Math.max(nut[j], 1e-6), 6 / (0.075 * yy * yy) * (yy < 2.5 ? 1 : 0))));
+    kk[0] = 0; if (ke) ww[0] = 0;
+    const a = new Array(n + 1), b = new Array(n + 1), c = new Array(n + 1), d = new Array(n + 1), ur = 0.5;
+    const solve = (phi, gam, src, sink, fixed) => {
+      for (let j = 0; j <= n; j++) {
+        if (j === 0 || (fixed && fixed[j] !== undefined)) { a[j] = 0; c[j] = 0; b[j] = 1; d[j] = j === 0 && !fixed ? 0 : fixed ? fixed[j] : 0; continue; }
+        if (j === n) { a[j] = -1; b[j] = 1; c[j] = 0; d[j] = 0; continue; }
+        const we = (0.5 * (r[j] + r[j + 1]) * 0.5 * (gam[j] + gam[j + 1])) / (y[j + 1] - y[j]), wwst = (0.5 * (r[j] + r[j - 1]) * 0.5 * (gam[j] + gam[j - 1])) / (y[j] - y[j - 1]), vol = (r[j] * (y[j + 1] - y[j - 1])) / 2, bb = (wwst + we + sink[j] * vol) / ur;
+        a[j] = -wwst; c[j] = -we; b[j] = bb; d[j] = src[j] * vol + (1 - ur) * bb * phi[j];
+      }
+      const x = tridiag(a, b, c, d); for (let j = 0; j <= n; j++) phi[j] = Math.max(x[j], j === 0 ? 0 : 1e-12);
+    };
+    const gam = new Array(n + 1), src = new Array(n + 1), sink = new Array(n + 1), fmu = y.map((yy) => 1 - Math.exp(-0.0115 * yy));
+    const wFix = ke ? null : y.map((yy, j) => (j === 0 ? 60 / (0.075 * y[1] * y[1]) : yy < 2.5 ? 6 / (0.075 * yy * yy) : undefined));
+    for (it = 1; it <= maxIter; it++) {
+      if (ke) { // Chien: k and the dissipation variable ε̃ (zero at the wall)
+        for (let j = 0; j <= n; j++) { gam[j] = 1 + nut[j]; src[j] = nut[j] * S[j] * S[j]; sink[j] = j ? ww[j] / Math.max(kk[j], 1e-12) + 2 / (y[j] * y[j]) : 0; }
+        solve(kk, gam, src, sink);
+        for (let j = 0; j <= n; j++) { const Ret = (kk[j] * kk[j]) / Math.max(ww[j], 1e-12), f2 = 1 - 0.22 * Math.exp(-((Ret / 6) ** 2)); gam[j] = 1 + nut[j] / 1.3; src[j] = 1.35 * 0.09 * fmu[j] * kk[j] * S[j] * S[j]; sink[j] = j ? (1.8 * f2 * ww[j]) / Math.max(kk[j], 1e-12) + (2 * Math.exp(-0.5 * y[j])) / (y[j] * y[j]) : 0; }
+        solve(ww, gam, src, sink);
+        for (let j = 1; j <= n; j++) nut[j] = (0.09 * fmu[j] * kk[j] * kk[j]) / Math.max(ww[j], 1e-12);
+      } else { // Wilcox k–ω
+        for (let j = 0; j <= n; j++) { gam[j] = 1 + 0.5 * nut[j]; src[j] = nut[j] * S[j] * S[j]; sink[j] = bS * ww[j]; }
+        solve(kk, gam, src, sink);
+        for (let j = 0; j <= n; j++) { src[j] = (5 / 9) * S[j] * S[j]; sink[j] = 0.075 * ww[j]; }
+        solve(ww, gam, src, sink, wFix);
+        for (let j = 1; j <= n; j++) nut[j] = kk[j] / Math.max(ww[j], 1e-12);
+      }
+      nut[0] = 0;
+      const un = velocity(); res = Math.abs(un - ub) / un; ub = un;
+      if (res < tol && it > 20) break;
+    }
+    k = kk.slice();
+  }
+  const Re = 2 * Rp * ub;
+  return { Re, f: 8 / (ub * ub), reTau: Rp, y, u: u.slice(), r: r.map((v) => v / Rp), uRel: u.map((v) => v / ub), nut: nut.slice(), k, iterations: it, residual: res, converged: model === 'laminar' || model === 'mixing' || res < 1e-6 };
+}
+/** Friction Reynolds number R⁺ of a smooth pipe at a bulk Reynolds number (Prandtl / Colebrook friction law). */
+export const reTauOf = (Re) => (Re / 2) * Math.sqrt(frictionFactor(Math.max(Re, 10), 0, 'colebrook') / 8);
+
+/**
+ * 1-D volume-of-fluid advection of a liquid fraction at constant velocity on a periodic domain: first-order upwind or the
+ * algebraic interface-capturing THINC flux (hyperbolic-tangent reconstruction, Xiao et al.), both conservative.
+ * o: { n, cfl, beta, scheme: 'thinc' | 'upwind', length, u, tEnd, phi0: fn(x) }.
+ * Returns { x[], phi[], exact[], mass0, mass, massError, l1 (mean absolute error), thickness (cells between 5 % and 95 % per interface), min, max }.
+ */
+export function vofAdvect1D(o = {}) {
+  const n = o.n || 200, L = o.length || 1, u = o.u ?? 1, dx = L / n, cfl = o.cfl || 0.4, beta = o.beta || 2.5, tEnd = o.tEnd ?? L / Math.abs(u || 1), thinc = o.scheme !== 'upwind';
+  const f0 = o.phi0 || ((x) => (x > 0.25 * L && x < 0.55 * L ? 1 : 0)), x = Array.from({ length: n }, (_, i) => (i + 0.5) * dx);
+  let phi = x.map(f0); const mass0 = phi.reduce((s, v) => s + v, 0) * dx, steps = Math.max(1, Math.ceil((Math.abs(u) * tEnd) / (cfl * dx))), c = (Math.abs(u) * tEnd) / steps / dx, F = new Array(n);
+  for (let s = 0; s < steps; s++) {
+    for (let i = 0; i < n; i++) { // flux through the downstream face of cell i (u > 0), as a fraction of the cell volume
+      const p = phi[i], pm = phi[(i - 1 + n) % n], pp = phi[(i + 1) % n];
+      let fl = c * p;
+      if (thinc && p > 1e-6 && p < 1 - 1e-6 && (pp - p) * (p - pm) > 0) {
+        const gm = pp > pm ? 1 : -1, qq = (beta * (2 * p - 1)) / gm, w = (Math.exp(beta) - Math.exp(qq)) / (Math.exp(qq) - Math.exp(-beta));
+        if (w > 0 && Number.isFinite(w)) { const xt = Math.log(w) / (2 * beta); fl = 0.5 * (c + (gm / beta) * (Math.log(Math.cosh(beta * (1 - xt))) - Math.log(Math.cosh(beta * (1 - c - xt))))); }
+      }
+      F[i] = clamp(fl, Math.max(0, c - (1 - p)), Math.min(c, p));
+    }
+    phi = phi.map((p, i) => p - F[i] + F[(i - 1 + n) % n]);
+  }
+  const shift = u * tEnd, exact = x.map((xx) => f0((((xx - shift) % L) + L) % L)), mass = phi.reduce((s, v) => s + v, 0) * dx;
+  let inter = 0, edges = 0; for (let i = 0; i < n; i++) { if (phi[i] > 0.05 && phi[i] < 0.95) inter++; if (exact[i] !== exact[(i + 1) % n]) edges++; }
+  return { x, phi, exact, mass0, mass, massError: Math.abs(mass - mass0) / Math.max(mass0, 1e-12), l1: mean(phi.map((p, i) => Math.abs(p - exact[i]))), thickness: inter / Math.max(edges, 1), min: Math.min(...phi), max: Math.max(...phi), steps };
+}
+
+/**
+ * Dam-break of a liquid layer in a horizontal channel (collapse of a slug tail onto the film): shallow-water equations,
+ * finite volume with the HLL flux, compared with the exact Ritter (dry bed) or Stoker (wet bed) solution.
+ * o: { hL, hR (m), length (m, dam in the middle), n, tEnd (s), cfl }. Returns { x[], h[], u[], exact[], l1 (relative), massError, tEnd }.
+ */
+export function damBreak(o = {}) {
+  const hL = o.hL ?? 1, hR = Math.max(o.hR ?? 0, 0), n = o.n || 300, L = o.length || 20 * hL, dx = L / n, cfl = o.cfl || 0.45, cL = Math.sqrt(G * hL), tEnd = o.tEnd ?? (0.2 * L) / cL, dry = 1e-9 * hL;
+  const x = Array.from({ length: n }, (_, i) => -L / 2 + (i + 0.5) * dx); let h = x.map((v) => (v < 0 ? hL : hR)), q = new Array(n).fill(0), t = 0;
+  const m0 = h.reduce((s, v) => s + v, 0) * dx, flux = (h1, q1, h2, q2) => {
+    const u1 = h1 > dry ? q1 / h1 : 0, u2 = h2 > dry ? q2 / h2 : 0, c1 = Math.sqrt(G * h1), c2 = Math.sqrt(G * h2);
+    const sL = h1 > dry ? Math.min(u1 - c1, h2 > dry ? u2 - c2 : u1 - c1) : u2 - 2 * c2, sR = h2 > dry ? Math.max(u2 + c2, h1 > dry ? u1 + c1 : u2 + c2) : u1 + 2 * c1;
+    const f1 = [q1, q1 * u1 + 0.5 * G * h1 * h1], f2 = [q2, q2 * u2 + 0.5 * G * h2 * h2];
+    if (sL >= 0) return f1; if (sR <= 0) return f2;
+    return [(sR * f1[0] - sL * f2[0] + sL * sR * (h2 - h1)) / (sR - sL), (sR * f1[1] - sL * f2[1] + sL * sR * (q2 - q1)) / (sR - sL)];
+  };
+  while (t < tEnd - 1e-12) {
+    let smax = 1e-9; for (let i = 0; i < n; i++) smax = Math.max(smax, (h[i] > dry ? Math.abs(q[i] / h[i]) : 0) + Math.sqrt(G * h[i]));
+    const dt = Math.min((cfl * dx) / smax, tEnd - t), F = []; for (let i = 0; i <= n; i++) { const a = Math.max(i - 1, 0), b = Math.min(i, n - 1); F.push(flux(h[a], i === 0 ? -q[a] : q[a], h[b], i === n ? -q[b] : q[b])); }
+    h = h.map((v, i) => Math.max(v - (dt / dx) * (F[i + 1][0] - F[i][0]), 0)); q = q.map((v, i) => v - (dt / dx) * (F[i + 1][1] - F[i][1])); t += dt;
+  }
+  let exact;
+  if (hR <= dry) exact = x.map((v) => { const xi = v / tEnd; return xi <= -cL ? hL : xi >= 2 * cL ? 0 : (2 * cL - xi) ** 2 / (9 * G); });
+  else { // Stoker: rarefaction, constant middle state, bore
+    const um = (hm) => (hm - hR) * Math.sqrt((0.5 * G * (hm + hR)) / (hm * hR)), hm = brent((v) => 2 * (cL - Math.sqrt(G * v)) - um(v), hR, hL, 1e-13), u2 = um(hm), cm = Math.sqrt(G * hm), sb = (hm * u2) / (hm - hR);
+    exact = x.map((v) => { const xi = v / tEnd; return xi <= -cL ? hL : xi <= u2 - cm ? (2 * cL - xi) ** 2 / (9 * G) : xi <= sb ? hm : hR; });
+  }
+  const mass = h.reduce((s, v) => s + v, 0) * dx;
+  return { x, h, u: h.map((v, i) => (v > dry ? q[i] / v : 0)), exact, l1: mean(h.map((v, i) => Math.abs(v - exact[i]))) / hL, massError: Math.abs(mass - m0) / m0, tEnd };
+}
+
+// =====================================================================================================
+// 8. Suite assembly
+// =====================================================================================================
+const cellOf = (st, i) => ({ vsl: st.vsl[i], vsg: st.vsg[i], rhoL: st.rhoL[i], rhoG: st.rhoG[i], muL: st.muL[i], muG: st.muG[i], sigma: st.sigma[i], D: st.D[i], theta: st.theta[i] });
+const slugOpts = (v) => ({ freqModel: ['zabaras', 'gregory', 'heywood', 'unitCell'].includes(v.freqModel) ? v.freqModel : 'unitCell', lengthModel: ['scott', 'brill', 'norris'].includes(v.lengthModel) ? v.lengthModel : 'scott', vtModel: v.vtModel === 'nicklin' ? 'nicklin' : 'bendiksen', bodyModel: v.bodyModel === 'barnea' ? 'barnea' : 'gregory', freqMult: num(v.freqMult, 1, 0.01, 100), lenMult: num(v.lenMult, 1, 0.01, 100), filmMult: num(v.filmMult, 1, 0.2, 3) });
+const isSlug = (r) => r === 'slug' || r === 'churn';
+const pwl = (ts, ys) => (t) => interp1(ts, ys, t);
+const DEFAULT_SCHEDULE = [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.25, rate: 1, dp: 0, choke: 100 }, { t: 0.5, rate: 0.6, dp: 0, choke: 100 }, { t: 6, rate: 0.6, dp: 0, choke: 100 }];
+
+/** Regime (Taitel–Dukler / Barnea) at every node of a steady solution. */
+function regimes(st) { return st.vsl.map((_, i) => (st.vsl[i] > 1e-9 && st.vsg[i] > 1e-9 ? flowPattern(cellOf(st, i)).pattern : st.regime[i])); }
+
+/** Minimum stable rate: scan the rate downwards on a coarse grid and return the lowest rate fraction before severe or terrain slugging is predicted. */
+function minimumStableRate(cfg, mNow) {
+  const rates = [1.2, 1, 0.85, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12].map((r) => r * Math.max(mNow, 1e-3)), rows = [];
+  let guess, lowest = rates[0], hit = false;
+  for (const m of rates) {
+    const r = steadySolve({ ...cfg.base, n: 30, mScale: m, pOut: cfg.pOut, pGuess: guess, hydrate: false, tolP: 1e-3 });
+    if (!r.ok) break;
+    guess = r.pIn;
+    const sc = cfg.hasRiser ? severeScreen(r, { riserBaseS: cfg.riserBaseS, pSep: cfg.pSep }) : null, ter = sc ? null : terrainSlugging(r), unstable = sc ? sc.severe : ter.accumulates;
+    rows.push({ m, pIn: r.pIn, unstable, boe: sc ? sc.boe : null, pots: sc ? sc.pots : null, regime: sc ? sc.feedRegime : ter.worst ? ter.worst.downRegime : '—' });
+    if (unstable && !hit) hit = true;
+    if (!hit) lowest = m;
+  }
+  return { rate: hit ? lowest : rows.length ? rows[rows.length - 1].m : mNow, limited: hit, rows };
+}
+
+/** Transient set-up from the suite inputs and a steady solution; returns the stepper and its descriptors. */
+function buildTransient(v, st) {
+  const cfg = st.cfg, fm = cfg.fm, n = Math.round(num(v.nCells, 50, 8, 600)), grid = transientGrid(cfg.profile, n, cfg.hasRiser ? cfg.riserBaseS : Infinity, cfg.hasRiser ? num(v.riserRefine, 3, 1, 10) : 1);
+  const rows = (Array.isArray(v.schedule) && v.schedule.length ? v.schedule : DEFAULT_SCHEDULE).map((r) => ({ t: +r?.t, rate: +r?.rate, dp: +r?.dp, choke: +r?.choke })).filter((r) => Number.isFinite(r.t) && r.t >= 0).sort((a, b) => a.t - b.t);
+  if (!rows.length) rows.push({ t: 0, rate: 1, dp: 0, choke: 100 });
+  const ts = rows.map((r) => r.t * 3600), tEnd = num(v.tEnd, 2.5, 0.01, 2000) * 3600, mdotCase = st.mdot, r0 = clamp(fin(rows[0].rate, 1), 0, 10);
+  const rateOf = pwl(ts, rows.map((r) => clamp(fin(r.rate, 1), 0, 10))), dpOf = pwl(ts, rows.map((r) => fin(r.dp, 0))), chokeOf = pwl(ts, rows.map((r) => clamp(fin(r.choke, 100), 1, 100)));
+  const slip = { c0: 1.2, vdScale: 1, fricMult: 1 }, uniform = v.initMode === 'uniform', at = (ref, a) => grid.sc.map((s) => interp1(ref.s, a, s));
+  const tdSteady = (fmult, nn, guess) => steadySolve({ ...cfg.base, n: nn, model: 'transient', mp: { slip: { ...slip, fricMult: fmult } }, energy: 'cpjt', mScale: st.mScale * Math.max(r0, 0.02), pOut: cfg.pOut, pGuess: guess, hydrate: false, tolP: 1e-4 });
+  let init, matched = false, mdot0 = mdotCase * r0, ref = null;
+  if (uniform) { // settled line: uniform holdup and temperature, hydrostatic pressure from the outlet
+    const H = clamp(num(v.initHoldup, 0.5, 0, 1), 0, 1), T0 = num(v.initT, cfg.thermal.tSeabed, -40, 200), P = new Array(n); let p = num(v.initP, cfg.pSep, 1.05, 1300);
+    for (let i = n - 1; i >= 0; i--) { const pr = fm.at(p, T0), rho = pr.rhoL * H + pr.rhoG * (1 - H), dz = (i === n - 1 ? grid.z[n] : grid.zc[i + 1]) - grid.zc[i]; p += (rho * G * dz) / 1e5; P[i] = Math.max(p, 1.05); }
+    init = { P, T: P.map(() => T0), holdup: P.map(() => H) }; mdot0 = 0;
+  } else {
+    if (v.matchSteady !== false && Math.abs(r0 - 1) < 1e-9) { // tune the wall friction of the transient closure to the steady inlet pressure
+      const g = (f) => { const r = tdSteady(f, 40, st.pIn); return r.ok ? r.pIn - st.pIn : 1e3; }, lo = g(0.2), hi = g(5);
+      if (lo < 0 && hi > 0) { slip.fricMult = brent(g, 0.2, 5, 1e-3); matched = true; }
+    }
+    ref = tdSteady(slip.fricMult, st.n, st.pIn);
+    if (!ref.ok) throw new Error('The transient could not be initialised: ' + (ref.reason || 'no steady solution of the drift-flux closure at the initial rate.'));
+    init = { P: at(ref, ref.P), T: at(ref, ref.T), holdup: at(ref, ref.holdup) };
+  }
+  const mid = fm.at(0.5 * (st.pIn + st.pOut), 0.5 * (st.tIn + st.tOut)), D = cfg.idOf ? cfg.idMin : cfg.id, jOut = ref ? ref.vm[ref.n] : 1, rhoOut = ref ? ref.rhoM[ref.n] : 100;
+  const chokeK = cfg.chokeDp > 0 ? (cfg.chokeDp * 1e5 * (st.mScale * Math.max(r0, 0.05)) ** 2) / Math.max(rhoOut * jOut * jOut, 1e-6) : 0;
+  const sim = makeTransient({ fm, grid, D, rough: cfg.rough, init, mdot0, mdotOf: (t) => mdotCase * rateOf(t), tInOf: () => cfg.tIn, pOutOf: (t) => Math.max(cfg.pSep + dpOf(t), 1.05), chokeOf, chokeK,
+    slip, fricMult: slip.fricMult, U: at(st, st.U), tAmb: grid.sc.map((s, i) => cfg.tAmbOf(s, grid.zc[i])), wallC: (BASE.rhoSteel * 470 * ((D + 2 * cfg.wt) ** 2 - D * D)) / (D * D), cpG: mid.cpG, cpL: mid.cpL,
+    cfl: num(v.cfl, 0.6, 0.05, 0.95), tEnd, nSeries: 380, nField: 70, maxSteps: 60000 });
+  return { sim, grid, tEnd, slip, matched, ref, rows, uniform };
+}
+
+const INPUTS = [
+  { group: 'Boundary conditions and rates', tab: 'inputs', help: 'The well stream (composition, GOR, rates, water cut) is the case fluid; here you choose which pressures and rates are fixed.', fields: [
+    { key: 'bc', label: 'Boundary conditions', type: 'select', value: 'outletP', options: [{ value: 'outletP', label: 'Outlet pressure + rate (inlet pressure is solved)' }, { value: 'inletP', label: 'Inlet (source) pressure + rate (outlet pressure is solved)' }, { value: 'bothP', label: 'Inlet and outlet pressure (rate is solved)' }, { value: 'ipr', label: 'Well inflow + outlet pressure (rate is solved)' }] },
+    { key: 'rateFrac', label: 'Rate multiplier on the case rates', unit: '×', value: 1, min: 0.01, max: 5, typical: [0.2, 1.5], help: 'Scales the oil, gas and water mass rates of the case fluid together (GOR and water cut unchanged).', showIf: (v) => v.bc === 'outletP' || v.bc === 'inletP' || !v.bc },
+    { key: 'wc', label: 'Water cut', unit: '%', value: 20, min: 0, max: 98, typical: [0, 90], help: 'Water cut of the stock-tank liquid (oil-rate basis). Changing it rebuilds the stream rates.' },
+    { key: 'fluidSel', label: 'Fluid', type: 'select', value: 'case', options: [{ value: 'case', label: 'Case fluid (from the Fluid suite)' }, { value: 'gascond', label: 'Lean gas condensate, 10 MSm³/d (built-in)' }] },
+    { key: 'tIn', label: 'Inlet temperature', unit: '°C', value: BASE.tIn, min: -20, max: 200, typical: [40, 120] },
+    { key: 'pOut', label: 'Outlet (separator / back-) pressure', unit: 'bara', value: BASE.pOut, min: 1.1, max: 500, typical: [5, 100] },
+    { key: 'pInSet', label: 'Inlet (source) pressure', unit: 'bara', value: 95, min: 2, max: 1300, typical: [30, 300], showIf: (v) => v.bc === 'inletP' || v.bc === 'bothP' },
+    { key: 'pRes', label: 'Reservoir pressure', unit: 'bara', value: BASE.pRes, min: 5, max: 1500, showIf: (v) => v.bc === 'ipr' },
+    { key: 'piIpr', label: 'Productivity index (stock-tank liquid)', unit: 'Sm³/d/bar', value: BASE.pi, min: 0.01, max: 1e5, showIf: (v) => v.bc === 'ipr' },
+    { key: 'iprType', label: 'Inflow relation', type: 'select', value: 'linear', options: [{ value: 'linear', label: 'Straight line (PI)' }, { value: 'vogel', label: 'Vogel (solution-gas drive)' }], showIf: (v) => v.bc === 'ipr' },
+    { key: 'wellDp', label: 'Pressure loss sandface → flowline inlet at the case rate', unit: 'bar', value: 60, min: 0, max: 1000, help: 'Tubing head, friction and wellhead choke; 80 % is treated as static and 20 % scales with the rate squared.', showIf: (v) => v.bc === 'ipr' },
+  ] },
+  { group: 'Line geometry, fittings and choke', tab: 'inputs', fields: [
+    { key: 'profile', label: 'Elevation profile', type: 'table', columns: [{ key: 'x', label: 'Distance', unit: 'm' }, { key: 'z', label: 'Elevation', unit: 'm' }], value: BASE.profile.map((p) => ({ x: p.x, z: p.z })), help: 'Horizontal distance from the inlet and elevation relative to mean sea level (negative below).' },
+    { key: 'idMm', label: 'Inner diameter', unit: 'mm', value: BASE.idMm, min: 20, max: 1500, typical: [100, 900] },
+    { key: 'wtMm', label: 'Wall thickness', unit: 'mm', value: BASE.wtMm, min: 2, max: 80 },
+    { key: 'roughUm', label: 'Wall roughness', unit: 'µm', value: BASE.roughUm, min: 0, max: 3000, typical: [15, 300] },
+    { key: 'riserBaseX', label: 'Riser base position', unit: 'm', value: BASE.riserBaseX, min: 0, max: 1e6, help: 'Distance at which the flowline meets the riser. Set it to the line length when there is no riser.' },
+    { key: 'kLoss', label: 'Total minor-loss coefficient (bends, tees, spools)', unit: '–', value: 0, min: 0, max: 5000, help: 'Spread evenly along the line: Δp = K ρ v² / 2 on the no-slip mixture.' },
+    { key: 'fittings', label: 'Valves and fittings', type: 'table', columns: [{ key: 'x', label: 'Distance', unit: 'm' }, { key: 'K', label: 'Loss coefficient fully open', unit: '–' }, { key: 'open', label: 'Opening', unit: '%' }], value: [], help: 'Local losses at a position; a partly closed valve is scaled with (100 / opening)².' },
+    { key: 'chokeOpening', label: 'Topsides choke opening', unit: '%', value: 100, min: 1, max: 100 },
+    { key: 'chokeDp', label: 'Choke pressure drop fully open at the case rate', unit: 'bar', value: 0, min: 0, max: 200, help: '0 = no choke modelled (the outlet pressure applies at the end of the line).' },
+    { key: 'effIdMm', label: 'Effective bore with deposits (uniform)', unit: 'mm', value: 0, min: 0, max: 1500, help: '0 = clean bore. Used only when no deposit profile is given.' },
+    { key: 'roughEffUm', label: 'Effective roughness with deposits', unit: 'µm', value: 0, min: 0, max: 20000, help: '0 = use the wall roughness.' },
+    { key: 'deposit', label: 'Deposit thickness profile', type: 'table', columns: [{ key: 'x', label: 'Distance', unit: 'm' }, { key: 't', label: 'Thickness', unit: 'mm' }], value: [], help: 'Hydrate, wax and scale layer from the solids suite; narrows the bore locally.' },
+  ] },
+  { group: 'Ambient and heat transfer', tab: 'inputs', fields: [
+    { key: 'uMode', label: 'Overall heat-transfer coefficient', type: 'select', value: 'input', options: [{ value: 'input', label: 'Given U-value' }, { value: 'layers', label: 'From films, wall, insulation and burial' }] },
+    { key: 'uValue', label: 'U-value (on inner diameter)', unit: 'W/m²K', value: BASE.U, min: 0, max: 2000, typical: [1, 30], showIf: (v) => v.uMode !== 'layers' },
+    { key: 'uMult', label: 'U-value multiplier (calibration)', unit: '×', value: 1, min: 0.1, max: 10 },
+    { key: 'insT', label: 'Insulation thickness', unit: 'mm', value: BASE.insulation.t * 1000, min: 0, max: 300 },
+    { key: 'insK', label: 'Insulation conductivity', unit: 'W/mK', value: BASE.insulation.k, min: 0.01, max: 3 },
+    { key: 'insRho', label: 'Insulation density', unit: 'kg/m³', value: 900, min: 30, max: 3000 },
+    { key: 'insCp', label: 'Insulation heat capacity', unit: 'J/kgK', value: 1700, min: 300, max: 4000 },
+    { key: 'kWall', label: 'Pipe-wall conductivity', unit: 'W/mK', value: 45, min: 5, max: 400 },
+    { key: 'tSeabed', label: 'Seabed temperature', unit: '°C', value: BASE.tSeabed, min: -2, max: 35 },
+    { key: 'tSeaSurface', label: 'Sea-surface temperature', unit: '°C', value: BASE.tSeaSurface, min: -2, max: 35 },
+    { key: 'thermocline', label: 'Thermocline depth scale', unit: 'm', value: 250, min: 20, max: 2000 },
+    { key: 'tAir', label: 'Air temperature (above sea level)', unit: '°C', value: BASE.tAir, min: -50, max: 55 },
+    { key: 'currentSpeed', label: 'Sea current speed', unit: 'm/s', value: BASE.currentSpeed, min: 0, max: 3 },
+    { key: 'windSpeed', label: 'Wind speed', unit: 'm/s', value: 5, min: 0, max: 50 },
+    { key: 'burialDepth', label: 'Burial depth to top of pipe (flowline)', unit: 'm', value: 0, min: 0, max: 10, help: '0 = exposed. Used with the layer-based U-value and in the cooldown preview.' },
+    { key: 'kSoil', label: 'Soil conductivity', unit: 'W/mK', value: 1.2, min: 0.2, max: 5 },
+    { key: 'heatTrace', label: 'Imposed heating (e.g. electrical)', unit: 'W/m', value: 0, min: 0, max: 500 },
+    { key: 'watC', label: 'Wax appearance temperature', unit: '°C', value: 0, min: -50, max: 90, help: '0 = not checked. Offered from the Fluid suite.' },
+  ] },
+  { group: 'Flow model', tab: 'setup', fields: [
+    { key: 'model', label: 'Holdup and pressure-gradient model', type: 'select', value: 'beggsBrill', options: HOLDUP_MODELS },
+    { key: 'fModel', label: 'Friction factor', type: 'select', value: 'colebrook', options: [{ value: 'colebrook', label: 'Colebrook–White' }, { value: 'haaland', label: 'Haaland' }, { value: 'swamee', label: 'Swamee–Jain' }, { value: 'churchill', label: 'Churchill' }] },
+    { key: 'energy', label: 'Energy equation', type: 'select', value: 'enthalpy', options: [{ value: 'enthalpy', label: 'Flowing-enthalpy balance (flashing, Joule–Thomson, elevation, kinetic)' }, { value: 'cpjt', label: 'Frozen heat capacity and Joule–Thomson coefficients' }] },
+    { key: 'c0', label: 'Distribution parameter C0', unit: '–', value: 1.2, min: 0.9, max: 1.6, showIf: (v) => v.model === 'zuberFindlay' },
+    { key: 'vDrift', label: 'Drift velocity', unit: 'm/s', value: 0.35, min: 0, max: 3, showIf: (v) => v.model === 'zuberFindlay' },
+    { key: 'wallisN', label: 'Wallis hindered-drift exponent n', unit: '–', value: 0, min: 0, max: 4, help: 'Drift velocity × (1 − α)^n; 0 gives the plain Zuber–Findlay relation.', showIf: (v) => v.model === 'zuberFindlay' },
+    { key: 'holdupMult', label: 'Liquid-holdup multiplier (calibration)', unit: '×', value: 1, min: 0.5, max: 2 },
+    { key: 'cErosion', label: 'Erosional-velocity constant C (API RP 14E)', unit: '–', value: 100, min: 50, max: 300 },
+    { key: 'mapX', label: 'Location for the regime map and local models', unit: 'm', value: 9000, min: 0, max: 1e6 },
+  ] },
+  { group: 'Slugging', tab: 'setup', fields: [
+    { key: 'freqModel', label: 'Slug frequency', type: 'select', value: 'unitCell', options: [{ value: 'unitCell', label: 'Unit-cell balance with the length correlation' }, { value: 'zabaras', label: 'Zabaras (2000)' }, { value: 'gregory', label: 'Gregory & Scott (1969)' }, { value: 'heywood', label: 'Heywood & Richardson (1979)' }] },
+    { key: 'lengthModel', label: 'Slug length', type: 'select', value: 'scott', options: [{ value: 'scott', label: 'Scott et al. (1989)' }, { value: 'brill', label: 'Brill et al. (1981)' }, { value: 'norris', label: 'Norris (1982)' }] },
+    { key: 'vtModel', label: 'Translational velocity', type: 'select', value: 'bendiksen', options: [{ value: 'bendiksen', label: 'Bendiksen (1984)' }, { value: 'nicklin', label: 'Nicklin et al. (1962)' }] },
+    { key: 'bodyModel', label: 'Slug-body holdup', type: 'select', value: 'gregory', options: [{ value: 'gregory', label: 'Gregory et al. (1978)' }, { value: 'barnea', label: 'Barnea & Brauner (1985)' }] },
+    { key: 'freqMult', label: 'Slug-frequency multiplier (calibration)', unit: '×', value: 1, min: 0.05, max: 20 },
+    { key: 'lenMult', label: 'Slug-length multiplier (calibration)', unit: '×', value: 1, min: 0.05, max: 20 },
+    { key: 'filmMult', label: 'Film-holdup multiplier (calibration)', unit: '×', value: 1, min: 0.3, max: 2.5 },
+    { key: 'trackSlugs', label: 'Track slugs to the outlet', type: 'bool', value: true },
+    { key: 'nSlugs', label: 'Slugs to collect at the outlet', unit: '–', value: 150, min: 20, max: 2000, showIf: (v) => v.trackSlugs !== false },
+    { key: 'slugSeed', label: 'Random seed', unit: '–', value: 42, min: 1, max: 1e6, showIf: (v) => v.trackSlugs !== false },
+    { key: 'drainFactor', label: 'Vessel liquid drain rate / mean liquid rate', unit: '×', value: 1.2, min: 1, max: 5 },
+    { key: 'feedLength', label: 'Gas-pocket length upstream of the riser', unit: 'm', value: 0, min: 0, max: 1e6, help: '0 = from the last crest upstream of the riser base.' },
+  ] },
+  { group: 'Transient', tab: 'setup', fields: [
+    { key: 'transient', label: 'Run the transient', type: 'bool', value: true },
+    { key: 'schedule', label: 'Boundary history', type: 'table', columns: [{ key: 't', label: 'Time', unit: 'h' }, { key: 'rate', label: 'Rate / steady rate', unit: '×' }, { key: 'dp', label: 'Outlet-pressure change', unit: 'bar' }, { key: 'choke', label: 'Choke opening', unit: '%' }], value: DEFAULT_SCHEDULE.map((r) => ({ ...r })), help: 'Piecewise-linear history of the inlet rate, the outlet (separator) pressure and the choke.', showIf: (v) => v.transient !== false },
+    { key: 'tEnd', label: 'Simulated time', unit: 'h', value: 2.5, min: 0.05, max: 500, showIf: (v) => v.transient !== false },
+    { key: 'initMode', label: 'Initial condition', type: 'select', value: 'steady', options: [{ value: 'steady', label: 'Converged steady state at the first rate' }, { value: 'uniform', label: 'Settled line: given pressure, temperature and holdup' }], showIf: (v) => v.transient !== false },
+    { key: 'initP', label: 'Initial pressure at the outlet', unit: 'bara', value: BASE.pOut, min: 1.1, max: 1000, showIf: (v) => v.transient !== false && v.initMode === 'uniform' },
+    { key: 'initT', label: 'Initial temperature', unit: '°C', value: BASE.tSeabed, min: -20, max: 150, showIf: (v) => v.transient !== false && v.initMode === 'uniform' },
+    { key: 'initHoldup', label: 'Initial liquid holdup', unit: '–', value: 0.5, min: 0, max: 1, showIf: (v) => v.transient !== false && v.initMode === 'uniform' },
+    { key: 'matchSteady', label: 'Tune transient wall friction to the steady inlet pressure', type: 'bool', value: true, showIf: (v) => v.transient !== false },
+  ] },
+  { group: 'Local models and comparisons', tab: 'setup', fields: [
+    { key: 'localModels', label: 'Run the local models (radial RANS, interface capturing)', type: 'bool', value: true },
+    { key: 'ransModel', label: 'Turbulence model of the radial solve', type: 'select', value: 'mixing', options: [{ value: 'mixing', label: 'Mixing length (van Driest)' }, { value: 'komega', label: 'k–ω (Wilcox)' }, { value: 'kepsilon', label: 'Low-Reynolds k–ε (Chien)' }], showIf: (v) => v.localModels !== false },
+    { key: 'compareModels', label: 'Compare all holdup models', type: 'bool', value: true },
+  ] },
+  { group: 'Discretisation and convergence', tab: 'mesh', fields: [
+    { key: 'nSteady', label: 'Cells of the steady march', unit: '–', value: 150, min: 20, max: 2000 },
+    { key: 'tolP', label: 'Shooting tolerance on the outlet pressure', unit: 'bar', value: 1e-6, min: 1e-9, max: 0.01 },
+    { key: 'nCells', label: 'Cells of the transient grid', unit: '–', value: 50, min: 10, max: 400 },
+    { key: 'riserRefine', label: 'Refinement of the riser cells', unit: '×', value: 3, min: 1, max: 8 },
+    { key: 'cfl', label: 'CFL number of the transient', unit: '–', value: 0.6, min: 0.05, max: 0.95 },
+    { key: 'nRadial', label: 'Radial cells per layer', unit: '–', value: 6, min: 2, max: 60 },
+    { key: 'nRans', label: 'Radial nodes of the RANS solve', unit: '–', value: 70, min: 30, max: 400 },
+  ] },
+];
+
+const HILLY = [0, 120, 1500, 210, 3200, 150, 5000, 290, 6800, 205, 8500, 330, 10200, 240, 12000, 300].reduce((a, _, i, s) => (i % 2 ? a : a.concat([{ x: s[i], z: s[i + 1] }])), []);
+const TRUNK = [0, -95, 8000, -110, 16000, -102, 24000, -118, 32000, -90, 40000, -70, 46000, -30, 49000, -8, 50000, 12].reduce((a, _, i, s) => (i % 2 ? a : a.concat([{ x: s[i], z: s[i + 1] }])), []);
+const PRESETS = [
+  { name: 'Deep-water oil tie-back (reference case)', values: { rateFrac: 1 } },
+  { name: 'Low-rate turndown (riser slugging)', values: { rateFrac: 0.4, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 4, rate: 1, dp: 0, choke: 100 }], tEnd: 3, matchSteady: false } },
+  { name: 'Gas-condensate trunk line', values: { fluidSel: 'gascond', profile: TRUNK, riserBaseX: 50000, idMm: 590, wtMm: 19.1, pOut: 70, tIn: 55, uValue: 12, insT: 3, insK: 0.3, model: 'mechanistic', mapX: 24000, nCells: 40, tEnd: 4, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.5, rate: 1, dp: 0, choke: 100 }, { t: 1, rate: 0.7, dp: 0, choke: 100 }, { t: 8, rate: 0.7, dp: 0, choke: 100 }] } },
+  { name: 'Hilly-terrain onshore multiphase line', values: { profile: HILLY, riserBaseX: 12000, idMm: 203, wtMm: 8.2, rateFrac: 0.45, pOut: 15, tAir: 15, uMode: 'layers', insT: 0, burialDepth: 1.2, kSoil: 1.4, model: 'mukherjeeBrill', mapX: 5000, nCells: 40, tEnd: 1.5, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.2, rate: 1, dp: 0, choke: 100 }, { t: 0.4, rate: 1.3, dp: 0, choke: 100 }, { t: 4, rate: 1.3, dp: 0, choke: 100 }] } },
+  { name: 'High-water-cut late life', values: { wc: 75, rateFrac: 0.7, model: 'mechanistic', tEnd: 1.5, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.3, rate: 1, dp: 0, choke: 100 }, { t: 0.4, rate: 1, dp: 5, choke: 100 }, { t: 4, rate: 1, dp: 5, choke: 100 }] } },
+  { name: 'Ramp-up transient', values: { rateFrac: 0.4, tEnd: 2, schedule: [{ t: 0, rate: 1, dp: 0, choke: 100 }, { t: 0.2, rate: 1, dp: 0, choke: 100 }, { t: 0.7, rate: 2.5, dp: 0, choke: 100 }, { t: 5, rate: 2.5, dp: 0, choke: 100 }] } },
+];
+
+let lastCtx = {};
+async function run(v, ctx = {}) {
+  lastCtx = { fluid: ctx.fluid, outputs: ctx.outputs };
+  const prog = typeof ctx.progress === 'function' ? ctx.progress : () => {}, tick = typeof ctx.tick === 'function' ? ctx.tick : async () => {};
+  const warnings = [], recs = [], plots = [], tables = [], balances = [];
+  prog(0.02, 'Steady pressure, temperature and holdup');
+  const st = steadyFlow(v, ctx), cfg = st.cfg, fm = cfg.fm, N = st.n, A0 = (PI * st.D[0] ** 2) / 4, so = slugOpts(v), xKm = st.x.map((x) => x / 1000);
+  await tick();
+  // ---- regimes, unit cells, stability -----------------------------------------------------------------
+  const reg = regimes(st), units = st.vsl.map((_, i) => (st.vsl[i] > 1e-9 && st.vsg[i] > 1e-9 ? slugUnitCell(cellOf(st, i), so) : null));
+  const regLen = {}; for (let i = 0; i < N; i++) regLen[reg[i]] = (regLen[reg[i]] || 0) + st.ds;
+  const kh = []; for (let i = 0; i < N; i += Math.max(1, Math.round(N / 60))) { if (Math.abs(st.theta[i]) < 10 * DEG && st.vsl[i] > 1e-6 && st.vsg[i] > 1e-6) { try { const s = interfacialStability(cellOf(st, i)); if (Object.values(s).every(Number.isFinite)) kh.push({ i, ...s }); } catch { /* no equilibrium level */ } } }
+  const im = clamp(Math.round(cfg.sOfX(clamp(num(v.mapX, 0.5 * cfg.length, 0, 1e7), 0, cfg.length)) / st.ds), 0, N - 1), cm = cellOf(st, im);
+  prog(0.2, 'Flow-pattern map');
+  const twoPhase = cm.vsl > 1e-9 && cm.vsg > 1e-9, map = twoPhase ? flowPatternMap(cm, { n: 40 }) : null, mand = twoPhase ? mandhaneRegime(cm.vsl, cm.vsg) : 'single phase';
+  await tick();
+  // ---- slugging -------------------------------------------------------------------------------------------
+  prog(0.3, 'Slug tracking and severe-slugging screening');
+  const slugIdx = []; for (let i = 0; i <= N; i++) if (isSlug(reg[i]) && units[i]) slugIdx.push(i);
+  const iOnsetKH = kh.find((k) => k.vkhRatio > 1), iOnset = slugIdx.length ? slugIdx[0] : iOnsetKH ? iOnsetKH.i : -1;
+  let track = null;
+  const allUnits = units.every(Boolean);
+  if (v.trackSlugs !== false && slugIdx.length > 2 && allUnits) {
+    const field = trackingField(st, units), sites = [{ s: st.s[slugIdx[0]], freq: units[slugIdx[0]].freq, length: units[slugIdx[0]].lengthFromFreq }];
+    for (let i = 2; i < N - 1; i++) if (st.theta[i - 1] < -1e-5 && st.theta[i] > 1e-5 && isSlug(reg[i + 1]) && st.s[i] > sites[0].s) sites.push({ s: st.s[i], freq: 0.5 * units[i + 1].freq, length: units[i + 1].lengthFromFreq }); // low points re-initiate slugs
+    const uo = units[N];
+    track = slugTracking(field, { sites, nSlugs: Math.round(num(v.nSlugs, 150, 5, 5000)), seed: Math.round(num(v.slugSeed, 42, 1, 2 ** 31)), theta: st.theta, drainFactor: num(v.drainFactor, 1.2, 1, 10), qSlugOut: A0 * uo.holdupSlug * st.vm[N], qFilmOut: A0 * uo.holdupFilm * Math.max(uo.filmVelocity, 0) });
+    if (!track.n) track = null;
+  }
+  const terrain = terrainSlugging(st), sev = cfg.hasRiser ? severeScreen(st, { riserBaseS: cfg.riserBaseS, feedLength: num(v.feedLength, 0, 0, 1e7), pSep: cfg.pSep }) : null;
+  let cyc = null;
+  if (sev && sev.severe) { const k = sev.iBase - 1; try { cyc = riserSluggingCycle({ D: st.D[k], feedLength: sev.feedLength, feedAngle: sev.feedAngle * DEG, riserHeight: sev.riserHeight, riserLength: sev.riserLength, wG: Math.max(st.mG[k], 1e-6), wL: Math.max(st.mL[k], 1e-6), rhoL: st.rhoL[k], muL: st.muL[k], T: st.T[k] + 273.15, zG: st.zG[k], mwG: st.mwG[k], pSep: cfg.pSep * 1e5, alphaL: 1 - sev.alpha, chokeOpening: cfg.chokeOpening, chokeDp: Math.max(cfg.chokeDp, 0.05) * 1e5 * st.mScale ** 2, rough: cfg.rough }); } catch (e) { warnings.push({ level: 'info', msg: 'Riser-slugging cycle model: ' + e.message }); } }
+  const severe = !!(sev && sev.severe && (!cyc || !cyc.stable));
+  await tick();
+  prog(0.4, 'Minimum stable rate');
+  const turndown = minimumStableRate(cfg, st.mScale);
+  await tick();
+  // ---- transient ------------------------------------------------------------------------------------------
+  let tr = null, trInfo = null;
+  if (v.transient !== false) {
+    prog(0.45, 'Transient drift-flux solution');
+    trInfo = buildTransient(v, st);
+    while (!trInfo.sim.done) { trInfo.sim.advance(40); prog(0.45 + 0.35 * Math.min(trInfo.sim.t / trInfo.tEnd, 1), `Transient: ${(trInfo.sim.t / 3600).toFixed(2)} h of ${(trInfo.tEnd / 3600).toFixed(2)} h`); await tick(); }
+    tr = trInfo.sim.result();
+  }
+  // ---- heat-transfer detail and cooldown preview ----------------------------------------------------------
+  prog(0.82, 'Radial conduction and local models');
+  let ic = 0; for (let i = 1; i <= N; i++) if (st.subcooling[i] > st.subcooling[ic]) ic = i;
+  const kc = Math.min(ic, N - 1), prC = fm.at(st.P[ic], st.T[ic], st.mScale), netC = cfg.network({ s: st.s[kc], z: st.z[kc], D: st.D[kc], pr: prC, vm: st.vm[kc], holdup: st.holdup[kc], ta: st.tAmb[kc] });
+  const radLayers = cfg.layers.map((l) => ({ ...l })), buried = cfg.buriedAt(st.s[kc]);
+  if (buried) radLayers.push({ name: 'Soil (equivalent annulus)', t: (cfg.od / 2) * (Math.exp(Math.acosh((2 * (cfg.burialDepth + cfg.od / 2)) / cfg.od)) - 1), k: cfg.kSoil, rho: 1800, cp: 1300 });
+  const hOutC = buried ? 1e5 : st.z[kc] >= 0 ? hOutside(cfg.wind, cfg.od, 'air') : hOutside(cfg.current, cfg.od, 'seawater', st.tAmb[kc]), Ac = (PI * st.D[kc] ** 2) / 4;
+  const fluidC = Ac * (st.holdup[kc] * st.rhoL[kc] * prC.cpL + (1 - st.holdup[kc]) * st.rhoG[kc] * prC.cpG), nPer = Math.round(num(v.nRadial, 6, 2, 80));
+  const radSteady = radialConduction({ ri: st.D[kc] / 2, layers: radLayers, hIn: st.hIn[kc], hOut: hOutC, tFluid: st.T[ic], tAmb: st.tAmb[kc], T0: 'steady', tEnd: 0, nPer });
+  const tauC = fluidC / Math.max(netC.U * cfg.uMult * PI * st.D[kc], 1e-9), cool = radialConduction({ ri: st.D[kc] / 2, layers: radLayers, hIn: clamp(0.25 * st.hIn[kc], 30, 400), hOut: hOutC, tFluid: st.T[ic], tAmb: st.tAmb[kc], fluidC, T0: 'steady', tEnd: clamp(5 * tauC, 3600, 60 * 86400), nSteps: 240, nPer, stopAt: st.tHyd[ic], nProfiles: 5 });
+  // ---- local models ---------------------------------------------------------------------------------------
+  let rans = null, ransRef = null, vof = null, vofUp = null, dam = null;
+  if (v.localModels !== false) {
+    const lam = cm.vsl / Math.max(cm.vsl + cm.vsg, 1e-9), rhoN = cm.rhoL * lam + cm.rhoG * (1 - lam), muN = cm.muL * lam + cm.muG * (1 - lam), ReLoc = clamp((rhoN * (cm.vsl + cm.vsg) * cm.D) / muN, 3000, 3e6), nR = Math.round(num(v.nRans, 70, 30, 400));
+    const mdl = ['komega', 'kepsilon', 'mixing'].includes(v.ransModel) ? v.ransModel : 'mixing';
+    rans = ransPipe({ reTau: reTauOf(ReLoc), model: mdl, n: nR, tol: 1e-7, maxIter: 2500 }); ransRef = mdl === 'mixing' ? null : ransPipe({ reTau: reTauOf(ReLoc), model: 'mixing', n: nR });
+    await tick();
+    vof = vofAdvect1D({ n: 120, scheme: 'thinc' }); vofUp = vofAdvect1D({ n: 120, scheme: 'upwind' });
+    const um = units[im]; dam = damBreak({ hL: Math.max(levelOfHoldup(um ? um.holdupSlug : 0.9), 0.05) * cm.D, hR: (um ? um.filmThickness : 0.2 * cm.D), n: 160 });
+  }
+  await tick();
+  // ---- model comparison -----------------------------------------------------------------------------------
+  const cmp = [];
+  if (v.compareModels !== false && st.bc !== 'inletP') {
+    prog(0.9, 'Comparing holdup models');
+    for (const m of HOLDUP_MODELS) { const r = m.value === cfg.model ? st : steadySolve({ ...cfg.base, model: m.value, n: Math.min(cfg.n, 40), mScale: st.mScale, pOut: cfg.pOut, pGuess: st.pIn, hydrate: false, tolP: 1e-4 }); cmp.push(r.ok ? [m.label, r3(r.pIn, 2), r3(r.dpFric, 2), r3(r.dpGrav, 2), r3(r.liquidInventory, 1), r3(r.tOut, 2)] : [m.label, '—', '—', '—', '—', '—']); }
+  }
+  // ---- derived quantities ---------------------------------------------------------------------------------
+  const maxOf = (a) => a.reduce((m, x) => Math.max(m, x), -Infinity), argMax = (a) => a.reduce((m, x, i) => (x > a[m] ? i : m), 0), minOf = (a) => a.reduce((m, x) => Math.min(m, x), Infinity);
+  const evrMax = maxOf(st.evr), iEvr = argMax(st.evr), vMax = maxOf(st.vm), subMax = maxOf(st.subcooling), hydLen = st.subcooling.slice(0, N).filter((s) => s > 0).length * st.ds, dpTotal = st.pIn - st.pOut, iHyd = st.subcooling.findIndex((s) => s > 0);
+  const heatFlux = st.qLoss.map((q, i) => q / (PI * st.D[i])), wat = num(v.watC, 0, -60, 120), tMin = minOf(st.T), gor = fin(fm.rates.gor, 0), wcIn = fin(fm.rates.wc, 0) * 100;
+  // strongest hydrodynamic slugging location
+  let iS = -1; for (const i of slugIdx) if (iS < 0 || units[i].vt * units[i].volume > units[iS].vt * units[iS].volume) iS = i;
+  const uS = iS >= 0 ? units[iS] : null, qLout = st.qL[N], qGout = st.qG[N];
+  const terrainActive = terrain.accumulates && !severe, slugType = severe ? 'severe' : terrainActive ? 'terrain' : uS ? 'hydrodynamic' : 'none';
+  let slug;
+  if (slugType === 'severe') { const vol = A0 * sev.riserLength, per = cyc && cyc.period ? cyc.period : (vol / Math.max(qLout, 1e-9)); slug = { type: 'severe', freq: 1 / per, period: per, length: sev.riserLength, lengthMax: sev.riserLength, velocity: cyc ? (cyc.qLiqPeakRatio * st.mL[sev.iBase - 1]) / st.rhoL[sev.iBase - 1] / A0 : st.vm[N], holdupBody: 1, volume: vol, surge: vol * Math.max(1 - (cyc ? Math.min(num(v.drainFactor, 1.2, 1, 10) / Math.max(cyc.qLiqPeakRatio, 1), 1) : 0), 0.2), x: st.x[sev.iBase] }; }
+  else if (slugType === 'terrain') { const d = terrain.worst, hs = uS ? uS.holdupSlug : 0.9, vol = Math.max(d.excess, 0.05 * d.volume), L = vol / (A0 * hs), per = Math.max(d.period, vol / Math.max(qLout, 1e-9)); slug = { type: 'terrain', freq: 1 / per, period: per, length: L, lengthMax: 1.5 * L, velocity: slugVelocity(d.vsl + d.vsg, st.D[0], d.upAngle * DEG).vt, holdupBody: hs, volume: vol, surge: vol, x: d.x }; }
+  else if (uS) { const Lm = track ? track.meanLength : uS.length, Lx = track ? Math.max(track.maxLength, track.length1000) : uS.lengthMax, f = track && track.freqArrival > 0 ? track.freqArrival : uS.freq; slug = { type: 'hydrodynamic', freq: f, period: 1 / f, length: Lm, lengthMax: Lx, velocity: uS.vt, holdupBody: uS.holdupSlug, volume: Lm * A0 * uS.holdupSlug, surge: track ? Math.max(track.surge, track.surgeSingle, Lm * A0 * uS.holdupSlug) : Lx * A0 * uS.holdupSlug * 0.5, x: st.x[iS] }; }
+  else slug = { type: 'none', freq: 0, period: null, length: 0, lengthMax: 0, velocity: 0, holdupBody: 0, volume: 0, surge: 0, x: null };
+  for (const k of Object.keys(slug)) if (typeof slug[k] === 'number' && !Number.isFinite(slug[k])) slug[k] = null;
+  const catcher = 1.25 * fin(slug.surge, 0);
+  // transient summary
+  let pAmp = 0, trSummary = null;
+  if (tr && tr.t.length > 3) {
+    const i0 = Math.floor(tr.t.length * 0.4), w = tr.pIn.slice(i0), wq = tr.qLiqOut.slice(i0), meanQ = mean(wq);
+    pAmp = maxOf(w) - minOf(w); let cum = 0; for (let i = 1; i < tr.t.length; i++) cum += 0.5 * (tr.qLiqOut[i] + tr.qLiqOut[i - 1]) * (tr.t[i] - tr.t[i - 1]);
+    trSummary = { pMean: mean(w), pMin: minOf(w), pMax: maxOf(w), qMean: meanQ, qPeak: maxOf(wq), cumLiq: cum, invEnd: tr.inv[tr.inv.length - 1], inv0: tr.inv[0] };
+  } else if (cyc && !cyc.stable) pAmp = cyc.amplitude / 1e5;
+
+  // ---- warnings ---------------------------------------------------------------------------------------------
+  if (subMax > 0) warnings.push({ level: subMax > 3 ? 'bad' : 'warn', msg: `The stream is inside the hydrate region over ${Math.round(hydLen)} m (from ${Math.round(st.x[Math.max(iHyd, 0)])} m); the largest subcooling is ${subMax.toFixed(1)} °C at ${Math.round(st.x[ic])} m.` });
+  if (evrMax > 1) warnings.push({ level: 'bad', msg: `The mixture velocity reaches ${evrMax.toFixed(2)} times the API RP 14E erosional velocity (C = ${cfg.cErosion}) at ${Math.round(st.x[iEvr])} m.` });
+  else if (evrMax > 0.8) warnings.push({ level: 'warn', msg: `The mixture velocity is ${(100 * evrMax).toFixed(0)} % of the erosional velocity at ${Math.round(st.x[iEvr])} m.` });
+  if (severe) warnings.push({ level: 'bad', msg: `Severe riser slugging is predicted: the feed line is ${sev.feedRegime}, the liquid velocity is ${sev.boe.toFixed(1)} times the Bøe limit and the Pots number is ${sev.pots === null ? 'n/a' : sev.pots.toFixed(2)}${cyc && cyc.period ? `; cycle of about ${(cyc.period / 60).toFixed(0)} min with ${(cyc.amplitude / 1e5).toFixed(0)} bar swing at the riser base` : ''}.` });
+  else if (sev && sev.severe && cyc && cyc.stable) warnings.push({ level: 'info', msg: 'The screening criteria place the riser in the severe-slugging region, but the cycle model shows no liquid surge at this choke setting.' });
+  if (terrain.accumulates) warnings.push({ level: 'warn', msg: `Liquid accumulates at ${terrain.dips.filter((d) => d.accumulates).length} low point(s): at ${Math.round(terrain.worst.x)} m the gas velocity is ${terrain.worst.vsg.toFixed(2)} m/s against ${terrain.worst.vsgCrit.toFixed(2)} m/s needed to sweep the upward leg, which holds about ${terrain.worst.volume.toFixed(0)} m³.` });
+  if (wat !== 0 && tMin < wat) warnings.push({ level: 'warn', msg: `The fluid temperature falls to ${tMin.toFixed(1)} °C, below the wax appearance temperature of ${wat.toFixed(1)} °C.` });
+  if (tr && tr.aborted !== null) warnings.push({ level: 'warn', msg: `The transient was stopped at ${(tr.aborted / 3600).toFixed(2)} h: the line became liquid-full and the volume constraint could no longer be met (pressure-surge dynamics are outside this scheme). Results up to that time are shown.` });
+  if (tr && pAmp > 0.05 * dpTotal && pAmp > 2) warnings.push({ level: 'warn', msg: `The transient inlet pressure swings by ${pAmp.toFixed(1)} bar over the last 60 % of the simulated time.` });
+  if (UP_ONLY.has(cfg.model) && st.theta.some((t) => t < -1e-4)) warnings.push({ level: 'info', msg: 'The selected correlation is for upward flow; downward-inclined cells use Beggs & Brill.' });
+  if (st.nodal) warnings.push({ level: 'info', msg: `Well inflow balance: ${st.nodal.qLiqStd.toFixed(0)} Sm³/d of liquid at a flowing bottom-hole pressure of ${st.nodal.pwf.toFixed(1)} bara (${(100 * st.mScale).toFixed(0)} % of the case rate).` });
+  if (cfg.idOf || cfg.idMin < cfg.id0) warnings.push({ level: 'info', msg: `Deposits narrow the bore to ${(cfg.idMin * 1000).toFixed(0)} mm at the tightest point.` });
+
+  // ---- recommendations --------------------------------------------------------------------------------------
+  const rateNow = st.mScale, tdFrac = turndown.rate;
+  if (turndown.limited) recs.push(`Keep the rate above about ${(100 * tdFrac).toFixed(0)} % of the case rate (${(tdFrac * stdLiquid(fm, 1)).toFixed(0)} Sm³/d liquid): below it the screening predicts ${cfg.hasRiser ? 'riser-induced' : 'terrain'} slugging${rateNow < tdFrac ? ` — the present rate (${(100 * rateNow).toFixed(0)} %) is already below it` : ''}.`);
+  else recs.push(`No slugging limit was found down to ${(100 * tdFrac).toFixed(0)} % of the case rate; turndown is limited by other constraints (arrival temperature, liquid inventory).`);
+  if (slug.type !== 'none') recs.push(`Size the receiving vessel for a liquid surge of about ${catcher.toFixed(0)} m³ (largest ${slug.type} slug ${fin(slug.lengthMax, 0).toFixed(0)} m, 25 % margin, vessel drained at ${num(v.drainFactor, 1.2, 1, 10).toFixed(1)} × the mean liquid rate).`);
+  if (severe) recs.push(`Suppress the riser cycle by topsides choking or riser-base gas lift: the Bøe ratio must fall below 1 (now ${sev.boe.toFixed(1)}); the Taitel criterion asks for ${Math.max(sev.taitelPsep, 0).toFixed(0)} bara at the riser top without active control.`);
+  if (subMax > 0) {
+    // U-value that keeps the arrival just above the hydrate temperature (same holdup model, coarse grid)
+    let uNeed = null;
+    try { const g = (m) => { const r = steadySolve({ ...cfg.base, n: 40, U: cfg.U * m, uOf: cfg.uOf ? (c) => cfg.uOf(c) * m : null, mScale: st.mScale, pOut: cfg.pOut, pGuess: st.pIn, tolP: 1e-3 }); return r.ok ? Math.max(...r.subcooling) : 1; }; if (g(0.02) < 0) uNeed = brent(g, 0.02, 1, 1e-3) * (cfg.uOf ? mean(st.U) : cfg.U); } catch { uNeed = null; }
+    recs.push(uNeed ? `Lower the overall U-value to about ${uNeed.toFixed(2)} W/m²K (now ${mean(st.U).toFixed(2)}) to keep the whole line outside the hydrate region in steady flow, or inhibit for ${subMax.toFixed(1)} °C of subcooling.` : `Insulation alone cannot keep the line outside the hydrate region at this rate; plan inhibitor for ${subMax.toFixed(1)} °C of subcooling or active heating.`);
+  } else recs.push(`The steady stream stays ${(-subMax).toFixed(1)} °C above the hydrate temperature at the closest point (${Math.round(st.x[ic])} m); after a stop the contents there reach the hydrate temperature in ${cool.tReach !== null ? 'about ' + (cool.tReach / 3600).toFixed(1) + ' h' : 'more than ' + (cool.t[cool.t.length - 1] / 3600).toFixed(0) + ' h'}.`);
+  if (evrMax > 0.8) recs.push(`Limit the rate to ${(100 * rateNow * (0.8 / evrMax)).toFixed(0)} % of the case rate, or increase the bore near ${Math.round(st.x[iEvr])} m, to stay below 80 % of the erosional velocity.`);
+  if (terrain.accumulates) recs.push(`Raise the gas velocity above ${terrain.worst.vsgCrit.toFixed(1)} m/s in the upward leg at ${Math.round(terrain.worst.x)} m (rate increase, gas recycle or pigging) to stop the ${terrain.worst.volume.toFixed(0)} m³ liquid accumulation there.`);
+
+  // ---- plots ------------------------------------------------------------------------------------------------
+  const D0 = (a, k = 3) => a.map((x) => r3(x, k));
+  plots.push({ type: 'line', title: 'Pressure, temperature and hydrate temperature along the line', xlabel: 'Distance (km)', ylabel: 'bara · °C', series: [{ name: 'Pressure (bara)', x: xKm, y: st.P }, { name: 'Temperature (°C)', x: xKm, y: st.T }, { name: 'Hydrate temperature (°C)', x: xKm, y: st.tHyd, dash: true }, { name: 'Wall temperature (°C)', x: xKm, y: st.tWall }, { name: 'Ambient (°C)', x: xKm, y: st.tAmb, dash: true }], vlines: cfg.hasRiser ? [{ x: cfg.riserBaseX / 1000, label: 'Riser base' }] : [] });
+  plots.push({ type: 'line', title: 'Elevation profile', xlabel: 'Distance (km)', ylabel: 'Elevation (m)', height: 220, series: [{ name: 'Elevation', x: xKm, y: st.z }], hlines: [{ y: 0, label: 'Sea level' }] });
+  plots.push({ type: 'line', title: 'Liquid holdup and flow regime', xlabel: 'Distance (km)', ylabel: 'Holdup (–) · regime index', ymin: 0, series: [{ name: 'Liquid holdup', x: xKm, y: st.holdup }, { name: 'No-slip liquid fraction', x: xKm, y: st.vsl.map((l, i) => l / Math.max(l + st.vsg[i], 1e-12)), dash: true }, { name: 'Void fraction', x: xKm, y: st.holdup.map((h) => 1 - h), dash: true }, { name: 'Regime index / 6', x: xKm, y: reg.map((r) => Math.max(PATTERNS.indexOf(r), 0) / 6), mode: 'step' }], note: 'Regime index: ' + PATTERNS.map((p, i) => `${i} ${p}`).join(' · ') });
+  plots.push({ type: 'line', title: 'Velocities and erosional limit', xlabel: 'Distance (km)', ylabel: 'm/s', zeroY: true, series: [{ name: 'Superficial liquid', x: xKm, y: st.vsl }, { name: 'Superficial gas', x: xKm, y: st.vsg }, { name: 'Liquid phase', x: xKm, y: st.vL }, { name: 'Gas phase', x: xKm, y: st.vG }, { name: 'Mixture', x: xKm, y: st.vm }, { name: 'Erosional (API RP 14E)', x: xKm, y: st.vm.map((vv, i) => vv / Math.max(st.evr[i], 1e-9)), dash: true }] });
+  plots.push({ type: 'line', title: 'Pressure-gradient components', xlabel: 'Distance (km)', ylabel: 'Pa/m', series: [{ name: 'Friction', x: xKm, y: st.fric }, { name: 'Gravity', x: xKm, y: st.grav }, { name: 'Acceleration', x: xKm, y: st.acc }, { name: 'Local losses', x: xKm, y: st.loc }, { name: 'Total', x: xKm, y: st.dpdx, dash: true }] });
+  plots.push({ type: 'bar', title: 'Pressure-loss breakdown', ylabel: 'bar', categories: ['Friction', 'Gravity', 'Acceleration', 'Local', 'Choke'], series: [{ name: 'Pressure loss', values: [r3(st.dpFric), r3(st.dpGrav), r3(st.dpAcc), r3(st.dpLocal), r3(cfg.pOut - cfg.pSep)] }] });
+  plots.push({ type: 'line', title: 'Heat loss and heat flux', xlabel: 'Distance (km)', ylabel: 'W/m · W/m²', series: [{ name: 'Heat loss (W/m)', x: xKm, y: st.qLoss }, { name: 'Heat flux on the inner wall (W/m²)', x: xKm, y: heatFlux }, { name: 'U-value × 10 (W/m²K)', x: xKm, y: st.U.map((u) => 10 * u), dash: true }] });
+  if (map) plots.push({ type: 'line', title: `Flow-pattern map at ${Math.round(st.x[im])} m (inclination ${(cm.theta / DEG).toFixed(2)}°)`, xlabel: 'Superficial gas velocity (m/s)', ylabel: 'Superficial liquid velocity (m/s)', logx: true, logy: true, series: [...map.boundaries.map((b) => ({ name: b.name, x: b.x, y: b.y, mode: 'points' })), { name: 'Operating point', x: [cm.vsg], y: [cm.vsl], mode: 'points' }, { name: 'Operating line (inlet → outlet)', x: st.vsg.filter((g, i) => g > 0 && st.vsl[i] > 0), y: st.vsl.filter((l, i) => l > 0 && st.vsg[i] > 0), dash: true }], note: `Taitel–Dukler / Barnea transitions for the local properties: ${reg[im]}. Mandhane map (horizontal, air–water coordinates): ${mand}.` });
+  if (kh.length > 1) plots.push({ type: 'line', title: 'Stability of stratified flow (ratio > 1 = unstable)', xlabel: 'Distance (km)', ylabel: 'Actual / critical', logy: true, series: [{ name: 'Inviscid Kelvin–Helmholtz', x: kh.map((k) => xKm[k.i]), y: kh.map((k) => Math.max(k.ikhRatio, 1e-3)) }, { name: 'Viscous Kelvin–Helmholtz', x: kh.map((k) => xKm[k.i]), y: kh.map((k) => Math.max(k.vkhRatio, 1e-3)) }, { name: 'Taitel–Dukler', x: kh.map((k) => xKm[k.i]), y: kh.map((k) => Math.max(k.tdRatio, 1e-3)) }, { name: 'Wave generation (Jeffreys)', x: kh.map((k) => xKm[k.i]), y: kh.map((k) => Math.max(k.wavyRatio, 1e-3)), dash: true }, { name: 'Roll waves (Vedernikov)', x: kh.map((k) => xKm[k.i]), y: kh.map((k) => Math.max(k.rollRatio, 1e-3)), dash: true }], hlines: [{ y: 1, label: 'Neutral stability' }], note: 'Evaluated at the equilibrium stratified level of near-horizontal cells (|θ| < 10°).' });
+  if (slugIdx.length > 1) {
+    const sx = slugIdx.map((i) => xKm[i]);
+    plots.push({ type: 'line', title: 'Slug unit cell along the line', xlabel: 'Distance (km)', ylabel: 'see legend', logy: true, series: [{ name: 'Frequency (1/min)', x: sx, y: slugIdx.map((i) => 60 * units[i].freq), mode: 'points' }, { name: 'Mean length (m)', x: sx, y: slugIdx.map((i) => units[i].lengthFromFreq), mode: 'points' }, { name: 'Length, 1-in-1000 (m)', x: sx, y: slugIdx.map((i) => units[i].lengthMax), mode: 'points' }, { name: 'Translational velocity (m/s)', x: sx, y: slugIdx.map((i) => units[i].vt), mode: 'points' }, { name: 'Liquid volume per slug (m³)', x: sx, y: slugIdx.map((i) => units[i].lengthFromFreq * A0 * units[i].holdupSlug), mode: 'points' }] });
+    plots.push({ type: 'line', title: 'Slug body and film', xlabel: 'Distance (km)', ylabel: 'Holdup (–) · m/s · m', series: [{ name: 'Body holdup', x: sx, y: slugIdx.map((i) => units[i].holdupSlug), mode: 'points' }, { name: 'Film holdup', x: sx, y: slugIdx.map((i) => units[i].holdupFilm), mode: 'points' }, { name: 'Film thickness / D', x: sx, y: slugIdx.map((i) => units[i].filmThickness / st.D[i]), mode: 'points' }, { name: 'Film velocity (m/s)', x: sx, y: slugIdx.map((i) => units[i].filmVelocity), mode: 'points' }] });
+  }
+  if (track) {
+    plots.push({ type: 'bar', title: 'Slug-length distribution at the outlet', ylabel: 'Slugs', categories: track.hist.centers.map((c) => c.toFixed(0) + ' m'), series: [{ name: 'Tracked slugs', values: track.hist.counts }] });
+    plots.push({ type: 'line', title: 'Slug arrivals at the outlet', xlabel: 'Arrival time (min)', ylabel: 'Slug length (m)', series: [{ name: 'Slug', x: track.arrivals.map((a) => (a.t - track.arrivals[0].t) / 60), y: track.arrivals.map((a) => a.length), mode: 'points' }] });
+  }
+  if (cyc) plots.push({ type: 'line', title: 'Severe-slugging cycle (lumped model)', xlabel: 'Time (min)', ylabel: 'bara · × mean rate', series: [{ name: 'Riser-base pressure (bara)', x: cyc.t.map((t) => t / 60), y: cyc.pBase.map((p) => p / 1e5) }, { name: 'Liquid out / mean (×10)', x: cyc.t.map((t) => t / 60), y: cyc.wLout.map((w) => (10 * w) / Math.max(st.mL[sev.iBase - 1], 1e-9)) }, { name: 'Liquid column / riser length (×100)', x: cyc.t.map((t) => t / 60), y: cyc.level.map((l) => 100 * l) }], note: cyc.stable ? 'No sustained cycle at this choke setting.' : `${cyc.type}. Stages per cycle: build-up ${(cyc.stages.buildUp / 60).toFixed(0)} min, production ${(cyc.stages.production / 60).toFixed(0)} min, blowout ${(cyc.stages.blowout / 60).toFixed(1)} min, fallback ${(cyc.stages.fallback / 60).toFixed(1)} min.` });
+  if (tr && tr.t.length > 2) {
+    const th = tr.t.map((t) => t / 3600);
+    plots.push({ type: 'line', title: 'Transient: inlet pressure and liquid inventory', xlabel: 'Time (h)', ylabel: 'bara · m³/10', series: [{ name: 'Inlet pressure (bara)', x: th, y: tr.pIn }, { name: 'Liquid inventory / 10 (m³)', x: th, y: tr.inv.map((x) => x / 10), dash: true }] });
+    plots.push({ type: 'line', title: 'Transient: outlet rates and holdup', xlabel: 'Time (h)', ylabel: 'm³/h · %', series: [{ name: 'Liquid out (m³/h)', x: th, y: tr.qLiqOut.map((q) => 3600 * q) }, { name: 'Gas out / 10 (actual m³/h)', x: th, y: tr.qGasOut.map((q) => 360 * q) }, { name: 'Outlet holdup (%)', x: th, y: tr.holdupOut.map((h) => 100 * h), dash: true }] });
+    if (tr.field.t.length > 1) {
+      const fx = tr.field.x.map((x) => x / 1000), fy = tr.field.t.map((t) => t / 3600);
+      plots.push({ type: 'field', title: 'Liquid holdup: distance–time map', xlabel: 'Distance (km)', ylabel: 'Time (h)', zlabel: 'Holdup', zunit: '–', x: fx, y: fy, z: tr.field.holdup, zmin: 0, zmax: 1, cmap: 'viridis' });
+      plots.push({ type: 'field', title: 'Pressure: distance–time map', xlabel: 'Distance (km)', ylabel: 'Time (h)', zlabel: 'Pressure', zunit: 'bara', x: fx, y: fy, z: tr.field.P, cmap: 'turbo' });
+    }
+  }
+  { const lay = radSteady.layerOf.map((l) => radLayers.filter((q) => q.t > 0 && q.k > 0)[l]?.name || ''), rmm = radSteady.r.map((r) => r * 1000);
+    plots.push({ type: 'line', title: `Radial temperature at ${Math.round(st.x[ic])} m and cooldown after a stop`, xlabel: 'Radius (mm)', ylabel: '°C', series: cool.profiles.map((p) => ({ name: p.t === 0 ? 'Flowing (steady)' : `${(p.t / 3600).toFixed(1)} h after the stop`, x: rmm, y: p.T, mode: 'both' })), hlines: [{ y: st.tHyd[ic], label: 'Hydrate temperature' }], note: `Layers from the bore outwards: ${[...new Set(lay)].join(', ')}.` });
+    plots.push({ type: 'line', title: 'Cooldown of the contents at the coldest-margin location', xlabel: 'Time after the stop (h)', ylabel: '°C', series: [{ name: 'Contents', x: cool.t.map((t) => t / 3600), y: cool.fluid }, { name: 'Inner wall', x: cool.t.map((t) => t / 3600), y: cool.wall, dash: true }], hlines: [{ y: st.tHyd[ic], label: 'Hydrate temperature' }] }); }
+  if (rans) {
+    plots.push({ type: 'line', title: `Developed turbulent velocity profile (radial RANS, Re = ${sig(rans.Re, 3)})`, xlabel: 'y⁺', ylabel: 'u⁺', logx: true, series: [{ name: `${v.ransModel === 'komega' ? 'k–ω' : v.ransModel === 'kepsilon' ? 'k–ε (Chien)' : 'Mixing length'}`, x: rans.y.slice(1), y: rans.u.slice(1) }, ...(ransRef ? [{ name: 'Mixing length', x: ransRef.y.slice(1), y: ransRef.u.slice(1), dash: true }] : []), { name: 'Log law (κ = 0.41, B = 5.2)', x: rans.y.filter((y) => y > 30), y: rans.y.filter((y) => y > 30).map((y) => Math.log(y) / 0.41 + 5.2), dash: true }], note: `Darcy friction factor ${rans.f.toFixed(5)} against ${frictionFactor(rans.Re, 0).toFixed(5)} from the smooth-pipe Colebrook law (${(100 * (rans.f / frictionFactor(rans.Re, 0) - 1)).toFixed(1)} %). Single-phase flow at the local no-slip mixture Reynolds number.` });
+    plots.push({ type: 'line', title: 'Interface capturing: liquid slug advected once around a periodic pipe', xlabel: 'Position (–)', ylabel: 'Liquid fraction', series: [{ name: 'Exact', x: vof.x, y: vof.exact, dash: true }, { name: 'THINC volume-of-fluid', x: vof.x, y: vof.phi }, { name: 'First-order upwind', x: vofUp.x, y: vofUp.phi }], note: `Interface thickness ${vof.thickness.toFixed(1)} cells with THINC against ${vofUp.thickness.toFixed(1)} with upwind; both conserve the liquid volume to round-off.` });
+    plots.push({ type: 'line', title: 'Slug-tail collapse onto the film (shallow-water dam break)', xlabel: 'Distance from the tail (m)', ylabel: 'Liquid depth (m)', series: [{ name: 'Finite volume (HLL)', x: dam.x, y: dam.h }, { name: 'Exact (Stoker)', x: dam.x, y: dam.exact, dash: true }], note: `Channel analogue at ${Math.round(st.x[im])} m, ${dam.tEnd.toFixed(2)} s after release; mean error ${(100 * dam.l1).toFixed(2)} % of the initial depth.` });
+  }
+
+  // ---- tables -----------------------------------------------------------------------------------------------
+  const rowIdx = [...new Set(linspace(0, N, Math.min(N + 1, 41)).map(Math.round))];
+  tables.push({ title: 'Results along the line', columns: ['x (m)', 'z (m)', 'P (bara)', 'T (°C)', 'T wall (°C)', 'T hydrate (°C)', 'Holdup', 'vsl (m/s)', 'vsg (m/s)', 'v liquid (m/s)', 'v gas (m/s)', 'ρ mix (kg/m³)', 'Regime', 'dp/dx fric (Pa/m)', 'grav', 'acc', 'local', 'Heat loss (W/m)', 'Heat flux (W/m²)', 'τ wall (Pa)', 'v / v eros'],
+    rows: rowIdx.map((i) => [r3(st.x[i], 0), r3(st.z[i], 1), r3(st.P[i], 2), r3(st.T[i], 2), r3(st.tWall[i], 2), r3(st.tHyd[i], 2), r3(st.holdup[i]), r3(st.vsl[i]), r3(st.vsg[i]), r3(st.vL[i]), r3(st.vG[i]), r3(st.rhoM[i], 1), reg[i], r3(st.fric[i], 1), r3(st.grav[i], 1), r3(st.acc[i], 2), r3(st.loc[i], 2), r3(st.qLoss[i], 1), r3(heatFlux[i], 1), r3(st.tauW[i], 2), r3(st.evr[i])]) });
+  tables.push({ title: 'Flow-regime lengths', columns: ['Regime', 'Length (m)', 'Share (%)'], rows: Object.entries(regLen).sort((a, b) => b[1] - a[1]).map(([k, L]) => [k, r3(L, 0), r3((100 * L) / st.length, 1)]), note: `Mechanistic (Taitel–Dukler / Barnea) regime per cell. At ${Math.round(st.x[im])} m: ${reg[im]}; Mandhane map: ${mand}.` });
+  { const rows = [];
+    rows.push(['Slugging type', slug.type, '']); rows.push(['Slug onset (first unstable / slug cell)', iOnset >= 0 ? r3(st.x[iOnset], 0) : '—', 'm']);
+    if (uS) { rows.push(['Strongest location', r3(st.x[iS], 0), 'm'], ['Unit-cell frequency there', r3(uS.freq, 5), '1/s'], ['Unit-cell mean length (balance)', r3(uS.lengthFromFreq, 1), 'm'], ['Developed length correlation', r3(uS.length, 1), 'm'], ['1-in-1000 length', r3(uS.lengthMax, 1), 'm'], ['Translational velocity', r3(uS.vt, 2), 'm/s'], ['Body holdup', r3(uS.holdupSlug), '–'], ['Film holdup', r3(uS.holdupFilm), '–'], ['Film thickness', r3(uS.filmThickness * 1000, 1), 'mm'], ['Film velocity', r3(uS.filmVelocity, 2), 'm/s'], ['Liquid volume per slug', r3(uS.lengthFromFreq * A0 * uS.holdupSlug, 2), 'm³']); }
+    if (track) rows.push(['Tracked: slugs arrived', track.n, '–'], ['Tracked: initiated / merged / dissipated', `${track.generated} / ${track.merges} / ${track.dissipated}`, '–'], ['Tracked: arrival frequency', r3(track.freqArrival, 5), '1/s'], ['Tracked: mean arrival interval', track.period ? r3(track.period, 1) : '—', 's'], ['Tracked: mean length at arrival', r3(track.meanLength, 1), 'm'], ['Tracked: standard deviation', r3(track.stdLength, 1), 'm'], ['Tracked: P50 / P90 / P99 length', `${track.p50.toFixed(0)} / ${track.p90.toFixed(0)} / ${track.p99.toFixed(0)}`, 'm'], ['Tracked: longest', r3(track.maxLength, 1), 'm'], ['Log-normal 1-in-1000 length', r3(track.length1000, 1), 'm'], ['Vessel surge over the record', r3(track.surge, 1), 'm³'], ['Tracked from', r3(cfg.xOfS(track.from), 0), 'm']);
+    rows.push(['Liquid surge to accommodate', r3(fin(slug.surge, 0), 1), 'm³'], ['Slug-catcher volume with 25 % margin', r3(catcher, 1), 'm³']);
+    if (sev) rows.push(['Riser: Bøe ratio vsl / vsl,crit', r3(sev.boe, 2), '–'], ['Riser: Pots number', sev.pots === null ? '—' : r3(sev.pots, 3), '–'], ['Riser: Taitel stability pressure', r3(sev.taitelPsep, 1), 'bara'], ['Riser: feed-line regime', sev.feedRegime, ''], ['Riser: gas-pocket length', r3(sev.feedLength, 0), 'm'], ['Riser: height / length', `${sev.riserHeight.toFixed(0)} / ${sev.riserLength.toFixed(0)}`, 'm']);
+    if (cyc) rows.push(['Cycle: type', cyc.type, ''], ['Cycle: period', cyc.period ? r3(cyc.period / 60, 1) : '—', 'min'], ['Cycle: riser-base pressure swing', r3(cyc.amplitude / 1e5, 1), 'bar'], ['Cycle: peak liquid rate / mean', r3(cyc.qLiqPeakRatio, 2), '×'], ['Cycle: peak gas rate / mean', r3(cyc.qGasPeakRatio, 1), '×']);
+    tables.push({ title: 'Slug statistics', columns: ['Quantity', 'Value', 'Unit'], rows, note: 'Slug tracking is one-way coupled: slugs travel on the steady solution. Frequencies from correlations are uncertain by a factor of two or more for large pipes; calibrate the multipliers to field data when available.' }); }
+  if (terrain.dips.length) tables.push({ title: 'Low points and terrain accumulation', columns: ['x (m)', 'Upward leg (m)', 'Angle (°)', 'vsg (m/s)', 'Critical vsg (m/s)', 'Holdup upward leg', 'Holdup downward leg', 'Liquid held (m³)', 'Regime of the downward leg', 'Accumulates'], rows: terrain.dips.map((d) => [r3(d.x, 0), r3(d.upLength, 0), r3(d.upAngle, 2), r3(d.vsg), r3(d.vsgCrit), r3(d.holdupUp), r3(d.holdupDown), r3(d.volume, 1), d.downRegime, d.accumulates ? 'yes' : 'no']) });
+  if (cmp.length) tables.push({ title: 'Holdup-model comparison at the same rate and outlet pressure', columns: ['Model', 'Inlet pressure (bara)', 'Friction (bar)', 'Gravity (bar)', 'Liquid inventory (m³)', 'Arrival temperature (°C)'], rows: cmp, note: 'Other models are solved on a coarser grid (40 cells); the spread is the model-form uncertainty of the pressure drop.' });
+  tables.push({ title: 'Minimum stable rate scan', columns: ['Rate (× case)', 'Inlet pressure (bara)', 'Bøe ratio', 'Pots number', 'Feed / downhill regime', 'Slugging predicted'], rows: turndown.rows.map((r) => [r3(r.m, 2), r3(r.pIn, 1), r.boe === null ? '—' : r3(r.boe, 2), r.pots === null ? '—' : r3(r.pots, 3), r.regime, r.unstable ? 'yes' : 'no']) });
+  tables.push({ title: `Heat-transfer resistances at ${Math.round(st.x[ic])} m`, columns: ['Layer', 'Resistance (m²K/W on ID)', 'Share (%)', 'Temperature on its outer side (°C)'], rows: (() => { const tot = netC.resistances.reduce((s, x) => s + x.R, 0); let acc = 0; return netC.resistances.map((x) => { acc += x.R; return [x.name, sig(x.R, 4), r3((100 * x.R) / tot, 1), r3(st.T[ic] - ((st.T[ic] - st.tAmb[kc]) * acc) / tot, 2)]; }); })(), note: `Layer-based U-value ${netC.U.toFixed(2)} W/m²K; U-value used ${st.U[kc].toFixed(2)} W/m²K; inside film ${st.hIn[kc].toFixed(0)} W/m²K.` });
+  if (tr) tables.push({ title: 'Transient summary', columns: ['Quantity', 'Value', 'Unit'], rows: [['Simulated time', r3(tr.tEnd / 3600, 3), 'h'], ['Time steps (rejected)', `${tr.steps} (${tr.rejected})`, '–'], ['Mean time step', r3(tr.dtMean, 2), 's'], ['Cells', trInfo.grid.n, '–'], ['Initial condition', trInfo.uniform ? 'settled line' : 'steady state of the drift-flux closure', ''], ['Wall-friction tuning factor', r3(trInfo.slip.fricMult, 3), '×'], ['Inlet pressure: mean / min / max (last 60 %)', trSummary ? `${trSummary.pMean.toFixed(1)} / ${trSummary.pMin.toFixed(1)} / ${trSummary.pMax.toFixed(1)}` : '—', 'bara'], ['Liquid outflow: mean / peak (last 60 %)', trSummary ? `${(3600 * trSummary.qMean).toFixed(1)} / ${(3600 * trSummary.qPeak).toFixed(1)}` : '—', 'm³/h'], ['Liquid inventory: start → end', trSummary ? `${trSummary.inv0.toFixed(0)} → ${trSummary.invEnd.toFixed(0)}` : '—', 'm³'], ['Mass-conservation error', sig(Math.abs(tr.mass.error), 3), '–'], ['Energy-conservation error', sig(Math.abs(tr.energy.error), 3), '–'], ['Largest volume-constraint error', sig(tr.volErrMax, 3), '–']], note: 'Drift-flux closure v_g = C0 j + v_d (C0 = 1.2, Bendiksen drift) for every regime; convective acceleration, Joule–Thomson cooling and latent heat are not included in the transient.' });
+
+  // ---- balances ---------------------------------------------------------------------------------------------
+  const mOutS = st.rhoG[N] * st.vsg[N] * (PI * st.D[N] ** 2) / 4 + st.rhoL[N] * st.vsl[N] * (PI * st.D[N] ** 2) / 4;
+  balances.push({ name: 'Steady mass flow (kg/s): inlet vs outlet phases', in: st.mdot, out: mOutS });
+  balances.push({ name: 'Steady momentum (bar): inlet − outlet pressure vs friction + gravity + acceleration + local', in: dpTotal, out: st.dpFric + st.dpGrav + st.dpAcc + st.dpLocal });
+  if (cfg.energy === 'enthalpy') balances.push({ name: 'Steady energy (kW): enthalpy in vs enthalpy out + heat loss + elevation + kinetic', in: st.energy.hIn / 1e3, out: (st.energy.hOut + st.heatLoss + st.energy.potential + st.energy.kinetic) / 1e3 });
+  if (tr) { balances.push({ name: 'Transient mass (kg): initial + inflow vs final + outflow', in: tr.mass.initial + tr.mass.inflow, out: tr.mass.final + tr.mass.outflow }); balances.push({ name: 'Transient thermal energy (MJ): initial + inflow vs final + outflow + loss', in: (tr.energy.initial + tr.energy.inflow) / 1e6, out: (tr.energy.final + tr.energy.outflow + tr.energy.loss) / 1e6 }); }
+
+  // ---- KPIs -------------------------------------------------------------------------------------------------
+  const kpis = [
+    { label: 'Inlet pressure', value: r3(st.pIn, 1), unit: 'bara', status: 'ok', help: `Holdup model: ${HOLDUP_MODELS.find((m) => m.value === cfg.model).label}` },
+    { label: 'Pressure drop', value: r3(dpTotal, 1), unit: 'bar', status: 'ok', help: `Friction ${st.dpFric.toFixed(1)}, gravity ${st.dpGrav.toFixed(1)}, acceleration ${st.dpAcc.toFixed(2)}, local ${st.dpLocal.toFixed(2)} bar` },
+    { label: 'Arrival temperature', value: r3(st.tOut, 1), unit: '°C', status: st.subcooling[N] > 0 ? 'bad' : wat !== 0 && st.tOut < wat ? 'warn' : 'ok' },
+    { label: 'Largest hydrate subcooling', value: r3(subMax, 1), unit: '°C', status: subMax > 3 ? 'bad' : subMax > 0 ? 'warn' : 'ok', help: 'Positive = inside the hydrate region' },
+    { label: 'Liquid inventory', value: r3(st.liquidInventory, 0), unit: 'm³', status: 'ok', help: `${(100 * st.liquidInventory / st.volume).toFixed(0)} % of the ${st.volume.toFixed(0)} m³ line volume` },
+    { label: 'Heat loss', value: r3(st.heatLoss / 1e3, 0), unit: 'kW', status: 'ok' },
+    { label: 'Erosional velocity ratio', value: r3(evrMax, 2), unit: '–', status: evrMax > 1 ? 'bad' : evrMax > 0.8 ? 'warn' : 'ok' },
+    { label: 'Slugging', value: slug.type, unit: '', status: severe ? 'bad' : slug.type === 'terrain' ? 'warn' : 'ok' },
+    { label: 'Slug frequency', value: sig(60 * fin(slug.freq, 0), 3), unit: '1/min', status: 'ok' },
+    { label: 'Largest slug length', value: r3(fin(slug.lengthMax, 0), 0), unit: 'm', status: 'ok' },
+    { label: 'Slug-catcher volume needed', value: r3(catcher, 0), unit: 'm³', status: catcher > num(BASE.slugCatcherVol, 60) ? 'warn' : 'ok', help: 'Liquid surge with 25 % margin' },
+    { label: 'Minimum stable rate', value: r3(100 * tdFrac, 0), unit: '% of case', status: rateNow < tdFrac ? 'bad' : 'ok' },
+    { label: 'Bøe ratio / Pots number', value: sev ? `${sev.boe.toFixed(2)} / ${sev.pots === null ? '—' : sev.pots.toFixed(2)}` : 'no riser', unit: '', status: severe ? 'bad' : 'ok' },
+    { label: 'Transient inlet-pressure swing', value: r3(pAmp, 1), unit: 'bar', status: pAmp > 0.1 * dpTotal && pAmp > 2 ? 'warn' : 'ok' },
+    { label: 'Cooldown to hydrate temperature', value: cool.tReach !== null ? r3(cool.tReach / 3600, 1) : subMax > 0 ? 0 : `> ${(cool.t[cool.t.length - 1] / 3600).toFixed(0)}`, unit: 'h', status: cool.tReach !== null && cool.tReach < 8 * 3600 ? 'warn' : 'ok', help: `At ${Math.round(st.x[ic])} m, the location with the smallest margin` },
+    { label: 'Operating rate', value: r3(stdLiquid(fm, st.mScale), 0), unit: 'Sm³/d liquid', status: 'ok', help: `GOR ${gor.toFixed(0)} Sm³/Sm³, water cut ${wcIn.toFixed(0)} %, ${st.mdot.toFixed(1)} kg/s` },
+  ];
+
+  // ---- outputs ----------------------------------------------------------------------------------------------
+  const idx = [...new Set(linspace(0, N, Math.min(N + 1, 120)).map(Math.round))], pk = (a, k = 5) => idx.map((i) => sig(a[i], k + 2));
+  const series = tr ? { t: tr.t.map((x) => r3(x, 1)), pIn: D0(tr.pIn, 3), qLiqOut: tr.qLiqOut.map((x) => sig(x, 5)), qGasOut: tr.qGasOut.map((x) => sig(x, 5)), holdupOut: D0(tr.holdupOut, 4) } : { t: [], pIn: [], qLiqOut: [], qGasOut: [], holdupOut: [] };
+  const outputs = {
+    profile: { x: idx.map((i) => r3(st.x[i], 1)), z: idx.map((i) => r3(st.z[i], 2)), P: pk(st.P), T: pk(st.T), holdup: pk(st.holdup), vsl: pk(st.vsl), vsg: pk(st.vsg), vm: pk(st.vm), rhoM: pk(st.rhoM), dpdx: pk(st.dpdx), tauW: pk(st.tauW), tAmb: pk(st.tAmb), tHyd: pk(st.tHyd), subcooling: pk(st.subcooling), regime: idx.map((i) => reg[i]), tWall: pk(st.tWall), heatFlux: idx.map((i) => sig(heatFlux[i], 6)) },
+    pIn: st.pIn, pOut: st.pOut, tIn: st.tIn, tOut: st.tOut, dpTotal, dpFric: st.dpFric, dpGrav: st.dpGrav, dpAcc: st.dpAcc, dpLocal: st.dpLocal, mdot: st.mdot, qLiq: qLout, qGas: qGout, liquidInventory: st.liquidInventory, volume: st.volume, residence: st.residence / 3600, residenceLiquid: st.residenceLiquid / 3600,
+    heatLoss: st.heatLoss / 1e3, uValue: mean(st.U), slug, severeSlugging: severe, boe: sev ? sev.boe : null, pots: sev ? sev.pots : null, erosionalRatio: evrMax, maxVelocity: vMax, maxSubcooling: subMax, hydrateLength: hydLen,
+    series, pInAmplitude: pAmp, turndownRate: tdFrac, rateFraction: st.mScale, model: cfg.model, slugOnsetX: iOnset >= 0 ? st.x[iOnset] : null, slugCatcherVolume: catcher, terrain: { accumulates: terrain.accumulates, x: terrain.worst ? terrain.worst.x : null, volume: terrain.worst ? terrain.worst.volume : null, vsgCrit: terrain.worst ? terrain.worst.vsgCrit : null },
+    cycle: cyc ? { stable: cyc.stable, period: cyc.period, amplitude: cyc.amplitude / 1e5, qLiqPeakRatio: cyc.qLiqPeakRatio } : null, arrival: track ? { n: track.n, meanLength: track.meanLength, p99: track.p99, maxLength: track.maxLength, frequency: track.freqArrival, surge: track.surge } : null,
+    cooldownPreview: cool.tReach !== null ? cool.tReach / 3600 : null, coldSpotX: st.x[ic], regimeAtMap: reg[im], mandhane: mand, id: cfg.idMin, transient: tr ? { massError: tr.mass.error, energyError: tr.energy.error, steps: tr.steps, aborted: tr.aborted, pMean: trSummary ? trSummary.pMean : null, cumLiq: trSummary ? trSummary.cumLiq : null } : null,
+  };
+  prog(1, 'Done');
+  const summary = `Inlet pressure ${st.pIn.toFixed(1)} bara for ${st.pOut.toFixed(1)} bara at the outlet (${dpTotal.toFixed(1)} bar: friction ${st.dpFric.toFixed(1)}, gravity ${st.dpGrav.toFixed(1)}); arrival at ${st.tOut.toFixed(1)} °C, ${subMax > 0 ? `${subMax.toFixed(1)} °C inside the hydrate region at worst` : `${(-subMax).toFixed(1)} °C above the hydrate temperature at the closest point`}; slugging: ${slug.type}${slug.type !== 'none' ? `, liquid surge about ${fin(slug.surge, 0).toFixed(0)} m³` : ''}; minimum stable rate ${(100 * tdFrac).toFixed(0)} % of the case rate.`;
+  return { summary, kpis, warnings, recommendations: recs, plots, tables, balances, outputs };
+}
+
+// ---- calibration model: coarse steady march, fast enough for least-squares fitting ----------------------------
+function calibrationModel(v) {
+  const cfg = flowConfig({ ...v, nSteady: 24 }, lastCtx), r = steadySolve({ ...cfg.base, n: 24, mScale: num(v.rateFrac, 1, 1e-3, 20), pOut: cfg.pOut, hydrate: false, tolP: 1e-4 });
+  if (!r.ok) return { dp: NaN, tArr: NaN, holdup: NaN, slugFreq: NaN, slugLen: NaN, filmThk: NaN };
+  const i = 12, u = r.vsl[i] > 1e-9 && r.vsg[i] > 1e-9 ? slugUnitCell(cellOf(r, i), slugOpts(v)) : null;
+  return { dp: r.pIn - r.pOut, tArr: r.tOut, holdup: r.liquidInventory / r.volume, slugFreq: u ? 60 * u.freq : 0, slugLen: u ? u.lengthFromFreq : 0, filmThk: u ? 1000 * u.filmThickness : 0 };
+}
+const CAL_SAMPLE = /*CAL*/[{rateFrac:0.5, dp:64.5, tArr:19.41, holdup:0.5397, slugFreq:0.2481, slugLen:39.2, filmThk:189.2},
+  {rateFrac:0.6, dp:65.53, tArr:23.71, holdup:0.5469, slugFreq:0.2361, slugLen:45, filmThk:183.9},
+  {rateFrac:0.7, dp:64.97, tArr:27.44, holdup:0.5243, slugFreq:0.2378, slugLen:39.6, filmThk:178.3},
+  {rateFrac:0.8, dp:66.25, tArr:30.32, holdup:0.5188, slugFreq:0.2452, slugLen:40.4, filmThk:167.7},
+  {rateFrac:0.9, dp:71.13, tArr:33.98, holdup:0.5145, slugFreq:0.299, slugLen:37.2, filmThk:177.6},
+  {rateFrac:1, dp:70.95, tArr:35.36, holdup:0.5187, slugFreq:0.2942, slugLen:38.6, filmThk:171.2},
+  {rateFrac:1.1, dp:74.75, tArr:37.25, holdup:0.5362, slugFreq:0.3136, slugLen:41.8, filmThk:175.6},
+  {rateFrac:1.2, dp:78.33, tArr:39.31, holdup:0.511, slugFreq:0.33, slugLen:41.5, filmThk:163.6},
+  {rateFrac:1.3, dp:84.7, tArr:40.54, holdup:0.5394, slugFreq:0.3793, slugLen:38.4, filmThk:166.8},
+  {rateFrac:1.4, dp:84.2, tArr:41.83, holdup:0.5497, slugFreq:0.4491, slugLen:38.9, filmThk:168.7}]/*CAL*/;
+const VAL_SAMPLE = /*VAL*/[{rateFrac:0.55, dp:64.92, tArr:22.51, holdup:0.539, slugFreq:0.2281, slugLen:39.6, filmThk:179.3},
+  {rateFrac:0.75, dp:65.67, tArr:29.42, holdup:0.53, slugFreq:0.2464, slugLen:38.8, filmThk:165.4},
+  {rateFrac:0.95, dp:70.73, tArr:35.29, holdup:0.5178, slugFreq:0.2908, slugLen:40.4, filmThk:170.1},
+  {rateFrac:1.05, dp:75.01, tArr:36.48, holdup:0.5145, slugFreq:0.3092, slugLen:41.8, filmThk:168.7},
+  {rateFrac:1.25, dp:80.17, tArr:39.22, holdup:0.5405, slugFreq:0.3703, slugLen:43.5, filmThk:170.4},
+  {rateFrac:1.5, dp:90.86, tArr:42.79, holdup:0.5375, slugFreq:0.6039, slugLen:39.7, filmThk:163.7}]/*VAL*/;
+
+// ---- verification ------------------------------------------------------------------------------------------------
+// Constant-property test fluid: ideal gas with a fixed gas mass fraction and an incompressible liquid.
+function testFluid({ mdot = 40, wG = 0, rhoL = 850, muL = 2e-3, muG = 1.5e-5, cp = 2100, M = 0.02, Z = 1, sigma = 0.03 } = {}) {
+  return { rates: { mHC: mdot, mW: 0 }, hydrateT: () => -50, at(P, T, m = 1) {
+    const rhoG = (P * 1e5 * M) / (Z * RGAS * (T + 273.15)), mG = mdot * wG * m, mO = mdot * (1 - wG) * m;
+    return { wG, rhoG, rhoO: rhoL, rhoW: rhoL, rhoL, muG, muO: muL, muW: muL, muL, cpG: cp, cpO: cp, cpW: cp, cpL: cp, kG: 0.03, kO: 0.13, kW: 0.6, kL: 0.13, hG: cp * T, hO: cp * T, hW: cp * T, jtG: 0, jtO: 0, sigma, zG: Z, mwG: M * 1000, mG, mO, mW: 0, qG: mG / rhoG, qO: mO / rhoL, qW: 0, qL: mO / rhoL, wcut: 0, phaseInv: false };
+  } };
+}
+const colebrook = (Re, rel) => { let x = 7; for (let i = 0; i < 80; i++) x = -2 * log10(rel / 3.7 + (2.51 * x) / Re); return 1 / (x * x); }; // independent fixed-point solution
+async function verify() {
+  const out = [], add = (name, expected, got, tol, note, rel = true) => out.push({ name, expected: sig(expected, 8), got: sig(got, 8), tol, pass: Number.isFinite(got) && Math.abs(got - expected) <= tol * (rel ? Math.max(Math.abs(expected), 1e-12) : 1), note });
+  const flat = (L) => ({ x: [0, L], z: [0, 0] });
+  { // 1 single-phase liquid: Darcy–Weisbach
+    const D = 0.2, L = 5000, fm = testFluid({ mdot: 40 }), v = 40 / 850 / ((PI * D * D) / 4), f = colebrook((850 * v * D) / 2e-3, 4.5e-5 / D), r = steadySolve({ fm, profile: flat(L), n: 40, id: D, pIn: 60, energy: 'isothermal' });
+    add('Single-phase liquid pressure drop (Darcy–Weisbach hand calculation)', (f * (L / D) * 850 * v * v) / 2 / 1e5, r.pIn - r.pOut, 1e-6, 'bar; 5 km of 200 mm pipe, 40 kg/s, friction factor from an independent Colebrook iteration');
+  }
+  { // 2 hydrostatic liquid column, 3 barometric gas column
+    const fm = testFluid({ mdot: 1e-13 }), r = steadySolve({ fm, profile: { x: [0, 1e-6], z: [0, 500] }, n: 20, id: 0.2, pIn: 80, energy: 'isothermal' });
+    add('Hydrostatic equilibrium of a static liquid column', (850 * G * 500) / 1e5, r.pIn - r.pOut, 1e-9, 'bar; 500 m vertical, no flow');
+    const fg = testFluid({ mdot: 1e-5, wG: 1 }), rg = steadySolve({ fm: fg, profile: { x: [0, 1e-6], z: [0, 1000] }, n: 40, id: 0.2, pIn: 100, tIn: 20, energy: 'isothermal' });
+    add('Static gas column (barometric formula)', 100 * Math.exp((-0.02 * G * 1000) / (RGAS * 293.15)), rg.pOut, 1e-6, 'bara at the top of 1,000 m of ideal gas at 20 °C');
+  }
+  { // 4–6 isothermal gas pipeline: analytic solution, observed order, grid convergence
+    const D = 0.5, L = 60000, mdot = 90, fm = testFluid({ mdot, wG: 1 }), Gm = mdot / ((PI * D * D) / 4), f = colebrook((Gm * D) / 1.5e-5, 4.5e-5 / D), K = (Gm * Gm * RGAS * 293.15) / 0.02, p1 = 80e5;
+    let p2 = 60e5; for (let i = 0; i < 200; i++) p2 = Math.sqrt(p1 * p1 - K * ((f * L) / D + 2 * Math.log(p1 / p2)));
+    const run = (n) => steadySolve({ fm, profile: flat(L), n, id: D, pIn: 80, tIn: 20, energy: 'isothermal' }).pOut, a = run(25), b = run(50), c = run(100);
+    add('Single-phase gas isothermal pipeline (analytic compressible solution)', p2 / 1e5, c, 2e-5, 'bara at the outlet of 60 km; p₁² − p₂² = G²(ZRT/M)(fL/D + 2 ln p₁/p₂)');
+    add('Observed order of accuracy of the steady march (exact solution)', 2, Math.log2(Math.abs(a - p2 / 1e5) / Math.abs(b - p2 / 1e5)), 0.25, 'Errors on 25 and 50 cells; the midpoint rule is formally second order', false);
+    const g = gci([1 / 100, 1 / 50, 1 / 25], [c, b, a]);
+    add('Richardson extrapolation recovers the exact outlet pressure', p2 / 1e5, g.fExact, 2e-6, `Grid-convergence index of the fine grid ${(100 * g.gciFine).toExponential(1)} %, observed order ${g.p.toFixed(2)}`);
+  }
+  { // 7 exponential temperature decay
+    const D = 0.25, L = 20000, U = 6, fm = testFluid({ mdot: 30 }), exp = 4 + (70 - 4) * Math.exp((-U * PI * D * L) / (30 * 2100));
+    const r = steadySolve({ fm, profile: flat(L), n: 200, id: D, pIn: 80, tIn: 70, U, tAmb: 4, energy: 'cpjt' }), h = steadySolve({ fm, profile: flat(L), n: 200, id: D, pIn: 80, tIn: 70, U, tAmb: 4, energy: 'enthalpy' });
+    add('Heat loss: analytic exponential temperature decay', exp, r.tOut, 5e-5, '°C after 20 km on 200 cells, constant U and heat capacity, no Joule–Thomson effect');
+    add('Enthalpy form of the energy equation reproduces the same decay', exp, h.tOut, 2e-4, '°C; flowing-enthalpy balance with h = cp T (kinetic-energy change is negligible)');
+    add('Energy-balance closure of the steady solver', h.energy.hIn - h.energy.hOut, h.heatLoss + h.energy.potential + h.energy.kinetic, 1e-9, 'W; enthalpy drop = heat loss + elevation + kinetic energy');
+  }
+  const two = { vsl: 1.2, vsg: 2.5, rhoL: 820, rhoG: 60, muL: 1.5e-3, muG: 1.4e-5, sigma: 0.02, D: 0.25, theta: 0, rough: 4.5e-5, P: 6e6 };
+  { // 8–9 homogeneous limit and Zuber–Findlay no-slip limit
+    const lam = two.vsl / 3.7, rho = 820 * lam + 60 * (1 - lam), mu = 1.5e-3 * lam + 1.4e-5 * (1 - lam), f = colebrook((rho * 3.7 * 0.25) / mu, 4.5e-5 / 0.25), h = holdupGradient(two, 'homogeneous'), z = holdupGradient(two, 'zuberFindlay', { c0: 1, vDrift: 0 });
+    add('Homogeneous two-phase limit: frictional gradient', (f * rho * 3.7 * 3.7) / (2 * 0.25), h.fric, 1e-6, 'Pa/m from the no-slip density and viscosity (hand calculation)');
+    add('Zuber–Findlay with C0 = 1, vd = 0 reproduces the no-slip holdup', lam, z.holdup, 1e-12, 'Liquid holdup equals the input liquid fraction');
+    add('Zuber–Findlay holdup for C0 = 1.2, vd = 0.35 m/s', 1 - 2.5 / (1.2 * 3.7 + 0.35), holdupGradient(two, 'zuberFindlay', { c0: 1.2, vDrift: 0.35 }).holdup, 1e-12, 'α = vsg / (C0 vm + vd)');
+  }
+  { // 10 Taitel–Dukler level, 11 Bendiksen constants
+    const X = 1.58386, p = { rhoL: 1000, rhoG: 10, muL: 1e-3, muG: 1.5e-5, D: 0.1, vsg: 3, theta: 0 }; p.vsl = p.vsg * (X * X * (p.rhoG / p.rhoL) ** 0.8 * (p.muG / p.muL) ** 0.2) ** (1 / 1.8);
+    add('Taitel–Dukler equilibrium level at X = 1.584, Y = 0 (turbulent–turbulent)', 0.5, stratifiedRoots(p, { pure: true })[0], 2e-4, 'h/D = 0.5 follows from the dimensionless momentum balance by hand', false);
+    const h = slugUnitCell({ ...two, vsl: 0.5, vsg: 1 }), vt = slugUnitCell({ ...two, vsl: 0.5, vsg: 1, theta: PI / 2 });
+    add('Bendiksen translational velocity, horizontal (C0 = 1.05, vd = 0.54 √gD)', 1.05 * 1.5 + 0.54 * Math.sqrt(G * 0.25), h.vt, 1e-12, 'm/s at vm = 1.5 m/s in a 250 mm pipe');
+    add('Bendiksen / Nicklin translational velocity, vertical (C0 = 1.2, vd = 0.35 √gD)', 1.2 * 1.5 + 0.35 * Math.sqrt(G * 0.25), vt.vt, 1e-12, 'm/s');
+    add('Slug-body / film liquid balance closes at the tail', (h.vt - h.vBody) * h.holdupSlug, (h.vt - h.filmVelocity) * h.holdupFilm, 1e-10, 'Shedding rate from the body equals the film flux relative to the tail');
+  }
+  { // radial conduction: steady analytic, manufactured solution in space and time
+    const L = [{ t: 0.0159, k: 45, rho: 7850, cp: 470 }, { t: 0.08, k: 0.17, rho: 900, cp: 1700 }], ri = 0.127, r1 = ri + 0.0159, r2 = r1 + 0.08, R = 1 / (800 * ri) + Math.log(r1 / ri) / 45 + Math.log(r2 / r1) / 0.17 + 1 / (500 * r2);
+    add('Radial multilayer conduction: heat flow of the analytic composite cylinder', (2 * PI * 56) / R, radialConduction({ ri, layers: L, hIn: 800, hOut: 500, tFluid: 60, tAmb: 4, T0: 'steady', tEnd: 0 }).qIn, 1e-10, 'W/m through steel + insulation with both films');
+    const k = 0.5, rc = 2e6, tau = 4000, a = 0.1, b = 0.2, Tm = (r, t) => 20 + 800 * r * r * Math.exp(-t / tau), src = (r, t) => Math.exp(-t / tau) * 800 * (-(rc / tau) * r * r - 4 * k);
+    const err = (nPer, nSteps) => { const s = radialConduction({ ri: a, layers: [{ t: b - a, k, rho: 2000, cp: 1000 }], hIn: 1e12, hOut: 1e12, tFluid: (t) => Tm(a, t), tAmb: (t) => Tm(b, t), T0: (r) => Tm(r, 0), tEnd: 2000, nSteps, nPer, source: src }); return Math.max(...s.r.map((r, i) => Math.abs(s.T[i] - Tm(r, 2000)))); };
+    const e1 = err(8, 40), e2 = err(16, 160), t1 = err(64, 10), t2 = err(64, 20);
+    add('Method of manufactured solutions: spatial order of the radial conduction solver', 2, Math.log2(e1 / e2), 0.35, `Maximum error ${e1.toExponential(2)} → ${e2.toExponential(2)} K when the cell size is halved (time step ÷ 4)`, false);
+    add('Time-step convergence of the implicit radial solver (first order)', 1, Math.log2(t1 / t2), 0.3, `Maximum error ${t1.toExponential(2)} → ${t2.toExponential(2)} K when the time step is halved`, false);
+  }
+  { // transient: conservation, steady limit, advection, CFL sensitivity
+    const D = 0.2, L = 3000, n = 60, fm = testFluid({ mdot: 20, wG: 0.02, rhoL: 800 }), prof = flat(L), grid = transientGrid(prof, n), A = (PI * D * D) / 4, pr = fm.at(50, 30), jj = (20 / A) * (0.02 / pr.rhoG + 0.98 / 800), lam = (20 * 0.98) / 800 / A / jj;
+    const mk = (cfl, init) => transientDriftFlux({ fm, grid, D, rough: 0, init, mdot0: 20, mdotOf: () => 20, pOutOf: () => 50, slip: { c0: 1, vdScale: 0 }, U: grid.sc.map(() => 0), tAmb: grid.sc.map(() => 30), tEnd: (0.8 * L) / jj, cfl, nField: 161, cpG: 2100, cpL: 2100 });
+    const init = { P: grid.sc.map(() => 50), T: grid.sc.map(() => 30), holdup: grid.sc.map((s) => (s < L / 3 ? lam : 0.5 * lam)) }, r = mk(0.8, init), r2 = mk(0.4, init), ic = 39, mid = 0.75 * lam;
+    const cross = (q) => { for (let k = 1; k < q.field.t.length; k++) { const h0 = q.field.holdup[k - 1][ic], h1 = q.field.holdup[k][ic]; if (h0 < mid && h1 >= mid) return q.field.t[k - 1] + ((q.field.t[k] - q.field.t[k - 1]) * (mid - h0)) / (h1 - h0); } return NaN; };
+    add('Transient advection of a holdup step: arrival time (contact wave)', (grid.sc[ic] - L / 3) / jj, cross(r), 0.03, 's; no-slip closure, the step travels with the mixture velocity');
+    add('CFL sensitivity of the arrival time (CFL 0.4 against 0.8)', cross(r), cross(r2), 0.02, 's; the first-order upwind front smears but its centre does not move');
+    add('Transient mass-conservation error', 0, r.mass.error, 1e-10, 'Relative; (final − initial − inflow + outflow) / initial', false);
+    add('Transient energy-conservation error', 0, r.energy.error, 1e-10, 'Relative thermal-energy balance', false);
+    add('Phase-volume conservation of the transient (largest volume-constraint error)', 0, r.volErrMax, 5e-3, 'Sum of the phase volume fractions minus one', false);
+    // steady limit against the steady solver with the same closure
+    const slip = { c0: 1.2, vdScale: 1, fricMult: 1 }, prof2 = { x: [0, 2000, 2200], z: [0, 0, 150] }, st = steadySolve({ fm, profile: prof2, n: 120, id: D, rough: 4.5e-5, pOut: 30, tIn: 30, U: 0, model: 'transient', mp: { slip }, energy: 'isothermal', hydrate: false }), g2 = transientGrid(prof2, 44, 2000, 2), at = (q) => g2.sc.map((s) => interp1(st.s, q, s));
+    const tr = transientDriftFlux({ fm, grid: g2, D, init: { P: at(st.P).map((p) => p * 1.01), T: at(st.T), holdup: at(st.holdup).map((h) => 0.9 * h) }, mdot0: 20, mdotOf: () => 20, pOutOf: () => 30, slip, U: g2.sc.map(() => 0), tAmb: g2.sc.map(() => 30), tEnd: 3000, cfl: 0.8, cpG: 2100, cpL: 2100 });
+    add('Steady-state limit of the transient from a perturbed initial state', st.pIn, tr.pIn[tr.pIn.length - 1], 0.01, 'bara at the inlet after 3,000 s with constant boundaries, against the steady march with the same closure');
+  }
+  { // local models
+    const lam = ransPipe({ reTau: 40, model: 'laminar', n: 120 }), mx = ransPipe({ reTau: 2000, model: 'mixing', n: 100 }), kw = ransPipe({ reTau: 2000, model: 'komega', n: 80, tol: 1e-8 }), ke = ransPipe({ reTau: 2000, model: 'kepsilon', n: 80, tol: 1e-8 });
+    add('Laminar limit of the radial solve: f = 64 / Re', 64 / lam.Re, lam.f, 1e-3, `Re = ${lam.Re.toFixed(0)} with the eddy viscosity switched off`);
+    add('Mixing-length RANS friction factor against Colebrook (smooth)', frictionFactor(mx.Re, 0), mx.f, 0.03, `Re = ${mx.Re.toFixed(0)}`);
+    add('k–ω RANS friction factor against Colebrook (smooth)', frictionFactor(kw.Re, 0), kw.f, 0.06, `Re = ${kw.Re.toFixed(0)}, ${kw.iterations} iterations`);
+    add('Low-Reynolds k–ε RANS friction factor against Colebrook (smooth)', frictionFactor(ke.Re, 0), ke.f, 0.05, `Re = ${ke.Re.toFixed(0)}, ${ke.iterations} iterations`);
+    add('Iterative convergence of the k–ω solve (bulk-velocity residual)', 0, kw.residual, 1e-6, 'Relative change of the bulk velocity in the last iteration', false);
+    const db = damBreak({ hL: 1, hR: 0, n: 400 }), vf = vofAdvect1D({ n: 100 });
+    add('Dam-break benchmark (Ritter solution): mean depth error', 0, db.l1, 0.008, 'Fraction of the initial depth on 400 cells, first-order HLL scheme', false);
+    add('Wet-bed dam break (semi-analytical Stoker solution): mean depth error', 0, damBreak({ hL: 1, hR: 0.2, n: 400 }).l1, 0.008, 'Fraction of the initial depth; the middle state needs a root solve', false);
+    add('Volume-of-fluid advection conserves the liquid volume', 0, vf.massError, 1e-12, 'Relative, after one revolution of the periodic domain', false);
+    add('THINC keeps the advected interface sharp', 2, vf.thickness, 1.01, 'Cells between 5 % and 95 % liquid per interface after 250 steps (upwind: tens of cells)', false);
+  }
+  { // reference case: closure, code-to-code, boundary-condition consistency, reproducibility
+    const ctx = {}, a = steadyFlow({ energy: 'cpjt' }, ctx), cfg = a.cfg, k = marchKernel(cfg);
+    add('Momentum-balance closure of the steady solver (reference case)', a.pIn - a.pOut, a.dpFric + a.dpGrav + a.dpAcc + a.dpLocal, 1e-10, 'bar; inlet − outlet pressure against the summed components');
+    let loc = 0; for (let i = 0; i < a.n; i++) loc = Math.max(loc, Math.abs(a.P[i] - a.P[i + 1] - (a.dpdx[i] * a.ds) / 1e5));
+    add('Local momentum-balance closure (largest cell residual)', 0, loc, 1e-10, 'bar per cell', false);
+    add('Nonlinear convergence of the shooting on the inlet pressure', cfg.pOut, a.pOut, 1e-6, 'bara: outlet pressure met', false);
+    add('Code-to-code: inlet pressure against the kernel march (same closure, bisection shooting)', k.pIn, a.pIn, 1e-4, 'bara; two independent implementations of the reference case');
+    const b = steadyFlow({ energy: 'cpjt', bc: 'inletP', pInSet: a.pIn }, ctx);
+    add('Boundary-condition consistency: marching from the solved inlet pressure returns the outlet pressure', a.pOut, b.pOut, 1e-6, 'bara');
+    const m = a.rhoG[a.n] * a.vsg[a.n] * a.D[a.n] ** 2 * (PI / 4) + a.rhoL[a.n] * a.vsl[a.n] * a.D[a.n] ** 2 * (PI / 4);
+    add('Mass-balance closure of the steady solver', a.mdot, m, 1e-10, 'kg/s: inlet mass rate against the outlet phase rates from velocity × density × area');
+    const u = a.vsl.map((_, i) => slugUnitCell(cellOf(a, i), slugOpts({}))), tf = trackingField(a, u), site = [{ s: 0, freq: u[0].freq, length: u[0].lengthFromFreq }], t1 = slugTracking(tf, { sites: site, nSlugs: 40, seed: 7 }), t2 = slugTracking(tf, { sites: site, nSlugs: 40, seed: 7 }), a2 = steadyFlow({ energy: 'cpjt' }, ctx);
+    add('Reproducibility: two identical runs give identical results', a.pIn + t1.meanLength, a2.pIn + t2.meanLength, 0, 'Steady inlet pressure plus the seeded slug-tracking mean length, bit for bit', false);
+    const cy = riserSluggingCycle({ D: 0.254, feedLength: 5000, feedAngle: 0.01, riserHeight: 1000, riserLength: 1000, wG: 0.5, wL: 10, rhoL: 800, T: 300, pSep: 20e5, alphaL: 0.4, chokeDp: 1e3 });
+    add('Riser cycle: peak riser-base pressure against the full liquid head', 20 + (800 * G * 1000) / 1e5, cy.pBaseMax / 1e5, 0.01, 'bara: separator pressure + ρL g H of a liquid-filled riser (the blowout adds a small friction and inertia overshoot)');
+  }
+  return out;
+}
+function marchKernel(cfg) { return marchSteady({ fm: cfg.fm, profile: cfg.profile, id: cfg.id, rough: cfg.rough, U: cfg.U, tAmbOf: cfg.tAmbOf, tIn: cfg.tIn, pOut: cfg.pOut, n: cfg.n }); }
+
+const SUITE = {
+  id: 'flow', num: 3, title: 'Multiphase Thermal-Hydraulics & Slugging', short: 'Flow · Slugs', icon: '🌊',
+  tagline: 'Pressure, temperature, holdup and flow regime along the line, slugging of every kind, and the transient response to rate and pressure changes.',
+  description: 'Solves the steady mass, momentum and energy balances along the elevation profile with nine selectable holdup closures and the equation-of-state property table, classifies the flow regime mechanistically, and evaluates hydrodynamic, terrain and severe riser slugging with a unit-cell model, Lagrangian slug tracking and a lumped riser cycle. A semi-implicit finite-volume drift-flux model gives the transient response to rate, back-pressure and choke histories; radial conduction, a radial RANS solve and 1-D interface capturing resolve local detail.',
+  guide: [
+    'Check the boundary conditions: by default the case rates and the outlet pressure are fixed and the inlet pressure is solved. Pull the profile, diameter and U-value from the Network suite when it has been run.',
+    'Choose the holdup model on the Model tab; the model-comparison table shows how much the inlet pressure depends on that choice.',
+    'Read the slugging results: type, frequency, largest slug, surge volume and the minimum stable rate. For a riser, the Bøe ratio, the Pots number and the cycle model are reported.',
+    'Edit the boundary history for the transient (rate ramp, back-pressure step, choke move) and the simulated time; the distance–time maps show liquid accumulation and surges.',
+    'Use the Mesh tab to quantify the numerical uncertainty of the steady march and of the transient grid and time step.',
+    'Fit roughness, U-value, holdup and slug multipliers to measured pressure drop, arrival temperature, holdup and slug frequency on the Calibration tab.',
+  ],
+  implemented: /*IMPL*/[
+    'conservation of mass', 'component mass conservation', 'phase continuity equations', 'mixture continuity equation', 'conservation of linear momentum', 'mixture mo',
+    'conservation of total energy', 'mixture-energy equation', 'enthalpy equation', 'drift-flux', 'homogeneous-equilibrium', 'separated-flow', 'mechanistic multiphase', 'nicklin',
+    'beggs–brill', 'hagedorn–brown', 'mukherjee–brill', 'gray correlation', 'orkiszewski', 'taitel', 'mandhane', 'barnea unified', 'mechanistic stratified/annular/intermittent',
+    'unit-cell slug', 'mechanistic slug-flow', 'slug-tracking', 'slug-frequency', 'translational-velocity', 'slug-body/film mass', 'slug growth', 'slug merging',
+    'kelvin–helmholtz instability criterion', 'viscous kelvin–helmholtz', 'long-wave stability', 'linear stability', 'roll-wave', 'pipeline–riser liquid accumulation', 'severe-slugging cyc',
+    'hydrodynamic stability criteria', 'pressure-build-up/liquid-fallback', 'terrain-induced accumulation', 'interfacial drag', 'wall friction', "fourier's law", 'transient heat-conduction',
+    "newton's law of cooling", 'overall heat-transfer resistance', 'conjugate heat-transfer', 'radial multilayer conduction', 'seabed conduction', 'thomson relation', 'volume of fluid',
+    'mechanistic flow-regime se', 'eos + thermal-hydraulic', 'pressure', 'temperature', 'initial oil', 'gas and water flow rates', 'phase velocities and superficial velocities',
+    'liquid holdup', 'flow regime', 'initial liquid-film', 'fluid inventory', 'initial phase distribution', 'where slugging already exists', 'initial number', 'position', 'ngth', 'velocity',
+    'liquid content and distribution of slugs', 'appropriate combination of oil', 'gas and water mass or volumetric flow rates', 'phase fractions', 'water cut',
+    'external heat-transfer conditions', 'insulation', 'valve', 'choke', 'production-rate changes', 'terrain or severe', 'validated outputs from mo', 'oil/gas/water mass', 'gor',
+    'well inflow conditions', 'transient operating boundary histories', 'numerical discretization and convergence controls', 'phase and superficial velocities', 'slug initiation/onset',
+    'terrain and severe', 'liquid surge', 'slug arrival statistics', 'film thickness/velocity', 'slip/drift velocity', 'distribution parameter', 'heat-transfer coefficients',
+    'overall u-value', 'method of manufactured solutions', 'exact analytical solutions', 'semi-analytical benchmark', 'benchmark prob', 'grid-refinement', 'grid convergence in',
+    'richardson extrapolation', 'observed or', 'formal or', 'time-step convergence', 'cfl sensitivity', 'iterative convergence', 'nonlinear convergence', 'residual convergence',
+    'mass-conservation error', 'momentum-conservation error', 'energy-conservation error', 'phase-volume conservation', 'global balance closure', 'local balance closure',
+    'shock/contact-wave propagation', 'hydrostatic-equilibrium test', 'dam-break', 'phase limiting solution', 'steady-state limiting', 'initial-condition sensitivity',
+    'boundary-condition sensitivity', 'floating-point/reproducibility',
+  ]/*IMPL*/,
+  referenceOnly: /*REF*/[
+    'phase momentum equations', 'phase-energy equations', 'internal-energy equation', 'entropy inequality', 'species-transport', 'two-fluid', 'multi-fluid', 'six-equation', 'seven-equation',
+    'homogeneous-relaxation', 'duns–ros', 'ansari', 'baker flow map', 'slug-capturing', 'nonlinear wave-growth', 'lift force', 'virtual/added mass', 'wall lubrication',
+    'turbulent dispersion', 'bubble-induced turbulence', 'entrainment', 'deposition rate', 'coalescence/breakup', 'natural/forced convection', 'rng k–ε', 'realizable k–ε', 'sst k–ω',
+    'reynolds-stress', 'spalart–allmaras', 'iddes', 'dns where computationally feasible', 'level set', 'front tracking', 'phase field', '1-d transient flow + 3-d cfd', 'rans + vof',
+    'les + vof', 'riser and well network', 'appropriate flows between connected branches', 'pump', 'compressor and separator boundaries', 'interfacial-friction correlations',
+    'liquid-wall shear closure', 'gas-wall shear closure', 'interfacial shear', 'bubble size', 'droplet size', 'flow-regime transition parameters', 'slug-celerity parameters',
+    'slug-body holdup', 'slug initiation parameters', 'slug growth/decay parameters', 'slug merging parameters', 'external heat-transfer coefficient', 'water-faucet',
+    'kelvin–helmholtz/interfacial-instability benchmark', 'mesh-orientation sensitivity', 'horizontal multiphase flow', 'vertical upward/downward flow', 'inclined flow',
+    'hilly-terrain pipelines', 'gas-liquid flow', 'oil-water flow', 'gas-oil-water flow', 'annular flow', 'stratified flow', 'bubbly flow', 'intermittent flow', 'hydrodynamic slugging',
+    'terrain slugging', 'long-pipeline slugging', 'flexible/catenary risers', 'pressure fluctuations', 'slug velocity', 'slug-catcher arrival/load', 'cooldown behaviour',
+  ]/*REF*/,
+  equationsNote: 'Scope and limits. Steady state: 1-D mass, momentum and energy balances marched with a second-order midpoint rule; properties and flashing from the equation-of-state table of the case fluid; three-phase flow is treated as gas plus one mixed liquid. Transient: drift-flux model with one slip relation for all regimes, first-order upwind, convective acceleration, Joule–Thomson cooling and latent heat neglected; pressure waves are damped rather than resolved and the run stops if the line becomes liquid-full. Slug tracking is one-way coupled to the steady solution; the riser cycle is a lumped quasi-equilibrium model. The RANS solve is single-phase, fully developed and smooth-walled; the interface-capturing solvers are 1-D demonstrations. Two-fluid, slug-capturing, 3-D CFD, LES/DES/DNS and Reynolds-stress models are not solved here.',
+  inputs: INPUTS, presets: PRESETS,
+  pull: ({ fluid, outputs } = {}) => {
+    const n = outputs?.net, s = outputs?.solids, okArr = (a) => Array.isArray(a) && a.length >= 2 && a.every((x) => typeof x === 'number' && Number.isFinite(x)), it = [];
+    const add = (key, value, from) => { if (value !== undefined && value !== null && (typeof value !== 'number' || Number.isFinite(value))) it.push({ key, value, from }); };
+    add('tIn', fluid?.Tin, 'Case fluid: inlet temperature'); add('pOut', fluid?.Pout ?? n?.separatorP, fluid?.Pout !== undefined ? 'Case fluid: arrival pressure' : 'Network: separator pressure');
+    if ((fluid?.rateBasis || 'oil') === 'oil') add('wc', fluid?.wc, 'Case fluid: water cut');
+    if (okArr(n?.profile?.x) && okArr(n?.profile?.z) && n.profile.x.length === n.profile.z.length) add('profile', n.profile.x.map((x, i) => ({ x, z: n.profile.z[i] })), 'Network: elevation profile');
+    if (n?.id > 0) add('idMm', n.id * 1000, 'Network: inner diameter'); if (n?.wt > 0) add('wtMm', n.wt * 1000, 'Network: wall thickness'); if (n?.roughness >= 0) add('roughUm', n.roughness * 1e6, 'Network: wall roughness');
+    if (n?.uValue > 0) add('uValue', n.uValue, 'Network: overall U-value'); add('tSeabed', n?.tSeabed, 'Network: seabed temperature'); add('tSeaSurface', n?.tSeaSurface, 'Network: sea-surface temperature');
+    if (n?.riserBaseX >= 0) add('riserBaseX', n.riserBaseX, 'Network: riser base'); if (n?.kLoss >= 0) add('kLoss', n.kLoss, 'Network: minor-loss coefficient'); if (n?.burial > 0) add('burialDepth', n.burial, 'Network: burial depth');
+    if (n?.ipr?.pRes > 0) add('pRes', n.ipr.pRes, 'Network: reservoir pressure'); if (n?.ipr?.pi > 0) add('piIpr', n.ipr.pi, 'Network: productivity index'); if (n?.ipr?.type === 'vogel' || n?.ipr?.type === 'linear') add('iprType', n.ipr.type, 'Network: inflow relation');
+    if (s?.effectiveId > 0) add('effIdMm', s.effectiveId * 1000, 'Solids: effective bore with deposits'); if (s?.roughnessEff > 0) add('roughEffUm', s.roughnessEff * 1e6, 'Solids: effective roughness');
+    if (okArr(s?.depositProfile?.x) && okArr(s?.depositProfile?.total) && s.depositProfile.x.length === s.depositProfile.total.length) add('deposit', s.depositProfile.x.map((x, i) => ({ x, t: s.depositProfile.total[i] * 1000 })), 'Solids: deposit thickness profile');
+    const ch = outputs?.ops?.chokeOpening ?? n?.chokeOpening; if (ch >= 1 && ch <= 100) add('chokeOpening', ch, outputs?.ops?.chokeOpening !== undefined ? 'Operations: choke opening' : 'Network: choke opening');
+    if (Number.isFinite(outputs?.pvt?.wat)) add('watC', outputs.pvt.wat, 'Fluid: wax appearance temperature');
+    return it;
+  },
+  site: (site) => { const d = site?.data || {}, it = [], add = (key, value, from) => { if (typeof value === 'number' && Number.isFinite(value)) it.push({ key, value, from }); }; add('tSeabed', d.seabedTemp, 'Seabed temperature at the site'); add('tSeaSurface', d.sst, 'Sea-surface temperature at the site'); add('tAir', d.airTemp, 'Air temperature at the site'); add('currentSpeed', d.currentSpeed, 'Sea current at the site'); add('windSpeed', d.windSpeed, 'Wind speed at the site'); return it; },
+  run,
+  mesh: [
+    { name: 'Steady axial grid', keys: ['nSteady'], min: 20, note: 'Cells of the steady march (second-order midpoint rule).', metrics: [{ label: 'Inlet pressure', unit: 'bara', get: (r) => r.outputs.pIn }, { label: 'Arrival temperature', unit: '°C', get: (r) => r.outputs.tOut }, { label: 'Liquid inventory', unit: 'm³', get: (r) => r.outputs.liquidInventory }] },
+    { name: 'Transient grid', keys: ['nCells'], min: 12, note: 'Cells of the transient drift-flux grid (first-order upwind).', metrics: [{ label: 'Mean inlet pressure (last 60 %)', unit: 'bara', get: (r) => r.outputs.transient?.pMean ?? NaN }, { label: 'Cumulative liquid outflow', unit: 'm³', get: (r) => r.outputs.transient?.cumLiq ?? NaN }] },
+    { name: 'Transient time step (CFL number)', keys: ['cfl'], refine: 'divide', note: 'The CFL number is divided by the refinement ratio.', metrics: [{ label: 'Mean inlet pressure (last 60 %)', unit: 'bara', get: (r) => r.outputs.transient?.pMean ?? NaN }, { label: 'Cumulative liquid outflow', unit: 'm³', get: (r) => r.outputs.transient?.cumLiq ?? NaN }] },
+  ],
+  calibration: {
+    note: 'Fit wall roughness, the U-value multiplier, the holdup multiplier (or C0 and drift velocity when the Zuber–Findlay model is selected) and the slug-frequency, slug-length and film-holdup multipliers and the insulation conductivity to measured pressure drop, arrival temperature, mean holdup, slug frequency, slug length and film thickness at several rates. The model is the steady march on a coarse grid (24 cells). The sample data are synthetic.',
+    params: [{ key: 'roughUm', label: 'Wall roughness (µm)', lo: 5, hi: 500 }, { key: 'uMult', label: 'U-value multiplier', lo: 0.3, hi: 3 }, { key: 'holdupMult', label: 'Holdup multiplier', lo: 0.6, hi: 1.6 }, { key: 'freqMult', label: 'Slug-frequency multiplier', lo: 0.1, hi: 10 }, { key: 'lenMult', label: 'Slug-length multiplier', lo: 0.1, hi: 10 }, { key: 'filmMult', label: 'Film-holdup multiplier', lo: 0.5, hi: 2 }, { key: 'insK', label: 'Insulation conductivity (W/mK)', lo: 0.03, hi: 1 }, { key: 'c0', label: 'Distribution parameter C0', lo: 1, hi: 1.5 }, { key: 'vDrift', label: 'Drift velocity (m/s)', lo: 0, hi: 1.5 }],
+    columns: [{ key: 'rateFrac', label: 'Rate / case rate', unit: '×' }, { key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency (mid-line)', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness (mid-line)', unit: 'mm' }],
+    targets: [{ key: 'dp', label: 'Pressure drop', unit: 'bar' }, { key: 'tArr', label: 'Arrival temperature', unit: '°C' }, { key: 'holdup', label: 'Mean liquid holdup', unit: '–' }, { key: 'slugFreq', label: 'Slug frequency', unit: '1/min' }, { key: 'slugLen', label: 'Mean slug length', unit: 'm' }, { key: 'filmThk', label: 'Film thickness', unit: 'mm' }],
+    model: calibrationModel, sample: CAL_SAMPLE, validationSample: VAL_SAMPLE,
+  },
+  verify,
+};
+export default SUITE;
