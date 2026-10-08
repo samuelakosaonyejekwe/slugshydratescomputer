@@ -221,8 +221,8 @@ export function parseXT(text) {
     const base = { o, z: unit(z), x: perp(unit(z), vec(f.x_axis)), plus, name };
     if (nd.t === 50) return { type: 'plane', ...base };
     if (nd.t === 51) return f.radius > 0 ? { type: 'cylinder', ...base, r: f.radius, tanA: 0 } : { type: 'other', name, plus };
-    // cone: the radius grows against the axis direction and the natural normal points towards the axis
-    if (nd.t === 52) return f.radius >= 0 && f.cos_half_angle ? { type: 'cone', ...base, r: f.radius, tanA: f.sin_half_angle / f.cos_half_angle, inward: true } : { type: 'other', name, plus };
+    // cone: the radius grows along the axis by tan(half angle) (checked on real files: boundary points lie on this surface)
+    if (nd.t === 52) return f.radius >= 0 && f.cos_half_angle ? { type: 'cone', ...base, r: f.radius, tanA: f.sin_half_angle / f.cos_half_angle } : { type: 'other', name, plus };
     if (nd.t === 53) return f.radius > 0 ? { type: 'sphere', ...base, r: f.radius } : { type: 'other', name, plus };
     return f.major_radius > 0 && f.minor_radius > 0 && f.major_radius > f.minor_radius ? { type: 'torus', ...base, R: f.major_radius, r: f.minor_radius } : { type: 'other', name: 'self-intersecting torus', plus };
   };
@@ -230,7 +230,7 @@ export function parseXT(text) {
   let guard = 0;
   for (const [fi, nd] of nodes) {
     if (nd.t !== 14) continue;
-    const { plus, name, inward, ...surf } = surfOf(nd.f.surface), loops = [];
+    const { plus, name, ...surf } = surfOf(nd.f.surface), loops = [];
     counts.surfaces[surf.type] = (counts.surfaces[surf.type] || 0) + 1;
     if (surf.type === 'spline' || surf.type === 'other') skipped[name] = (skipped[name] || 0) + 1;
     for (let li = nd.f.loop, nl = 0; li && nl < 1e5; nl++) {
@@ -250,7 +250,7 @@ export function parseXT(text) {
       if (pts.length) loops.push({ pts, single: single && pts.length === 1 });
       li = lp.next;
     }
-    faces.push({ surf, sense: ((nd.f.sense !== '-') === (plus !== false)) !== !!inward, loops, id: fi });
+    faces.push({ surf, sense: (nd.f.sense !== '-') === (plus !== false), loops, id: fi });
   }
   const edges = [];
   for (const [ei, nd] of nodes) if (nd.t === 16) { const e = edgePts(ei); if (e.pts.length > 1) edges.push({ pts: e.pts, kind: e.kind, closed: e.closed }); }

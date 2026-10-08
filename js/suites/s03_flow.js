@@ -1952,10 +1952,10 @@ const annularParams = (v = {}) => ({ kDep: num(v.kDep, 0.15, 1e-4, 10), entMult:
  * Returns { vslCrit, hD, ratio (gas velocity / critical gas velocity at the given vsl), tauI, level (h/D at the given vsl) }.
  */
 export function stratifiedTransition(p, o = {}) {
-  const tm = o.transMult || 1, at = (vsl) => { const q = { ...p, vsl }, roots = stratifiedRoots(q, { ...o, n: 50 }), hD = roots[0], b = stratifiedBalance(hD, q, o), g = b.g, crit = tm * (1 - hD) * Math.sqrt((Math.max(p.rhoL - p.rhoG, 1e-6) * G * Math.max(Math.cos(p.theta || 0), 0.02) * g.AG) / (p.rhoG * Math.max(g.Si, 1e-9))); return { hD, ratio: b.vG / crit, tauI: b.ti, tauWL: b.tL, tauWG: b.tG }; };
+  const tm = o.transMult || 1, at = (vsl) => { const q = { ...p, vsl }, roots = stratifiedRoots(q, { ...o, n: 24 }), hD = roots[0], b = stratifiedBalance(hD, q, o), g = b.g, crit = tm * (1 - hD) * Math.sqrt((Math.max(p.rhoL - p.rhoG, 1e-6) * G * Math.max(Math.cos(p.theta || 0), 0.02) * g.AG) / (p.rhoG * Math.max(g.Si, 1e-9))); return { hD, ratio: b.vG / crit, tauI: b.ti, tauWL: b.tL, tauWG: b.tG }; };
   const here = at(p.vsl); let lo = 1e-4, hi = 20;
   if (at(hi).ratio < 1) return { vslCrit: hi, ...here, level: here.hD }; if (at(lo).ratio > 1) return { vslCrit: lo, ...here, level: here.hD };
-  for (let k = 0; k < 40; k++) { const m = Math.sqrt(lo * hi); if (at(m).ratio < 1) lo = m; else hi = m; }
+  for (let k = 0; k < 22; k++) { const m = Math.sqrt(lo * hi); if (at(m).ratio < 1) lo = m; else hi = m; }
   return { vslCrit: Math.sqrt(lo * hi), ...here, level: here.hD };
 }
 /** Mixed liquid of an oil–water stream for point comparisons: volume-weighted density, viscosity of the dispersion (continuous phase × (1 − φ)^(−2.5 μ*), Ishii–Zuber form) with inversion at 50 % water. */
@@ -2838,7 +2838,7 @@ function calibrationModel(v) {
       const c = cellOf(r, ia), aM = clamp(1 - r.holdup[ia], 0.01, 0.25), ib = interfacialAreaTransport({ d0: num(v.bubbleMm, 3, 0.2, 30) / 1000, alpha: aM, vg: Math.max(c.vsg / aM, 0.1), k: 0.01 * (c.vsl + c.vsg) ** 2, length: 30, n: 80, rhoL: c.rhoL, rhoG: c.rhoG, muL: c.muL, sigma: c.sigma, crc: 0.04 * num(v.crcMult, 1, 0, 100), cti: 0.085 * num(v.ctiMult, 1, 0, 100), cwe: 0.002 * num(v.crcMult, 1, 0, 100) }); out.dSauter = ib.dEnd * 1000; } }
   { const c = { s: r.s[i], z: r.z[i], D: r.D[i], pr: cfg.fm.at(r.P[i], r.T[i], r.mScale ?? num(v.rateFrac, 1, 1e-3, 20)), vm: r.vm[i], holdup: r.holdup[i], ta: r.tAmb[i], T: r.T[i] }, net = cfg.network(c); out.tSurf = c.ta + (net.U * c.D * (c.T - c.ta)) / (cfg.od * Math.max(net.hOut ?? cfg.hOutOf(c), 1e-9)); }
   if (r.vsl.every((q, k) => two(k))) { // tracked arrivals: initiation, growth / decay and merging parameters
-    const units = r.vsl.map((_, k) => slugUnitCell(cellOf(r, k), so)), tk = slugTracking(trackingField(r, units), { sites: [{ s: 0, freq: units[0].freq, length: units[0].lengthFromFreq }], nSlugs: 24, seed: 11, theta: r.theta, initMult: num(v.initMult, 1, 0.05, 20), relaxMult: num(v.relaxMult, 1, 0.05, 20), wakeMult: num(v.wakeMult, 1, 0, 10), maxOps: 2e4 });
+    const units = r.vsl.map((_, k) => slugUnitCell(cellOf(r, k), so)), tk = slugTracking(trackingField(r, units), { sites: [{ s: 0, freq: units[0].freq, length: units[0].lengthFromFreq }], nSlugs: 14, seed: 11, theta: r.theta, initMult: num(v.initMult, 1, 0.05, 20), relaxMult: num(v.relaxMult, 1, 0.05, 20), wakeMult: num(v.wakeMult, 1, 0, 10), maxOps: 6000 });
     Object.assign(out, { arrFreq: 60 * tk.freqArrival, arrLen: tk.meanLength, mergeShare: tk.generated > 0 ? tk.merges / tk.generated : 0 });
   } else Object.assign(out, { arrFreq: 0, arrLen: 0, mergeShare: 0 });
   for (const k of Object.keys(out)) if (!Number.isFinite(out[k])) out[k] = 0;
