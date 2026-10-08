@@ -1,7 +1,8 @@
 // Small DOM toolkit. All content is inserted as text nodes (never as HTML strings), so data that
 // comes from files or remote services cannot inject markup or scripts.
 import { fmt } from './num.js';
-import { IONS, ION_IDS, WATERS, cloneIons, summarize } from './water.js';
+import { COMP_IDS, COMP_LABELS } from './thermo.js';
+import { FLUID_LIBRARY } from '../data/fluids.js';
 import { readTable, toCSV, download, checkFile } from './io.js';
 import { importGeometry, FORMATS } from './geom.js';
 import { asOutline, asBathy } from './geomlinks.js';
@@ -94,39 +95,40 @@ function numberField(f, value, set) {
   return h('div', { class: 'ctl' }, h('div', { class: 'inp' }, input, f.unit ? h('span', { class: 'unit' }, f.unit) : null), msg);
 }
 
-function ionsField(f, value, set, ctx) {
-  let ions = cloneIons(value || f.value);
+/** Editor for a hydrocarbon composition in mol %: one box per component, running total, normalise, library and import. */
+function compositionField(f, value, set, ctx) {
+  let comp = { ...Object.fromEntries(COMP_IDS.map((k) => [k, 0])), ...(value || f.value || {}) };
   const grid = h('div', { class: 'ions' }), sumBox = h('div', { class: 'ion-sum' });
-  const refresh = () => {
-    const s = summarize(ions, 25);
-    clear(sumBox).append(
-      h('span', null, 'TDS ', h('b', null, fmt(s.tds)), ' mg/L'), h('span', null, 'Osmotic ', h('b', null, fmt(s.osmoticBar, 3)), ' bar'),
-      h('span', null, 'Ionic strength ', h('b', null, fmt(s.ionicStrength, 3)), ' mol/L'),
-      h('span', { class: Math.abs(s.chargeErrorPct) > 5 ? 'bad' : 'ok' }, 'Charge balance ', h('b', null, fmt(s.chargeErrorPct, 2)), ' %'));
-  };
+  const total = () => COMP_IDS.reduce((s, k) => s + (+comp[k] || 0), 0);
+  const refresh = () => { const t = total(); clear(sumBox).append(h('span', { class: Math.abs(t - 100) > 0.05 ? 'bad' : 'ok' }, 'Total ', h('b', null, fmt(t, 5)), ' mol %', Math.abs(t - 100) > 0.05 ? ' — values are normalised to 100 % when used' : ''), h('span', null, 'Methane ', h('b', null, fmt(t ? (100 * comp.C1) / t : 0, 3)), ' %'), h('span', null, 'C7+ ', h('b', null, fmt(t ? (100 * comp.C7p) / t : 0, 3)), ' %'), h('span', null, 'Acid gas ', h('b', null, fmt(t ? (100 * (comp.CO2 + comp.H2S)) / t : 0, 3)), ' %')); };
   const build = () => {
     clear(grid);
-    for (const id of ION_IDS) {
-      const inp = h('input', { type: 'number', min: 0, step: 'any', value: ions[id], 'aria-label': IONS[id].name + ' mg/L', inputmode: 'decimal' });
-      inp.addEventListener('input', () => { ions[id] = Math.max(0, +inp.value || 0); set({ ...ions }); refresh(); });
-      grid.append(h('label', { class: 'ion', title: IONS[id].name + ' (mg/L)' }, h('span', null, IONS[id].label), inp));
+    for (const id of COMP_IDS) {
+      const inp = h('input', { type: 'number', min: 0, max: 100, step: 'any', value: comp[id], 'aria-label': COMP_LABELS[id] + ' mol %', inputmode: 'decimal' });
+      inp.addEventListener('input', () => { comp[id] = Math.max(0, +inp.value || 0); set({ ...comp }); refresh(); });
+      grid.append(h('label', { class: 'ion', title: COMP_LABELS[id] + ' (mol %)' }, h('span', null, id === 'C7p' ? 'C7+' : id.replace(/^([in])C/, '$1-C')), inp));
     }
     refresh();
   };
-  const sel = h('select', { 'aria-label': 'Load a reference water' }, h('option', { value: '' }, 'Load reference water…'), Object.entries(WATERS).map(([k, w]) => h('option', { value: k }, w.name)));
-  sel.addEventListener('change', () => { if (WATERS[sel.value]) { ions = cloneIons(WATERS[sel.value].ions); set({ ...ions }); build(); } sel.value = ''; });
+  const sel = h('select', { 'aria-label': 'Load a reference fluid' }, h('option', { value: '' }, 'Load reference fluid…'), Object.entries(FLUID_LIBRARY).map(([k, w]) => h('option', { value: k }, `${w.name} (${w.kind})`)));
+  sel.addEventListener('change', () => { const w = FLUID_LIBRARY[sel.value]; if (w) { comp = { ...comp, ...w.comp }; set({ ...comp }, w); build(); toast(`Loaded: ${w.name}.`); } sel.value = ''; });
   const tools = h('div', { class: 'row-tools' }, sel,
-    ctx?.feed ? btn('Use case feed water', () => { ions = cloneIons(ctx.feed().ions); set({ ...ions }); build(); toast('Loaded the case feed-water analysis.'); }, 'mini') : null,
+    btn('Normalise to 100 %', () => { const t = total(); if (!(t > 0)) return toast('Enter at least one component first.', 'warn'); for (const k of COMP_IDS) comp[k] = +((100 * comp[k]) / t).toPrecision(6); set({ ...comp }); build(); }, 'mini'),
+    ctx?.fluid ? btn('Use case fluid', () => { comp = { ...comp, ...ctx.fluid().comp }; set({ ...comp }); build(); toast('Loaded the case fluid composition.'); }, 'mini') : null,
     importBtn('Import analysis', async (file) => {
-      const t = await readTable(file), norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-      const alias = { sodium: 'Na', potassium: 'K', calcium: 'Ca', magnesium: 'Mg', barium: 'Ba', strontium: 'Sr', ammonium: 'NH4', iron: 'Fe', manganese: 'Mn', chloride: 'Cl', sulphate: 'SO4', sulfate: 'SO4', bicarbonate: 'HCO3', carbonate: 'CO3', nitrate: 'NO3', fluoride: 'F', phosphate: 'PO4', silica: 'SiO2', boron: 'B' };
-      const find = (name) => ION_IDS.find((id) => norm(id) === norm(name)) || alias[norm(name)];
+      const t = await readTable(file), norm = (x) => String(x).toLowerCase().replace(/[^a-z0-9+]/g, '');
+      const alias = { nitrogen: 'N2', n2: 'N2', carbondioxide: 'CO2', co2: 'CO2', hydrogensulphide: 'H2S', hydrogensulfide: 'H2S', h2s: 'H2S', methane: 'C1', c1: 'C1', ethane: 'C2', c2: 'C2', propane: 'C3', c3: 'C3', isobutane: 'iC4', ibutane: 'iC4', ic4: 'iC4', nbutane: 'nC4', butane: 'nC4', nc4: 'nC4', isopentane: 'iC5', ipentane: 'iC5', ic5: 'iC5', npentane: 'nC5', pentane: 'nC5', nc5: 'nC5', hexanes: 'C6', hexane: 'C6', nhexane: 'C6', c6: 'C6', heptanesplus: 'C7p', 'c7+': 'C7p', c7plus: 'C7p', c7p: 'C7p', heptanes: 'C7p' };
+      const find = (name) => alias[norm(name)];
       let n = 0;
-      // accept either one row with ion columns or two columns (ion, mg/L)
-      for (const hd of t.headers) { const id = find(hd); if (id && typeof t.records[0]?.[hd] === 'number') { ions[id] = Math.max(0, t.records[0][hd]); n++; } }
-      if (!n) for (const r of t.records) { const vals = Object.values(r), id = find(vals[0]); if (id && typeof vals[1] === 'number') { ions[id] = Math.max(0, vals[1]); n++; } }
-      if (!n) throw new Error('No ion names recognised. Use columns such as Na, Ca, Cl, SO4 … in mg/L.');
-      set({ ...ions }); build(); toast(`Imported ${n} constituents.`, 'ok');
+      const next = Object.fromEntries(COMP_IDS.map((k) => [k, 0]));
+      // accept either one row with component columns or two columns (component, mol %); heavier cuts (C8, C9 …) are added to C7+
+      const take = (name, v) => { const id = find(name) || (/^c([89]|[1-9][0-9])\+?$/.test(norm(name)) ? 'C7p' : null); if (id && typeof v === 'number' && v >= 0) { next[id] += v; n++; } };
+      for (const hd of t.headers) take(hd, t.records[0]?.[hd]);
+      if (n < 2) { n = 0; for (const k of COMP_IDS) next[k] = 0; for (const r of t.records) { const vals = Object.values(r); take(vals[0], vals[1]); } }
+      if (n < 2) throw new Error('No component names recognised. Use names such as N2, CO2, C1, C2 … C7+ (or methane, ethane …) with mol %.');
+      const frac = COMP_IDS.reduce((s, k) => s + next[k], 0) <= 1.5; // mole fractions rather than per cent
+      for (const k of COMP_IDS) comp[k] = frac ? next[k] * 100 : next[k];
+      set({ ...comp }); build(); toast(`Imported ${n} components${frac ? ' (mole fractions converted to mol %)' : ''}.`, 'ok');
     }));
   build();
   return h('div', { class: 'ctl wide' }, tools, grid, sumBox);
@@ -202,7 +204,7 @@ function fileField(f, value, set) {
 export function fieldRow(f, get, set, ctx = {}) {
   const value = get(f.key);
   let control;
-  const wide = f.type === 'ions' || f.type === 'table' || f.type === 'file';
+  const wide = f.type === 'composition' || f.type === 'table' || f.type === 'file';
   if (f.type === 'select') {
     const opts = f.options.map((o) => (typeof o === 'object' ? o : { value: o, label: String(o) }));
     control = h('div', { class: 'ctl' }, h('select', { id: 'f_' + f.key, onchange: (e) => { const o = opts[e.target.selectedIndex]; set(f.key, o.value); if (ctx.rerender) ctx.rerender(); } },
@@ -211,7 +213,7 @@ export function fieldRow(f, get, set, ctx = {}) {
     control = h('div', { class: 'ctl' }, h('label', { class: 'switch' }, h('input', { type: 'checkbox', id: 'f_' + f.key, checked: !!value, onchange: (e) => { set(f.key, e.target.checked); if (ctx.rerender) ctx.rerender(); } }), h('span', { class: 'slider' })));
   } else if (f.type === 'text') {
     control = h('div', { class: 'ctl' }, h('input', { type: 'text', id: 'f_' + f.key, value: value ?? '', maxlength: 200, oninput: (e) => set(f.key, e.target.value) }));
-  } else if (f.type === 'ions') control = ionsField(f, value, (v) => set(f.key, v), ctx);
+  } else if (f.type === 'composition') control = compositionField(f, value, (v, lib) => set(f.key, v, lib), ctx);
   else if (f.type === 'table') control = tableField(f, value, (v) => set(f.key, v));
   else if (f.type === 'file') control = fileField(f, value, (v) => { set(f.key, v); if (ctx.rerender) ctx.rerender(); });
   else control = numberField(f, value, (v) => set(f.key, v));

@@ -12,11 +12,11 @@ import { buildId } from './core/build.js';
 
 const PAGES = [
   { path: 'home', label: 'Overview', icon: '🏠', render: home },
-  { path: 'case', label: 'Case & feed water', icon: '🗂️', render: casePage },
+  { path: 'case', label: 'Case & fluid', icon: '🗂️', render: casePage },
   { path: 'site', label: 'Global site data', icon: '🌍', render: sitePage },
-  { path: 'portal', label: 'Data portal', icon: '📥', render: portalPage },
+  { path: 'portal', label: 'Data portal', icon: '📥', full: 'Data portal — geometry and input data', render: portalPage },
   ...SUITES.map((s) => ({ path: 'suite/' + s.id, label: `${s.num}. ${s.short}`, full: s.title, icon: s.icon, suite: s.id })),
-  { path: 'chain', label: 'Integrated run', icon: '🔗', render: chainPage },
+  { path: 'chain', label: 'Integrated run', icon: '🔗', full: 'Integrated run — all suites, coupled', render: chainPage },
   { path: 'advisor', label: 'Decision support', icon: '🧭', full: 'Decision support & sustainability', render: advisorPage },
   { path: 'app', label: 'Install & offline', icon: '📲', render: appPage },
 ];
@@ -93,7 +93,7 @@ async function route() {
 }
 
 // ---- theme, connection, install -----------------------------------------------------------------------
-function applyTheme(t) { if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; document.querySelector('meta[name=theme-color]')?.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bar').trim() || '#0b3a5b'); }
+function applyTheme(t) { if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; document.querySelector('meta[name=theme-color]')?.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bar').trim() || '#0b3540'); }
 function setupChrome() {
   applyTheme(store.pref('theme'));
   document.getElementById('themeBtn').addEventListener('click', () => { const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; const t = dark ? 'light' : 'dark'; store.pref('theme', t); applyTheme(t); window.dispatchEvent(new Event('resize')); for (const f of document.querySelectorAll('figure.plot')) f._redraw?.(); });

@@ -41,6 +41,7 @@ def equations(md):
         if cur is None or line.startswith('**How the seven modules'):
             if line.startswith('**How the seven modules'): cur = None
             continue
+        if re.match(r'^\*{0,2}Corrected (input|output) data', line): continue  # the data lists come from the modules table
         m = re.match(r'^\*\*(.+?):\*\*\s*(.+)$', line)
         if m: cur['groups'].append({'title': clean(m.group(1)), 'items': split_items(m.group(2))}); pending = None; continue
         m = re.match(r'^\*\*(.+?)\*\*$', line)
@@ -98,6 +99,7 @@ def cvv(txt):
         if t in ('Verification', 'Numerical Verification'): key = 'verification'; continue
         if t == 'Validation': key = 'validation'; continue
         if t in ('Typical Inputs', 'Typical Outputs'): key = None; continue
+        if t.startswith('Corrected input data') or t.startswith('Corrected output data'): continue
         if t.startswith('- ') and key: cur[key].append(cap(clean(t[2:])))
         elif key and len(t) > 60 and not t.startswith('-') and not re.search(r'\bI would\b|\byour\b|\bYes\b|\bI am\b', t): cur['notes'].append(clean(t) + '.')
     return out
@@ -124,7 +126,7 @@ LEVELS = [
 
 def main(eq, ib, cv, mo):
     E, I, V, M = equations(pandoc(eq, 'markdown_strict-raw_html')), icbc(pandoc(ib, 'markdown_strict-raw_html')), cvv(pandoc(cv, 'plain')), modules(pandoc(mo, 'html'))
-    M['7'] = {'title': 'Economics, Techno-Economics & Decision Analysis', 'inputs': split_items(ECON_IO['inputs']), 'outputs': split_items(ECON_IO['outputs'])}
+    if '7' not in M: M['7'] = {'title': 'Economics, Techno-Economics & Decision Analysis', 'inputs': split_items(ECON_IO['inputs']), 'outputs': split_items(ECON_IO['outputs'])}
     cat = {}
     for k in '1234567':
         e, i, v, m = E[k], I[k], V[k], M[k]

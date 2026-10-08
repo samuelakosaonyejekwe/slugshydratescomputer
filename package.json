@@ -1,11 +1,11 @@
 {
-  "name": "brinelab",
+  "name": "hydraslug",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "BrineLab — integrated desalination simulation suite (installable, offline-capable web app)",
+  "description": "HydraSlug — integrated multiphase flow-assurance, integrity and techno-economic simulation suite (installable, offline-capable web app)",
   "scripts": {
-    "test": "node tests/run.mjs",
+    "test": "node tests/run.mjs && node tests/geom.test.mjs && node tests/route.test.mjs",
     "build": "node tools/build.mjs",
     "serve": "python3 -m http.server 8080"
   }

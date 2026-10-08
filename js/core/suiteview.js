@@ -21,7 +21,7 @@ const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geo
 export const allFields = (suite) => suite.inputs.flatMap((g) => g.fields);
 export function defaults(suite) {
   const d = {};
-  for (const f of allFields(suite)) d[f.key] = f.type === 'ions' || f.type === 'table' ? structuredCloneSafe(f.value) : f.value ?? null;
+  for (const f of allFields(suite)) d[f.key] = f.type === 'composition' || f.type === 'table' ? structuredCloneSafe(f.value) : f.value ?? null;
   return d;
 }
 const structuredCloneSafe = (v) => (v === undefined ? null : JSON.parse(JSON.stringify(v)));
@@ -46,11 +46,11 @@ function setValue(suite, key, value) {
 export function setGeometry(suite, key, g) { bigValues.set(suite.id + '.' + key, g); }
 
 const context = (extra = {}) => ({
-  feed: store.case.feed, site: store.case.site, outputs: store.case.outputs,
+  fluid: store.case.fluid, site: store.case.site, outputs: store.case.outputs,
   progress: () => {}, tick: () => new Promise((r) => setTimeout(r, 0)), ...extra,
 });
 
-/** Values offered by upstream suites, the case feed water and the site data. */
+/** Values offered by upstream suites, the case fluid and the site data. */
 export function linkItems(suite) {
   const items = [];
   const push = (list, kind) => { for (const it of list || []) if (it && it.key && it.value !== undefined && it.value !== null && !(typeof it.value === 'number' && !Number.isFinite(it.value))) items.push({ ...it, kind }); };
@@ -100,7 +100,7 @@ function exportReport(suite, res, plotEls) {
   const kt = add(b, 'table'); res.kpis.forEach((k) => { const tr = add(kt, 'tr'); add(tr, 'td', k.label); add(tr, 'td', `${typeof k.value === 'number' ? fmt(k.value) : k.value} ${k.unit || ''}`); });
   add(b, 'h2', 'Inputs used');
   const it = add(b, 'table');
-  for (const f of allFields(suite)) { if (['ions', 'table', 'file'].includes(f.type)) continue; const tr = add(it, 'tr'); add(tr, 'td', f.label); add(tr, 'td', `${res._inputs[f.key]} ${f.unit || ''}`); }
+  for (const f of allFields(suite)) { if (['composition', 'table', 'file'].includes(f.type)) continue; const tr = add(it, 'tr'); add(tr, 'td', f.label); add(tr, 'td', `${res._inputs[f.key]} ${f.unit || ''}`); }
   if (plotEls.length) add(b, 'h2', 'Plots');
   plotEls.forEach((c) => { const cv = c.querySelector('canvas'); if (cv && cv.width) { add(b, 'h3', c.querySelector('figcaption span')?.textContent || ''); add(b, 'img', null, { src: cv.toDataURL('image/png'), alt: 'plot' }); } });
   for (const t of res.tables) {
@@ -156,8 +156,8 @@ export function renderSuite(suite, root, app) {
         if (g.showIf && !g.showIf(v)) continue;
         const fields = g.fields.filter((f) => !f.showIf || f.showIf(v));
         if (!fields.length) continue;
-        box.append(h('fieldset', { class: 'group' + (fields.length <= 3 && !fields.some((f) => ['ions', 'table', 'file'].includes(f.type)) ? ' small' : '') }, h('legend', null, g.group, help(g.help)),
-          h('div', { class: 'fields' }, fields.map((f) => fieldRow(f, (k) => v[k], (k, val) => { v[k] = val; setValue(suite, k, val); const l = store.inputs(suite.id)._links; if (l && l[k]) { delete l[k]; } }, { rerender: paint, linked, feed: () => store.case.feed })))));
+        box.append(h('fieldset', { class: 'group' + (fields.length <= 3 && !fields.some((f) => ['composition', 'table', 'file'].includes(f.type)) ? ' small' : '') }, h('legend', null, g.group, help(g.help)),
+          h('div', { class: 'fields' }, fields.map((f) => fieldRow(f, (k) => v[k], (k, val) => { v[k] = val; setValue(suite, k, val); const l = store.inputs(suite.id)._links; if (l && l[k]) { delete l[k]; } }, { rerender: paint, linked, fluid: () => store.case.fluid })))));
       }
       if (tabName === 'mesh' && suite.mesh) box.append(meshStudyPanel());
     };
@@ -209,7 +209,7 @@ export function renderSuite(suite, root, app) {
       } catch (e) { fill(out, h('p', { class: 'bad' }, 'Study failed: ' + e.message)); }
       go.disabled = false;
     }, 'primary');
-    return h('fieldset', { class: 'group' }, h('legend', null, suite.id === 'econ' || suite.id === 'opt' ? 'Convergence and numerical sensitivity' : 'Mesh and step sensitivity', help('Solves the model on three systematically refined levels and quantifies the numerical uncertainty with Richardson extrapolation and the grid-convergence index (GCI), instead of simply declaring the mesh “independent”.')),
+    return h('fieldset', { class: 'group' }, h('legend', null, suite.id === 'econ' ? 'Convergence and numerical sensitivity' : 'Mesh and step sensitivity', help('Solves the model on three systematically refined levels and quantifies the numerical uncertainty with Richardson extrapolation and the grid-convergence index (GCI), instead of simply declaring the mesh “independent”.')),
       h('div', { class: 'row-tools' }, studies.length > 1 ? sel : null, h('label', { class: 'inline' }, 'Refinement ratio ', ratio), go),
       h('p', { class: 'note' }, studies.map((st) => st.note).filter(Boolean).join(' ')), out);
   };
@@ -280,7 +280,7 @@ export function renderSuite(suite, root, app) {
         const fitted = { ...base }; active.forEach((a, i) => (fitted[a.p.key] = r.p[i]));
         const ps = parity(rows, predictRows(fitted, rows), 'Calibration');
         fill(out, 
-          dataTable({ title: 'Fitted parameters', columns: ['Parameter', 'Initial', 'Fitted', '± Std. error', 'Relative error %', 'Identifiability'], rows: active.map((a, i) => [a.p.label, base[a.p.key], r.p[i], r.se[i], Math.abs((100 * r.se[i]) / (r.p[i] || 1)), !Number.isFinite(r.se[i]) ? 'Not identifiable' : Math.abs(r.se[i] / (r.p[i] || 1)) < 0.25 ? 'Well identified' : 'Weakly identified']), note: `Levenberg–Marquardt least squares, ${r.iterations} iterations, ${rows.length} data rows. Standard errors come from the parameter covariance matrix; a weakly identified parameter means the data do not constrain it — add operating points that span pressure, recovery, temperature and salinity.` }),
+          dataTable({ title: 'Fitted parameters', columns: ['Parameter', 'Initial', 'Fitted', '± Std. error', 'Relative error %', 'Identifiability'], rows: active.map((a, i) => [a.p.label, base[a.p.key], r.p[i], r.se[i], Math.abs((100 * r.se[i]) / (r.p[i] || 1)), !Number.isFinite(r.se[i]) ? 'Not identifiable' : Math.abs(r.se[i] / (r.p[i] || 1)) < 0.25 ? 'Well identified' : 'Weakly identified']), note: `Levenberg–Marquardt least squares, ${r.iterations} iterations, ${rows.length} data rows. Standard errors come from the parameter covariance matrix; a weakly identified parameter means the data do not constrain it — add measurements that span a wider range of rates, pressures and temperatures, or fit fewer parameters.` }),
           metricTable('Goodness of fit on the calibration data (not a validation)', ps),
           h('div', { class: 'row-tools' }, btn('Apply fitted parameters to this case', () => { active.forEach((a, i) => setValue(suite, a.p.key, r.p[i])); toast('Fitted parameters applied to the inputs.', 'ok'); }, 'primary')),
           h('div', { class: 'plots' }, ps.flatMap((q) => q.plots).map((p) => plotCard(p, { onDownload: download }))));
@@ -304,8 +304,8 @@ export function renderSuite(suite, root, app) {
         fieldRow(calDef, () => getT(calDef), setT), h('div', { class: 'row-tools' }, btn('Fit parameters', fit, 'primary')), out),
       h('fieldset', { class: 'group' }, h('legend', null, '3 · Independent validation data', help('Use operating points that were NOT used for calibration. Agreement with calibration data is not validation.')),
         fieldRow(valDef, () => getT(valDef), setT), h('div', { class: 'row-tools' }, btn('Validate model', validate, 'primary')), vout),
-      cat.calibration ? h('details', { class: 'ref' }, h('summary', null, 'Recommended calibration practice for this suite'), h('p', null, cat.calibration)) : null,
-      cat.validation ? h('details', { class: 'ref' }, h('summary', null, 'Recommended validation practice for this suite'), h('p', null, cat.validation)) : null);
+      cat.calibration?.length ? h('details', { class: 'ref' }, h('summary', null, `Calibration matrix for this suite — ${countOf(cat.calibration)}`), h('p', { class: 'note' }, 'Ticked quantities can be estimated here from your measurements (as a fitted parameter or through a model option). Unticked ones need data or models outside this suite.'), chipList(cat.calibration)) : null,
+      cat.validation?.length ? h('details', { class: 'ref' }, h('summary', null, `Validation matrix for this suite — ${countOf(cat.validation)}`), h('p', { class: 'note' }, 'Ticked items are data types this suite can be compared against on this tab or through its tables. A tick means the comparison is supported, not that it has been done: validation needs your independent measurements.'), chipList(cat.validation), (cat.practice || []).map((t) => h('p', { class: 'note' }, t))) : null);
   };
 
   const verifyTab = () => {
@@ -324,20 +324,23 @@ export function renderSuite(suite, root, app) {
     return h('div', { class: 'groups' },
       h('fieldset', { class: 'group' }, h('legend', null, 'Verification — is the model solved correctly?'), h('div', { class: 'row-tools' }, btn('Run verification checks', run, 'primary')), out),
       res?.balances ? dataTable({ title: 'Conservation closure of the last run', columns: ['Balance', 'In', 'Out', 'Closure error %'], rows: res.balances.map((b) => [b.name, b.in, b.out, b.in ? (100 * (b.in - b.out)) / b.in : 0]) }) : null,
-      cat.verification ? h('details', { class: 'ref', open: true }, h('summary', null, 'Verification practice for this suite'), h('p', null, cat.verification)) : null,
+      cat.verification?.length ? h('details', { class: 'ref', open: true }, h('summary', null, `Verification matrix for this suite — ${countOf(cat.verification)}`), h('p', { class: 'note' }, 'Ticked items are exercised by the checks above, by the conservation table or by the sensitivity study of this suite.'), chipList(cat.verification)) : null,
       h('p', { class: 'note' }, `Validation against measured data and calibration live on the “${L.cal}” tab. Numerical uncertainty lives on the “${L.mesh}” tab.`));
   };
 
+  const chipList = (items) => h('div', { class: 'chips' }, (items || []).map((it) => h('span', { class: 'chip ' + (isImpl(it) ? 'on' : ''), title: isImpl(it) ? 'Covered by this suite' : 'Listed for reference — not covered by the built-in engine' }, isImpl(it) ? '✓ ' : '', it)));
+  const countOf = (items) => `${(items || []).filter(isImpl).length} of ${(items || []).length} covered`;
   const theoryTab = () => {
-    const chips = (items) => h('div', { class: 'chips' }, (items || []).map((it) => h('span', { class: 'chip ' + (isImpl(it) ? 'on' : ''), title: isImpl(it) ? 'Solved by this suite' : 'Reference formulation — listed for completeness, not solved by the built-in engine' }, isImpl(it) ? '✓ ' : '', it)));
-    const count = (items) => `${(items || []).filter(isImpl).length} of ${(items || []).length} solved in-app`;
+    const all = [...(cat.classical || []), ...(cat.hybrid || [])];
     return h('div', { class: 'groups' },
-      h('p', { class: 'summary' }, 'Ticked items are solved by the built-in engine of this suite. Unticked items are established formulations listed for reference; they can be added through the custom-model tools of suite 11.'),
+      h('p', { class: 'summary' }, `Ticked items are solved by the built-in engine of this suite (${all.filter(isImpl).length} of ${all.length} equation families and coupled formulations). Unticked items are established formulations listed for reference; they are not solved here and no result of this suite depends on them.`),
       suite.equationsNote ? h('p', { class: 'note' }, suite.equationsNote) : null,
-      h('fieldset', { class: 'group' }, h('legend', null, 'Classical governing equations ', h('small', null, count(cat.classical))), chips(cat.classical)),
-      h('fieldset', { class: 'group' }, h('legend', null, 'Hybrid and coupled formulations ', h('small', null, count(cat.hybrid))), chips(cat.hybrid)),
-      h('fieldset', { class: 'group' }, h('legend', null, 'Initial and boundary conditions ', h('small', null, count(cat.icbc))), chips(cat.icbc), h('p', { class: 'note' }, cat.icbcText || '')),
-      h('fieldset', { class: 'group' }, h('legend', null, 'Modules ', h('small', null, count(cat.modules))), chips(cat.modules)),
+      (cat.groups || []).filter((g) => !/hybrid/i.test(g.title)).map((g) => h('fieldset', { class: 'group' }, h('legend', null, g.title + ' ', h('small', null, countOf(g.items))), chipList(g.items))),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Hybrid and coupled formulations ', h('small', null, countOf(cat.hybrid))), chipList(cat.hybrid)),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Initial conditions ', h('small', null, countOf(cat.initial))), chipList(cat.initial), h('p', { class: 'note' }, cat.initialText || '')),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Boundary conditions ', h('small', null, countOf(cat.boundary))), chipList(cat.boundary), h('p', { class: 'note' }, cat.boundaryText || '')),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Input data accepted ', h('small', null, countOf(cat.inputs))), chipList(cat.inputs)),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Output data and artefacts ', h('small', null, countOf(cat.outputs))), chipList(cat.outputs)),
       (() => { const ch = changesFor(suite.id); return h('fieldset', { class: 'group' }, h('legend', null, 'Model change log ', h('small', null, ch.length ? `${ch.length} change${ch.length > 1 ? 's' : ''} that moved results` : 'no recorded changes')),
         h('p', { class: 'note' }, 'Every change to this engine that moves results is recorded here with its size and reason. Results, reports and case files carry the build that produced them, so an earlier number can always be traced to its version.'),
         ch.length ? h('div', { class: 'changes' }, ch.map((c) => h('article', { class: 'change' }, h('header', null, h('span', { class: 'badge' }, c.date), h('b', null, ' ' + c.title)), h('dl', null, h('dt', null, 'What changed'), h('dd', null, c.what), h('dt', null, 'Effect on results'), h('dd', null, c.effect), h('dt', null, 'Earlier behaviour'), h('dd', null, c.revert))))) : null); })());
@@ -347,8 +350,8 @@ export function renderSuite(suite, root, app) {
     h('p', { class: 'summary' }, suite.description || suite.tagline),
     h('ol', { class: 'steps' }, (suite.guide || ['Review the inputs — defaults describe a realistic industrial case.', 'Choose the models and boundary conditions on the Model setup tab.', 'Press Run simulation and read the results, warnings and suggested actions.', 'Quantify numerical uncertainty, calibrate against your data and validate on independent data.']).map((s) => h('li', null, s))),
     h('div', { class: 'row-tools' }, btn(`Go to ${L.inputs.toLowerCase()} →`, () => tabset.show('inputs'), 'primary'), btn(`▶  ${L.run} with defaults`, doRun)),
-    h('details', { class: 'ref' }, h('summary', null, 'Input data this suite accepts'), h('p', null, cat.inputs || '')),
-    h('details', { class: 'ref' }, h('summary', null, 'Output data this suite produces'), h('p', null, cat.outputs || '')));
+    h('details', { class: 'ref' }, h('summary', null, 'Input data this suite accepts'), h('p', null, (cat.inputs || []).join(' · '))),
+    h('details', { class: 'ref' }, h('summary', null, 'Output data this suite produces'), h('p', null, (cat.outputs || []).join(' · '))));
 
   // -- live data feed: follow a file on this computer that the plant historian / SCADA export keeps appending to
   let liveTimer = null, liveHandle = null, liveSeen = '';
@@ -388,7 +391,7 @@ export function renderSuite(suite, root, app) {
     const once = importBtn('Load a snapshot…', async (file) => { liveSeen = ''; liveHandle = null; stopLive(); await ingest(file, 'Snapshot loaded'); }, '.csv,.tsv,.txt,.json,.xlsx');
     paint();
     return h('div', { class: 'groups' },
-      h('p', { class: 'summary' }, L2.help || `Follow a file on this computer that your plant historian or SCADA export keeps appending to. Each time it grows, the new rows are loaded into “${field.label}” and the suite is re-run, so trends, alarms and forecasts stay current.`),
+      h('p', { class: 'summary' }, L2.help || `Follow a file on this computer that your historian or SCADA export keeps appending to. Each time it grows, the new rows are loaded into “${field.label}” and the suite is re-run, so trends, alarms and forecasts stay current.`),
       h('fieldset', { class: 'group' }, h('legend', null, 'Live feed', help('The file is read locally through a permission you grant for that one file. Nothing is uploaded and no network connection to the plant is opened.')),
         h('div', { class: 'row-tools' }, canFollow ? link : null, once, pauseBtn, h('label', { class: 'inline' }, 'Check ', period), h('label', { class: 'inline', for: 'live_auto' }, auto, ' re-run automatically')),
         canFollow ? null : h('p', { class: 'note' }, 'This browser cannot keep a file open for following (Chrome and Edge on a computer can). Use “Load a snapshot…” each time the export is refreshed; everything else works the same.'),
@@ -400,10 +403,10 @@ export function renderSuite(suite, root, app) {
   const has = (t) => suite.inputs.some((g) => (g.tab || 'inputs') === t);
   const defs = [
     { id: 'guide', label: L.guide, render: guideTab, tip: 'What this suite does and how to use it' },
-    { id: 'inputs', label: L.inputs, render: groupTab('inputs'), tip: 'Feed, equipment and operating data' },
+    { id: 'inputs', label: L.inputs, render: groupTab('inputs'), tip: 'Case data for this suite' },
     has('setup') && { id: 'setup', label: L.setup, render: groupTab('setup'), tip: 'Model choices, initial and boundary conditions, solver settings' },
     (has('mesh') || suite.mesh) && { id: 'mesh', label: L.mesh, render: groupTab('mesh'), tip: 'Discretisation and sensitivity study' },
-    { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
+    { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import route, well, network, CAD, mesh, terrain or inspection geometry, or generate one' },
     suite.live && allFields(suite).some((f) => f.key === suite.live.key && f.type === 'table') && { id: 'live', label: 'Live feed', render: liveTab, tip: 'Follow a plant export file and re-analyse as new data arrive' },
     { id: 'results', label: L.results, render: resultsTab, tip: 'KPIs, plots, tables and exports' },
     ...(suite.views || []).map((v) => ({ id: 'x_' + v.id, label: v.label, tip: v.tip, render: () => { const el = h('div', { class: 'groups' }); try { v.render(el, { values: () => values(suite), set: (k, val) => setValue(suite, k, val), result: () => lastResult.get(suite.id), run: doRun, h, plotCard: (p) => plotCard(p, { onDownload: download }), dataTable, kpiGrid, toast, download, store }); } catch (e) { el.append(h('p', { class: 'bad' }, e.message)); } return el; } })),

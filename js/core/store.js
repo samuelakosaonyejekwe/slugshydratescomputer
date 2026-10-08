@@ -1,13 +1,23 @@
-// Case store: one "case" holds the site, the feed-water analysis, every suite's inputs and the
+// Case store: one "case" holds the site, the produced fluid and its rates, every suite's inputs and the
 // machine-readable outputs of the last run of each suite (which is what links the suites together).
 // Persisted in localStorage on the user's device only; nothing is sent to any server.
-import { WATERS, cloneIons } from './water.js';
+import { DEFAULT_FLUID, COMP_IDS } from './thermo.js';
 import { buildIdNow } from './build.js';
 
-const KEY = 'brinelab.case.v1', LIB = 'brinelab.cases.v1', PREF = 'brinelab.prefs.v1';
+const KEY = 'hydraslug.case.v1', LIB = 'hydraslug.cases.v1', PREF = 'hydraslug.prefs.v1';
 const MAX_IMPORT = 8e6; // characters
 const hasLS = (() => { try { return typeof localStorage !== 'undefined' && localStorage !== null; } catch { return false; } })();
 const listeners = new Map();
+
+/** Deep copy of a fluid specification with every component present and every number finite. */
+export function cloneFluid(f = DEFAULT_FLUID) {
+  const out = { ...DEFAULT_FLUID, ...f, comp: {} };
+  for (const k of COMP_IDS) { const v = +(f.comp || {})[k]; out.comp[k] = Number.isFinite(v) && v >= 0 ? v : 0; }
+  if (!COMP_IDS.some((k) => out.comp[k] > 0)) out.comp = { ...DEFAULT_FLUID.comp };
+  for (const k of ['c7MW', 'c7SG', 'qOil', 'qGas', 'mdot', 'wc', 'qWater', 'salinity', 'inhWt', 'nPseudo', 'Tin', 'Pout', 'Tres', 'Pres']) out[k] = Number.isFinite(+out[k]) ? +out[k] : DEFAULT_FLUID[k];
+  for (const k of ['name', 'rateBasis', 'inhibitor', 'eos']) out[k] = typeof out[k] === 'string' ? out[k].slice(0, 120) : DEFAULT_FLUID[k];
+  return out;
+}
 
 export function blankCase() {
   return {
@@ -16,7 +26,7 @@ export function blankCase() {
     notes: '',
     created: new Date().toISOString(),
     site: { name: '', lat: null, lon: null, country: '', countryCode: '', data: {}, fetchedAt: null },
-    feed: { source: 'seawater', name: WATERS.seawater.name, Q: 1000, T: 25, pH: 8.1, P: 1, ions: cloneIons(WATERS.seawater.ions), turbidity: 1, sdi: 3, toc: 1.5 },
+    fluid: cloneFluid(DEFAULT_FLUID),
     inputs: {},
     outputs: {},
     autolink: true,
@@ -44,9 +54,7 @@ function normalise(raw) {
   const b = blankCase(), c = sanitize(raw) || {};
   const out = { ...b, ...c };
   out.site = { ...b.site, ...(c.site || {}) };
-  out.feed = { ...b.feed, ...(c.feed || {}) };
-  out.feed.ions = cloneIons(out.feed.ions);
-  for (const k of ['Q', 'T', 'pH', 'P']) out.feed[k] = Number.isFinite(+out.feed[k]) ? +out.feed[k] : b.feed[k];
+  out.fluid = cloneFluid(c.fluid || b.fluid);
   out.inputs = c.inputs && typeof c.inputs === 'object' && !Array.isArray(c.inputs) ? c.inputs : {};
   out.outputs = c.outputs && typeof c.outputs === 'object' && !Array.isArray(c.outputs) ? c.outputs : {};
   out.name = String(out.name || 'Untitled case').slice(0, 120);
@@ -77,7 +85,7 @@ export const store = {
   get case() { return current; },
   on(ev, fn) { if (!listeners.has(ev)) listeners.set(ev, new Set()); listeners.get(ev).add(fn); return () => listeners.get(ev).delete(fn); },
   update(patch) { Object.assign(current, patch); persist(); emit('case', current); },
-  setFeed(patch) { current.feed = { ...current.feed, ...patch }; persist(); emit('feed', current.feed); },
+  setFluid(patch) { current.fluid = cloneFluid({ ...current.fluid, ...patch, comp: { ...current.fluid.comp, ...(patch.comp || {}) } }); persist(); emit('fluid', current.fluid); },
   setSite(patch) { current.site = { ...current.site, ...patch }; persist(); emit('site', current.site); },
   inputs(id) { return current.inputs[id] || (current.inputs[id] = {}); },
   setInput(id, key, value) { this.inputs(id)[key] = value; persist(); },
@@ -86,11 +94,11 @@ export const store = {
   outputs(id) { return current.outputs[id]; },
   setOutputs(id, o) { current.outputs[id] = { ...sanitize(o), _at: new Date().toISOString() }; persist(); emit('outputs', id); },
   reset() { current = blankCase(); persist(); emit('case', current); },
-  exportJSON(build) { return JSON.stringify({ app: 'BrineLab', exportedWithBuild: build || buildIdNow(), exportedAt: new Date().toISOString(), ...current }, null, 1); },
+  exportJSON(build) { return JSON.stringify({ app: 'HydraSlug', exportedWithBuild: build || buildIdNow(), exportedAt: new Date().toISOString(), ...current }, null, 1); },
   importJSON(text) {
     if (typeof text !== 'string' || text.length > MAX_IMPORT) throw new Error('Case file is too large or not text.');
     const raw = JSON.parse(text);
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Not a BrineLab case file.');
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Not a HydraSlug case file.');
     current = normalise(raw); persist(); emit('case', current);
   },
   // Named case library on this device

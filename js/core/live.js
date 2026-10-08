@@ -3,16 +3,18 @@
 // data stay fresh wherever the app is opened. Responses are treated as untrusted numbers/text only.
 import { clamp, mean, quantile } from './num.js';
 import { ATLAS } from '../data/atlas.js';
+import { PRICES } from '../data/prices.js';
 
 export const SOURCES = [
   { id: 'place', name: 'Place and country', host: 'api.bigdatacloud.net', provider: 'BigDataCloud reverse geocoding', gives: 'Locality, country' },
   { id: 'weather', name: 'Weather and solar', host: 'api.open-meteo.com', provider: 'Open-Meteo forecast (national weather models)', gives: 'Air temperature, wind, humidity, pressure, solar irradiance, land elevation' },
   { id: 'marine', name: 'Sea state, currents and tides', host: 'marine-api.open-meteo.com', provider: 'Open-Meteo marine (wave and ocean models)', gives: 'Sea-surface temperature, waves, ocean currents, sea-level / tide series' },
-  { id: 'bathy', name: 'Seabed and terrain', host: 'gis.ngdc.noaa.gov', provider: 'NOAA NCEI global DEM mosaic (best available resolution); fallback SRTM30+ via PacIOOS', gives: 'Bathymetry / topography grid around the site' },
-  { id: 'salinity', name: 'Seawater salinity', host: 'erddap.emodnet-physics.eu', provider: 'SeaDataCloud global T–S climatology (EMODnet Physics ERDDAP)', gives: 'Monthly near-surface salinity and temperature climatology' },
+  { id: 'bathy', name: 'Seabed and terrain', host: 'gis.ngdc.noaa.gov', provider: 'NOAA NCEI global DEM mosaic (best available resolution); fallback SRTM30+ via PacIOOS', gives: 'Bathymetry / topography grid, water depth, seabed slope; seabed temperature from the bundled World Ocean Atlas 2023 profile' },
+  { id: 'salinity', name: 'Sea temperature and salinity', host: 'erddap.emodnet-physics.eu', provider: 'SeaDataCloud global T–S climatology (EMODnet Physics ERDDAP)', gives: 'Monthly near-surface salinity and temperature climatology' },
   { id: 'economy', name: 'Inflation and interest', host: 'api.worldbank.org', provider: 'World Bank Open Data', gives: 'Consumer-price inflation, lending interest rate' },
   { id: 'fx', name: 'Currency', host: 'open.er-api.com', provider: 'Open exchange-rate API', gives: 'Local currency per US dollar' },
-  { id: 'energy', name: 'Grid carbon and renewables', host: 'ourworldindata.org', provider: 'Our World in Data (Ember / Energy Institute series)', gives: 'Carbon intensity of electricity, renewable share of generation' },
+  { id: 'energy', name: 'Grid carbon, renewables and carbon price', host: 'ourworldindata.org', provider: 'Our World in Data (Ember / Energy Institute / World Bank carbon-pricing series)', gives: 'Carbon intensity of electricity, renewable share of generation, national carbon price' },
+  { id: 'prices', name: 'Oil and gas prices', host: 'datahub.io', provider: 'US EIA daily spot series (Brent, WTI, Henry Hub) via DataHub; fallbacks: the same series on GitHub and the EIA open-data service', gives: 'Latest Brent and WTI crude and Henry Hub gas prices, 30-day mean and one-year range' },
   { id: 'climate', name: 'Solar and wind climatology', host: 'power.larc.nasa.gov', provider: 'NASA POWER long-term climatology', gives: 'Monthly and annual solar irradiation, wind speed, air temperature' },
 ];
 export const EVIDENCE_SOURCES = [
@@ -20,7 +22,7 @@ export const EVIDENCE_SOURCES = [
   { name: 'Crossref', host: 'api.crossref.org', gives: 'DOI registry of scholarly and technical publications' },
 ];
 const GEOCODE_HOST = 'geocoding-api.open-meteo.com';
-const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu']);
+const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu', 'r2.datahub.io', 'raw.githubusercontent.com', 'api.eia.gov']);
 
 /** GET text (CSV) from an allow-listed HTTPS host with a timeout and a size cap. */
 export async function getText(url, ms = 20000, maxChars = 400000) {
@@ -71,19 +73,26 @@ const CURRENCY = {
   ZA: 'ZAR', NG: 'NGN', GH: 'GHS', KE: 'KES', NA: 'NAD', TZ: 'TZS', SN: 'XOF', DJ: 'DJF', CV: 'CVE', IR: 'IRR', IQ: 'IQD', JO: 'JOD', YE: 'YER',
 };
 
+// Indicative headline tax on upstream petroleum profit (%), hand-entered planning defaults: the corporate rate plus the
+// petroleum-specific tax where one applies. Real fiscal terms depend on the licence or contract; the economics suite lets
+// every term be edited.
+const TAX = { NG: 50, AO: 50, GH: 35, EG: 40, DZ: 50, LY: 65, GQ: 35, GA: 35, CG: 35, CM: 38, CI: 25, SN: 30, MZ: 32, TZ: 30, NA: 35, ZA: 28, MR: 27, US: 21, CA: 27, MX: 30, BR: 34, AR: 35, CO: 35, GY: 25, SR: 36, TT: 55, VE: 50, EC: 25, PE: 30,
+  GB: 78, NO: 78, NL: 50, DK: 64, DE: 30, IT: 28, RO: 16, CY: 12.5, IL: 23, TR: 25, RU: 20, KZ: 20, AZ: 25, TM: 20, SA: 50, AE: 55, QA: 35, KW: 15, OM: 55, BH: 46, IQ: 35, IR: 25, CN: 25, IN: 40, ID: 40, MY: 38, BN: 55, TH: 50, VN: 32, PH: 25, AU: 58, NZ: 28, PG: 30, JP: 30, KR: 24 };
+
 const connectors = {
   async place(lat, lon) {
     const j = await getJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
     const code = txt(j.countryCode, 2).toUpperCase(), e = ENERGY[code];
     return { meta: { name: txt(j.city || j.locality || j.principalSubdivision || ''), country: txt(j.countryName), countryCode: code },
-      data: e ? { electricityPrice: e[0], gridCarbon: e[1], currency: CURRENCY[code] || 'USD' } : { currency: CURRENCY[code] || 'USD' } };
+      data: { ...(e ? { electricityPrice: e[0], gridCarbon: e[1] } : {}), currency: CURRENCY[code] || 'USD', ...(TAX[code] ? { taxRate: TAX[code] } : {}) } };
   },
   async weather(lat, lon) {
-    const j = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,shortwave_radiation&daily=shortwave_radiation_sum,temperature_2m_max,temperature_2m_min&wind_speed_unit=ms&past_days=7&forecast_days=7&timezone=GMT`);
+    const j = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,shortwave_radiation&daily=shortwave_radiation_sum,temperature_2m_max,temperature_2m_min&hourly=soil_temperature_54cm&wind_speed_unit=ms&past_days=7&forecast_days=7&timezone=GMT`);
     const c = j.current || {}, d = j.daily || {};
     const ghi = (d.shortwave_radiation_sum || []).filter((x) => num(x) !== null).map((x) => x / 3.6); // MJ/m² -> kWh/m²
+    const soil = (j.hourly?.soil_temperature_54cm || []).filter((x) => num(x) !== null);
     return { data: { airTemp: num(c.temperature_2m), humidity: num(c.relative_humidity_2m), pressure: num(c.surface_pressure), windSpeed: num(c.wind_speed_10m), windDir: num(c.wind_direction_10m), solar: num(c.shortwave_radiation),
-      ghiDaily: ghi.length ? mean(ghi) : null, airTempMax: d.temperature_2m_max?.length ? Math.max(...d.temperature_2m_max.filter((x) => num(x) !== null)) : null, airTempMin: d.temperature_2m_min?.length ? Math.min(...d.temperature_2m_min.filter((x) => num(x) !== null)) : null, elevation: num(j.elevation) } };
+      ghiDaily: ghi.length ? mean(ghi) : null, airTempMax: d.temperature_2m_max?.length ? Math.max(...d.temperature_2m_max.filter((x) => num(x) !== null)) : null, airTempMin: d.temperature_2m_min?.length ? Math.min(...d.temperature_2m_min.filter((x) => num(x) !== null)) : null, elevation: num(j.elevation), groundTemp: soil.length ? mean(soil) : null } };
   },
   async marine(lat, lon) {
     const j = await getJSON(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_direction,wave_period,sea_surface_temperature,ocean_current_velocity,ocean_current_direction&hourly=sea_level_height_msl,ocean_current_velocity,ocean_current_direction,sea_surface_temperature&past_days=3&forecast_days=5&timezone=GMT&cell_selection=sea`);
@@ -159,6 +168,11 @@ const connectors = {
     const data = {}, a = ci.status === 'fulfilled' ? pick(ci.value) : null, b = rn.status === 'fulfilled' ? pick(rn.value) : null;
     if (a && a.value >= 0 && a.value < 1500) { data.gridCarbon = a.value / 1000; data.gridCarbonYear = a.year; data.gridCarbonLive = true; }
     if (b && b.value >= 0 && b.value <= 100) { data.renewableShare = b.value; data.renewableShareYear = b.year; }
+    try { // national emissions-weighted carbon price (US$ per tonne CO₂); the series lists every country by year, so the last row of the country is the latest
+      const csv = await getText('https://ourworldindata.org/grapher/emissions-weighted-carbon-price.csv?v=1&csvType=filtered', 20000, 900000); let hit = null;
+      for (const line of csv.split('\n')) { const c = line.split(','); if ((iso3 && c[1] === iso3) || (!iso3 && c[0] === name)) { const v = parseFloat(c[3]); if (Number.isFinite(v)) hit = { value: v, year: txt(c[2], 6) }; } }
+      if (hit && hit.value >= 0 && hit.value < 1000) { data.carbonPrice = hit.value; data.carbonPriceYear = hit.year; }
+    } catch { /* optional */ }
     if (!Object.keys(data).length) throw new Error('Country not listed');
     return { data };
   },
@@ -168,6 +182,19 @@ const connectors = {
     const series = (o) => (o ? M.map((m) => (num(o[m]) !== null && o[m] > -900 ? o[m] : 0)) : null), ann = (o) => (o && num(o.ANN) !== null && o.ANN > -900 ? o.ANN : null);
     const data = { ghiAnnual: ann(p.ALLSKY_SFC_SW_DWN), ghiMonthly: series(p.ALLSKY_SFC_SW_DWN), windAnnual: ann(p.WS10M), windMonthly: series(p.WS10M), airTempAnnual: ann(p.T2M), airTempMonthly: series(p.T2M) };
     if (data.ghiAnnual === null) throw new Error('No climatology for this point');
+    return { data };
+  },
+  async prices() {
+    // Daily spot series as two-column CSV (date, price). Several independent copies are tried in turn.
+    const parse = (csv) => csv.trim().split('\n').map((l) => l.split(',')).filter((c) => /^\d{4}-\d\d-\d\d$/.test(c[0]) && num(parseFloat(c[1])) !== null).map((c) => [c[0], parseFloat(c[1])]);
+    const series = async (paths) => { let err; for (const u of paths) { try { const rows = parse(await getText(u, 20000, 4e6)); if (rows.length > 30) return rows; } catch (e) { err = e; } } throw err || new Error('No price series'); };
+    const eia = async (path, id) => { const j = await getJSON(`https://api.eia.gov/v2/${path}/data/?api_key=DEMO_KEY&frequency=daily&data[0]=value&facets[series][]=${id}&sort[0][column]=period&sort[0][direction]=desc&length=260`); return (j?.response?.data || []).map((r) => [txt(r.period, 10), parseFloat(r.value)]).filter((r) => Number.isFinite(r[1])).reverse(); };
+    const get = (dh, gh, path, id) => series([`https://datahub.io/core/${dh}`, `https://raw.githubusercontent.com/datasets/${gh}`]).catch(() => eia(path, id));
+    const [b, w, g] = await Promise.allSettled([get('oil-prices/r/brent-daily.csv', 'oil-prices/main/data/brent-daily.csv', 'petroleum/pri/spt', 'RBRTE'), get('oil-prices/r/wti-daily.csv', 'oil-prices/main/data/wti-daily.csv', 'petroleum/pri/spt', 'RWTC'), get('natural-gas/r/daily.csv', 'natural-gas/main/data/daily.csv', 'natural-gas/pri/fut', 'RNGWHHD')]);
+    const data = {}, stat = (rows, key) => { if (!rows?.length) return; const last = rows[rows.length - 1], y = rows.slice(-252).map((r) => r[1]), m = rows.slice(-22).map((r) => r[1]); data[key] = last[1]; data[key + 'Date'] = last[0]; data[key + 'Mean30'] = +mean(m).toFixed(2); data[key + 'Min1y'] = Math.min(...y); data[key + 'Max1y'] = Math.max(...y); data[key + 'Series'] = { t: rows.slice(-252).map((r) => r[0]), v: y }; data[key + 'Volatility'] = +(Math.sqrt(252) * Math.sqrt(mean(y.slice(1).map((v, i) => Math.log(v / y[i]) ** 2)))).toFixed(3); };
+    stat(b.status === 'fulfilled' ? b.value : null, 'oilPrice'); stat(w.status === 'fulfilled' ? w.value : null, 'oilPriceWTI'); stat(g.status === 'fulfilled' ? g.value : null, 'gasPrice');
+    if (data.oilPrice == null && data.oilPriceWTI != null) { data.oilPrice = data.oilPriceWTI; data.oilPriceDate = data.oilPriceWTIDate; }
+    if (data.oilPrice == null && data.gasPrice == null) throw new Error('No price series reachable');
     return { data };
   },
   async fx(lat, lon, site) {
@@ -185,8 +212,8 @@ const connectors = {
 // ---- response cache ---------------------------------------------------------------------------------
 // Slow-changing answers (relief, climatologies, national indicators) are kept on the device so that a
 // repeat fetch of the same place is instant; fast-changing ones (weather, sea state) are kept briefly.
-const CACHE_KEY = 'brinelab.live.v2', H = 3600e3;
-const TTL = { place: 30 * 24 * H, weather: 0.5 * H, marine: 0.5 * H, bathy: 90 * 24 * H, salinity: 90 * 24 * H, economy: 7 * 24 * H, fx: 12 * H, energy: 7 * 24 * H, climate: 90 * 24 * H };
+const CACHE_KEY = 'hydraslug.live.v1', H = 3600e3;
+const TTL = { place: 30 * 24 * H, weather: 0.5 * H, marine: 0.5 * H, bathy: 90 * 24 * H, salinity: 90 * 24 * H, economy: 7 * 24 * H, fx: 12 * H, energy: 7 * 24 * H, climate: 90 * 24 * H, prices: 6 * H };
 let memCache = null;
 function cacheAll() {
   if (memCache) return memCache;
@@ -205,6 +232,7 @@ function cachePut(key, v) {
 function keyOf(id, lat, lon, site) {
   if (id === 'economy' || id === 'energy') return site.countryCode ? `${id}:${site.countryCode}` : null;
   if (id === 'fx') return `fx:${site.data?.currency || site.countryCode || 'USD'}`;
+  if (id === 'prices') return 'prices:world';
   const r = id === 'salinity' ? 4 : id === 'climate' ? 2 : id === 'bathy' ? 250 : id === 'place' ? 100 : 20; // cells per degree
   return `${id}:${Math.round(lat * r)}:${Math.round(lon * r)}`;
 }
@@ -221,7 +249,7 @@ export const loadAtlas = () => (atlasLib ??= import('../data/atlas_lookup.js').c
 const ATLAS_SOURCE = {
   place: ['nations', ['country']], economy: ['nations', ['inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'renewableElectricity', 'electricityPriceWB', 'freshwaterPerCapita', 'safeWaterAccess']],
   fx: ['fx', ['fxPerUSD']], energy: ['nations', ['gridCarbon', 'renewableShare']], weather: ['climate', ['airTemp', 'windSpeed', 'ghiDaily', 'elevation']],
-  marine: ['coast', ['tideRange', 'waveHeight', 'currentSpeed', 'tide', 'sst']], bathy: ['relief', ['bathy', 'depth']], salinity: ['ocean', ['salinity', 'salinityMonthly']], climate: ['climate', ['ghiAnnual', 'windAnnual', 'airTempAnnual']],
+  marine: ['coast', ['tideRange', 'waveHeight', 'currentSpeed', 'tide', 'sst']], bathy: ['relief', ['bathy', 'depth']], salinity: ['ocean', ['salinity', 'salinityMonthly']], climate: ['climate', ['ghiAnnual', 'windAnnual', 'airTempAnnual']], prices: ['prices', ['oilPrice', 'gasPrice']],
 };
 /** Plain-language name of every site-data field the atlas can supply (used for labels and the notice on the site page). */
 export const ATLAS_LABELS = {
@@ -229,6 +257,7 @@ export const ATLAS_LABELS = {
   electricityPriceWB: 'business electricity tariff', freshwaterPerCapita: 'freshwater per capita', safeWaterAccess: 'safe water access', fxPerUSD: 'exchange rate', gridCarbon: 'grid carbon', renewableShare: 'renewable share',
   salinity: 'salinity', salinityMonthly: 'monthly salinity', sstMonthly: 'monthly sea temperature', sst: 'sea temperature', bathy: 'seabed and terrain grid', depth: 'water depth', maxDepthNearby: 'deepest point nearby', elevation: 'land elevation',
   tideRange: 'tidal range', tide: 'tide series', currentSpeed: 'mean current', currentMax: 'peak current', currentDir: 'current direction', waveHeight: 'wave height', wavePeriod: 'wave period', waveDir: 'wave direction',
+  oilPrice: 'oil price', oilPriceWTI: 'WTI oil price', gasPrice: 'gas price', seabedTemp: 'seabed temperature', tempProfile: 'sea temperature profile',
   ghiAnnual: 'solar resource', ghiDaily: 'solar resource', windAnnual: 'long-term wind', airTempAnnual: 'long-term air temperature', airTemp: 'air temperature', windSpeed: 'wind speed',
 };
 const month = () => new Date().getUTCMonth();
@@ -318,6 +347,12 @@ export async function atlasFill(site, status = {}, ctx = {}) {
         put(own('ghiAnnual'), 'ghiDaily', d.ghiAnnual ?? c.ghiAnnual, 'long-term mean');
       }
     });
+  }
+  if (ready('prices') && missing('oilPrice', 'gasPrice')) { // commodity prices known when this build was made
+    const note = `price on ${PRICES.date}, bundled with this build`;
+    put('prices', 'oilPrice', PRICES.brent, note); if (mark.has('oilPrice')) d.oilPriceDate = PRICES.date;
+    put('prices', 'oilPriceWTI', PRICES.wti, note); put('prices', 'gasPrice', PRICES.henryHub, note); if (mark.has('gasPrice')) d.gasPriceDate = PRICES.date;
+    vintage.prices = PRICES.date;
   }
   // last resort (also when the atlas modules are unavailable): the small table shipped with the core
   if (ready('salinity') && d.salinity == null) {
@@ -414,15 +449,33 @@ export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}
     if (d.sst == null && d.sstMonthly && d.sstMonthly[month()]) derive('sst', 'sstMonthly', d.sstMonthly[month()]);
     if (d.ghiAnnual != null && (d.ghiDaily == null || mk.has('ghiDaily') || !mk.has('ghiAnnual'))) derive('ghiDaily', 'ghiAnnual', d.ghiAnnual); // the long-term mean is the better design basis than this week's weather
     if (d.electricityPrice == null && d.electricityPriceWB != null) derive('electricityPrice', 'electricityPriceWB', d.electricityPriceWB);
+    if (d.bathy && d.bathy.elev?.length > 4) { // seabed / ground slope at the site from the relief grid (central differences over about 1 km)
+      const b = d.bathy, n = b.lat.length, m = b.lon.length, i = Math.floor(n / 2), j = Math.floor(m / 2), k = Math.max(1, Math.round(n / 28));
+      const dy = (b.lat[i + k] - b.lat[i - k]) * 110540, dx = (b.lon[j + k] - b.lon[j - k]) * 111320 * Math.cos((site.lat * Math.PI) / 180);
+      if (dy > 0 && dx > 0) derive('seabedSlope', 'bathy', +((Math.atan(Math.hypot((b.elev[i + k][j] - b.elev[i - k][j]) / dy, (b.elev[i][j + k] - b.elev[i][j - k]) / dx)) * 180) / Math.PI).toFixed(2));
+    }
+  };
+  // Seabed temperature: bundled World Ocean Atlas profile at the site depth; in shallow water the coldest month at the surface governs.
+  const deep = async () => {
+    const d = site.data;
+    if (!(d.depth > 0)) { if (ctx.mark.get('seabedTemp') === 'deep') { delete d.seabedTemp; delete d.tempProfile; ctx.mark.delete('seabedTemp'); ctx.mark.delete('tempProfile'); } return; }
+    try {
+      const { deepTemperature } = await import('../data/deep_lookup.js'), r = deepTemperature(site.lat, site.lon, d.depth);
+      if (!r || r.cellKm > 450) return;
+      const shallow = d.depth < 40 && (d.sstMin != null || d.sstMonthly), t = shallow ? Math.min(r.T, d.sstMin ?? Math.min(...d.sstMonthly.filter((x) => x > -3))) : r.T;
+      d.seabedTemp = +t.toFixed(2); d.tempProfile = r.profile; ctx.mark.set('seabedTemp', 'deep'); ctx.mark.set('tempProfile', 'deep');
+      ctx.notes.seabedTemp = `${r.vintage}, annual mean at ${Math.round(Math.min(d.depth, r.levelDepth))} m in the 2° cell ${r.cellKm} km away${shallow ? '; shallow water, so the coldest surface month is used when it is lower' : ''}${r.extrapolated ? '; the cell is shallower than the site, deepest level used' : ''}`;
+      ctx.vintage.deep = r.vintage;
+    } catch { /* atlas module unavailable */ }
   };
   if (opt.atlasOnly) { // no network at all: answer from the built-in atlas
     for (const src of SOURCES) { status[src.id] = { ok: false, message: 'No connection', at: new Date().toISOString() }; ctx.done.add(src.id); onStatus(src.id, 'fail', 'No connection'); }
-    await atlasFill(site, status, ctx); finish();
+    await atlasFill(site, status, ctx); finish(); await deep();
     return snapshot();
   }
   const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy'))])); // these need the country
-  await Promise.all([national, ...['weather', 'marine', 'bathy', 'salinity', 'climate'].map(run)]);
-  await atlasFill(site, status, ctx); finish();
+  await Promise.all([national, run('prices'), ...['weather', 'marine', 'salinity', 'climate'].map(run), run('bathy').then(deep).then(() => onData(snapshot()))]);
+  await atlasFill(site, status, ctx); finish(); await deep();
   return snapshot();
 }
 

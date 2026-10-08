@@ -2,7 +2,7 @@
 // (filled contours, iso-lines, streamlines, vectors). Every chart supports hover read-out and PNG/CSV export.
 import { fmt } from './num.js';
 
-const PALETTE = ['#0ea5e9', '#f97316', '#10b981', '#a855f7', '#ef4444', '#eab308', '#14b8a6', '#ec4899', '#6366f1', '#84cc16', '#f43f5e', '#06b6d4'];
+const PALETTE = ['#0d9488', '#e8890c', '#6366f1', '#ef4444', '#10b981', '#a855f7', '#eab308', '#0ea5e9', '#ec4899', '#84cc16', '#f43f5e', '#06b6d4'];
 const CMAPS = {
   viridis: ['#440154', '#472d7b', '#3b528b', '#2c728e', '#21918c', '#28ae80', '#5ec962', '#addc30', '#fde725'],
   turbo: ['#30123b', '#4662d7', '#36aaf9', '#1ae4b6', '#72fe5e', '#c7ef34', '#faba39', '#f66b19', '#ca2a04', '#7a0403'],

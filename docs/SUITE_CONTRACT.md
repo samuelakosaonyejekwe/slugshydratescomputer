@@ -177,6 +177,10 @@ Publish every key listed for your suite (use `null` when not applicable); you ma
 
 ## Coupling (forward and backward)
 
+The required input and output data of each suite are the `inputs` and `outputs` lists of its entry in `js/data/catalog.js`
+(generated from the corrected module specification); a suite must accept every listed input and compute every listed output,
+or leave the item unticked.
+
 Forward: 1 → 2 → 3 → 4 → 5 → 6 → 7. Backward: suite 4 publishes `effectiveId`, `roughnessEff` and `depositProfile`; suites 2
 and 3 offer them through `pull` (as optional inputs `depositProfile`-aware effective diameter / roughness) so that a second pass
 recomputes pressure drop and slugging with the restricted bore; suite 5 publishes `inhibitorDose` and `chokeOpening`, which

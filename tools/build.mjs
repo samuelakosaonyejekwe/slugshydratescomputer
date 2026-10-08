@@ -35,7 +35,7 @@ if (esbuildPath && existsSync(esbuildPath)) {
   const sha = (s) => "'sha256-" + createHash('sha256').update(s, 'utf8').digest('base64') + "'";
   let html = readFileSync(join(root, 'index.html'), 'utf8');
   html = html
-    .replace(/<link rel="manifest"[^>]*>\n/, '').replace(/<link rel="apple-touch-icon"[^>]*>\n/, '').replace(/<link rel="modulepreload"[^>]*>\n/, '')
+    .replace(/<link rel="manifest"[^>]*>\n/, '').replace(/<link rel="apple-touch-icon"[^>]*>\n/, '').replace(/<link rel="modulepreload"[^>]*>\n/g, '').replace(/<link rel="preconnect"[^>]*>\n/g, '')
     .replace(/<link rel="icon"[^>]*>/, `<link rel="icon" href="${icon}">`)
     .replace(/src="assets\/icon\.svg"/g, `src="${icon}"`)
     .replace('<link rel="stylesheet" href="css/app.css">', () => `<style>${css}</style>`)

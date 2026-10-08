@@ -1,4 +1,4 @@
-// Non-suite pages: home, case & feed water, global site data, data portal, integrated run, app & offline.
+// Non-suite pages: home, case & fluid, global site data, data portal, integrated run, app & offline.
 import { h, clear, btn, kpiGrid, dataTable, toast, badge, fieldRow, importBtn, help, fill } from '../core/ui.js';
 import { store } from '../core/store.js';
 import { SUITES, CHAIN, byId, loadSuite, downstream } from '../suites/index.js';
@@ -9,14 +9,17 @@ import { SUITE_GEOMETRY, formatOf } from '../core/geom.js';
 import { fetchSite, searchPlace, SOURCES, loadAtlas, mergeSiteData, ATLAS_LABELS } from '../core/live.js';
 import { plotCard } from '../core/plot.js';
 import { fmt } from '../core/num.js';
-import { summarize, WATERS, cloneIons, ION_IDS, IONS } from '../core/water.js';
+import { makeFluid, streams, saturationP, hydrateT, hydrateDepression, aqueous, INHIBITORS, EOS, DEFAULT_FLUID } from '../core/thermo.js';
 import { download, readTable, extOf, checkFile } from '../core/io.js';
 import { MIRRORS, APP } from '../data/app.js';
 import { LAND } from '../data/atlas.js';
+import { EXAMPLES } from '../data/examples.js';
 
 const card = (...kids) => h('section', { class: 'card' }, ...kids);
 const pc = (spec) => plotCard(spec, { onDownload: download });
 const ago = (iso) => { if (!iso) return 'never'; const s = (Date.now() - new Date(iso)) / 1000; return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago'; };
+const N = SUITES.length;
+const rateText = (f) => (f.rateBasis === 'gas' ? `${fmt(f.qGas)} MSm³/d gas` : f.rateBasis === 'mass' ? `${fmt(f.mdot)} kg/s` : `${fmt(f.qOil)} Sm³/d oil`);
 
 // ---------------------------------------------------------------------------------------------- home
 export function home(root) {
@@ -29,48 +32,91 @@ export function home(root) {
       k.length ? h('ul', { class: 'sc-kpi' }, k.map((q) => h('li', null, q.label + ': ', h('b', null, typeof q.value === 'number' ? fmt(q.value, 3) : String(q.value)), ' ' + q.unit))) : null,
       h('div', { class: 'sc-links' }, s.uses.length ? '⛓ uses ' + s.uses.map((u) => byId(u).short).join(', ') : '⛓ starts the chain'));
   });
-  fill(root, 
+  const next = !c.site.fetchedAt && done === 0 ? ['Start with the fluid and rates of your case, or load a worked example.', '#/case', 'Define the case'] : done < N ? [`${done} of ${N} suites solved. Run the whole chain in one pass, with the couplings between suites iterated.`, '#/chain', 'Run everything'] : ['Every suite is solved. Read the ranked recommendations for this case.', '#/advisor', 'See the decisions'];
+  fill(root,
     h('section', { class: 'hero' },
-      h('div', null, h('h1', null, 'One connected workspace for every desalination calculation'),
-        h('p', null, 'Thirteen engineering suites — membranes, chemistry, whole-plant balances, CFD, sea discharge, thermal, electrochemical, emerging processes, ZLD, fouling, optimisation, pumping and economics — share one case. Results flow from suite to suite automatically, so a single industrial case can be analysed end to end.'),
-        h('div', { class: 'row-tools' }, h('a', { class: 'btn primary', href: '#/case' }, '1 · Define the case'), h('a', { class: 'btn', href: '#/site' }, '2 · Pull site data'), h('a', { class: 'btn', href: '#/chain' }, '3 · Run everything'), h('a', { class: 'btn', href: '#/advisor' }, '4 · Decide'))),
-      h('div', { class: 'hero-stat' }, kpiGrid([{ label: 'Active case', value: c.name }, { label: 'Feed', value: `${fmt(c.feed.Q)} m³/h` }, { label: 'Feed TDS', value: summarize(c.feed.ions, c.feed.T).tds, unit: 'mg/L' }, { label: 'Site', value: c.site.name || (c.site.lat !== null ? `${fmt(c.site.lat, 4)}, ${fmt(c.site.lon, 4)}` : 'not set') }, { label: 'Suites solved', value: `${done} / 13` }, { label: 'Site data', value: c.site.fetchedAt ? ago(c.site.fetchedAt) : 'not pulled' }]))),
-    h('h2', { class: 'sect' }, 'The 13 suites'), h('div', { class: 'suite-grid' }, cards,
-      [['🌍', 'Global site data', 'Live sea, weather, seabed and economic data for any location', '#/site', c.site.fetchedAt ? 'pulled ' + ago(c.site.fetchedAt) : 'not pulled'], ['🔗', 'Integrated run', 'Solve all suites in sequence with results passed along', '#/chain', `${done} / 13 solved`], ['🧭', 'Decision support', 'Ranked recommendations and sustainability scorecard', '#/advisor', 'whole case']].map(([ico, t, b, href, st]) =>
+      h('div', null, h('h1', null, 'One connected workspace for multiphase flow assurance'),
+        h('p', null, 'Seven engineering suites share one case: fluid and phase behaviour; geometry, wells, network and equipment; multiphase thermal-hydraulics and slugging; hydrates and other solids; operations and control; integrity, loads and risk; economics and decisions. Results pass from suite to suite — forwards and back — so one industrial case is analysed from the reservoir fluid to the net present value.'),
+        h('div', { class: 'row-tools' }, h('a', { class: 'btn primary', href: '#/case' }, '1 · Define the case'), h('a', { class: 'btn', href: '#/site' }, '2 · Pull site data'), h('a', { class: 'btn', href: '#/portal' }, '3 · Bring geometry & data'), h('a', { class: 'btn', href: '#/chain' }, '4 · Run everything'), h('a', { class: 'btn', href: '#/advisor' }, '5 · Decide')),
+        h('p', { class: 'note nextstep' }, h('b', null, 'Suggested next step: '), next[0] + ' ', h('a', { href: next[1] }, next[2] + ' →'))),
+      h('div', { class: 'hero-stat' }, kpiGrid([{ label: 'Active case', value: c.name }, { label: 'Fluid', value: c.fluid.name || 'custom' }, { label: 'Rate', value: rateText(c.fluid) }, { label: 'Site', value: c.site.name || (c.site.lat !== null ? `${fmt(c.site.lat, 4)}, ${fmt(c.site.lon, 4)}` : 'not set') }, { label: 'Suites solved', value: `${done} / ${N}` }, { label: 'Site data', value: c.site.fetchedAt ? ago(c.site.fetchedAt) : 'not pulled' }]))),
+    h('h2', { class: 'sect' }, `The ${N} suites`), h('div', { class: 'suite-grid' }, cards,
+      [['🌍', 'Global site data', 'Live seabed depth and temperature, sea state, weather, prices and national figures for any location', '#/site', c.site.fetchedAt ? 'pulled ' + ago(c.site.fetchedAt) : 'not pulled'], ['📥', 'Data portal', 'Routes, well surveys, networks, CAD, meshes, terrain, inspection maps, logs and tables in one place', '#/portal', 'import'], ['🔗', 'Integrated run', 'Solve all suites in sequence and iterate the couplings between them', '#/chain', `${done} / ${N} solved`], ['🧭', 'Decision support', 'Ranked recommendations, sustainability scorecard and live evidence', '#/advisor', 'whole case']].map(([ico, t, b, href, st]) =>
         h('a', { class: 'suite-card whole', href }, h('div', { class: 'sc-top' }, h('span', { class: 'sc-ico', 'aria-hidden': 'true' }, ico), h('span', { class: 'sc-num' }, ''), badge(st, '')), h('h3', null, t), h('p', null, b), h('div', { class: 'sc-links' }, 'whole case')))),
     h('h2', { class: 'sect' }, 'How the suites are wired together'),
     card(h('div', { class: 'flowmap' }, CHAIN.map((id) => { const s = byId(id), d = downstream(id); return h('div', { class: 'fm-row' }, h('a', { class: 'chip on', href: '#/suite/' + id }, `${s.num}. ${s.short}`), h('span', { class: 'fm-arrow', 'aria-hidden': 'true' }, '→'), h('div', { class: 'fm-to' }, d.length ? d.map((x) => h('a', { class: 'chip', href: '#/suite/' + x.id }, `${x.num}. ${x.short}`)) : h('span', { class: 'note' }, 'final results — feeds the decision report'))); })),
-      h('p', { class: 'note' }, 'Each row reads “this suite feeds →”. For example the RO concentrate becomes the brine analysed by Chemistry, concentrated by ZLD and discharged by Outfall; its pressures and flows size the pumps; energy, membranes and chemicals end up in Economics.')));
+      h('p', { class: 'note' }, 'Each row reads “this suite feeds →”. The fluid model supplies properties and the hydrate curve to everything; the network supplies the route, wall and equipment; the flow solution gives pressure, temperature, hold-up and slugs; solids narrow the bore and roughen the wall, which is sent back to the flow solution; operations change rates, chemicals and valves; integrity turns the loads into damage and risk; economics turns all of it into cost, value and a ranked decision.')));
 }
 
-// ------------------------------------------------------------------------------------- case & feed
+// ------------------------------------------------------------------------------------- case & fluid
 export function casePage(root) {
-  const c = store.case, f = c.feed, sumBox = h('div');
-  const paintSum = () => { const s = summarize(store.case.feed.ions, store.case.feed.T); fill(sumBox, kpiGrid([{ label: 'TDS', value: s.tds, unit: 'mg/L' }, { label: 'Salinity', value: s.salinity, unit: 'g/kg' }, { label: 'Osmotic pressure', value: s.osmoticBar, unit: 'bar' }, { label: 'Conductivity', value: s.conductivity, unit: 'µS/cm' }, { label: 'Density', value: s.density, unit: 'kg/m³' }, { label: 'Hardness', value: s.hardness, unit: 'mg/L CaCO₃' }, { label: 'Alkalinity', value: s.alkalinity, unit: 'mg/L CaCO₃' }, { label: 'Charge balance', value: s.chargeErrorPct, unit: '%', status: Math.abs(s.chargeErrorPct) > 5 ? 'warn' : 'ok' }])); };
-  const get = (k) => store.case.feed[k], set = (k, v) => { store.setFeed({ [k]: v }); paintSum(); };
-  const F = (def) => fieldRow(def, get, set, {});
+  const c = store.case, sumBox = h('div'), warnBox = h('div');
+  let timer = 0;
+  const paintSum = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      try {
+        const f = store.case.fluid, m = makeFluid(f), st = streams(f, m), sat = saturationP(m, f.Tres), aq = aqueous(f), sg = st.std.gasSG ?? m.MW / 28.9647, tot = Object.values(f.comp).reduce((a, b) => a + (+b || 0), 0);
+        fill(sumBox, kpiGrid([
+          { label: 'Gas–oil ratio', value: Number.isFinite(st.gor) ? st.gor : '∞ (no stock-tank liquid)', unit: Number.isFinite(st.gor) ? 'Sm³/Sm³' : '', help: 'Single-stage flash of the well stream to 1.01325 bara and 15 °C.' },
+          st.std.api !== null ? { label: 'Stock-tank oil', value: st.std.api, unit: '°API' } : null, { label: 'Gas gravity', value: sg, unit: '(air = 1)' },
+          sat.P ? { label: sat.type === 'dew' ? 'Dew point at reservoir T' : 'Bubble point at reservoir T', value: sat.P, unit: 'bara', status: sat.P > f.Pres ? 'warn' : 'ok', help: sat.P > f.Pres ? 'The fluid is already two-phase at reservoir conditions.' : 'The fluid is single-phase in the reservoir.' } : { label: 'Saturation point', value: 'single phase' },
+          { label: 'Oil', value: st.qOilStd, unit: 'Sm³/d' }, { label: 'Gas', value: st.qGasStd / 1e6, unit: 'MSm³/d' }, { label: 'Water', value: st.qWaterStd, unit: 'Sm³/d' }, { label: 'Total mass rate', value: st.mHC + st.mW, unit: 'kg/s' },
+          { label: 'Hydrate temperature at arrival pressure', value: hydrateT(f.Pout, sg, aq), unit: '°C', help: 'Screening value (gas-gravity correlation with the salt and inhibitor of the case). Suite 1 computes the rigorous curve.' },
+          { label: 'Hydrate depression by salt + inhibitor', value: hydrateDepression(aq), unit: '°C' },
+        ].filter(Boolean)));
+        const w = [];
+        if (Math.abs(tot - 100) > 0.05) w.push(`The composition adds up to ${fmt(tot, 5)} mol %; it is normalised to 100 % in every calculation.`);
+        if (f.rateBasis === 'oil' && !(st.std.vOil > 0)) w.push('This fluid leaves no liquid at standard conditions, so an oil rate cannot define it: the gas rate is used instead. Switch the rate basis to gas.');
+        if (f.Tin < hydrateT(Math.max(f.Pout, 50), sg, aq)) w.push('The inlet temperature is already below the hydrate temperature at line pressure: hydrates can form from the first metre.');
+        fill(warnBox, w.length ? h('div', { class: 'warns' }, w.map((t) => h('div', { class: 'warn' }, h('b', null, 'Check'), ' ' + t))) : null);
+      } catch (e) { fill(sumBox, h('p', { class: 'bad' }, 'This fluid cannot be characterised: ' + (e.message || e))); }
+    }, 220);
+  };
+  const get = (k) => store.case.fluid[k];
+  const set = (k, v, lib) => { if (k === 'comp') store.setFluid(lib ? { comp: v, c7MW: lib.c7MW, c7SG: lib.c7SG, name: lib.name, ...(lib.rateBasis ? { rateBasis: lib.rateBasis, qGas: lib.qGas, qWater: lib.qWater } : { rateBasis: 'oil' }) } : { comp: v }); else store.setFluid({ [k]: v }); paintSum(); if (lib || k === 'rateBasis' || k === 'inhibitor') casePage(root); };
+  const F = (def) => fieldRow({ ...def, value: store.case.fluid[def.key] }, get, set, {});
+  const f = c.fluid, basis = f.rateBasis;
   const lib = store.library(), libSel = h('select', { 'aria-label': 'Saved cases' }, h('option', { value: '' }, Object.keys(lib).length ? 'Open a saved case…' : 'No saved cases yet'), Object.keys(lib).map((n) => h('option', { value: n }, n)));
   libSel.addEventListener('change', () => { if (libSel.value) { store.loadFromLibrary(libSel.value); toast('Case loaded.', 'ok'); casePage(root); } });
+  const exSel = h('select', { 'aria-label': 'Worked examples' }, h('option', { value: '' }, 'Load a worked example…'), EXAMPLES.map((e, i) => h('option', { value: i }, e.name)));
+  exSel.addEventListener('change', () => { const e = EXAMPLES[+exSel.value]; if (e && (Object.keys(store.case.inputs).length === 0 || confirm('Replace the current case with this worked example? Unsaved inputs of the current case are discarded.'))) { store.importJSON(JSON.stringify(e.case)); toast(`Loaded: ${e.name}.`, 'ok'); casePage(root); } exSel.value = ''; });
   paintSum();
-  fill(root, 
-    h('header', { class: 'page-head' }, h('h1', null, 'Case & feed water'), h('p', null, 'A case is one industrial study: its site, its feed water and the inputs and results of every suite. Everything is stored on this device only.')),
+  fill(root,
+    h('header', { class: 'page-head' }, h('h1', null, 'Case & fluid'), h('p', null, 'A case is one industrial study: its site, the produced fluid and rates, and the inputs and results of every suite. Everything is stored on this device only.')),
     card(h('h2', null, 'Case'),
       h('div', { class: 'fields' },
         h('div', { class: 'field' }, h('label', { for: 'c_name' }, 'Case name'), h('div', { class: 'ctl' }, h('input', { id: 'c_name', type: 'text', maxlength: 120, value: c.name, oninput: (e) => store.update({ name: e.target.value.slice(0, 120) || 'Untitled case' }) }))),
-        h('div', { class: 'field' }, h('label', { for: 'c_auto' }, 'Auto-link suites', help('When on, each suite takes matching values from the case feed water, the site data and the suites upstream of it every time it runs.')), h('div', { class: 'ctl' }, h('label', { class: 'switch' }, h('input', { id: 'c_auto', type: 'checkbox', checked: c.autolink, onchange: (e) => store.update({ autolink: e.target.checked }) }), h('span', { class: 'slider' })))),
+        h('div', { class: 'field' }, h('label', { for: 'c_auto' }, 'Auto-link suites', help('When on, each suite takes matching values from the case fluid, the site data and the other suites every time it runs.')), h('div', { class: 'ctl' }, h('label', { class: 'switch' }, h('input', { id: 'c_auto', type: 'checkbox', checked: c.autolink, onchange: (e) => store.update({ autolink: e.target.checked }) }), h('span', { class: 'slider' })))),
         h('div', { class: 'field wide' }, h('label', { for: 'c_notes' }, 'Notes'), h('div', { class: 'ctl wide' }, h('textarea', { id: 'c_notes', rows: 2, maxlength: 5000, oninput: (e) => store.update({ notes: e.target.value }) }, c.notes)))),
       h('div', { class: 'row-tools' },
-        btn('Save to this device', () => toast(store.saveToLibrary() ? 'Case saved in the library on this device.' : 'Could not save — device storage is full.', 'ok'), 'primary'), libSel,
-        btn('Export case file', () => download(store.exportJSON(), `${store.case.name}.brinelab.json`, 'application/json'), '', 'One portable JSON file with every input — share it or open it on another device'),
+        btn('Save to this device', () => toast(store.saveToLibrary() ? 'Case saved in the library on this device.' : 'Could not save — device storage is full.', 'ok'), 'primary'), libSel, exSel,
+        btn('Export case file', () => download(store.exportJSON(), `${store.case.name}${APP.caseExt}`, 'application/json'), '', 'One portable JSON file with every input — share it or open it on another device'),
         importBtn('Import case file', async (file) => { checkFile(file); store.importJSON(await file.text()); toast('Case imported.', 'ok'); casePage(root); }, '.json'),
         btn('New blank case', () => { if (confirm('Start a new blank case? Unsaved inputs of the current case are discarded.')) { store.reset(); casePage(root); } }, 'ghost'))),
-    card(h('h2', null, 'Feed water'), h('p', { class: 'note' }, 'This analysis is offered to every suite that needs feed chemistry. Pick a reference water, import a laboratory sheet (CSV / Excel with ion names and mg/L), or type the values.'),
+    card(h('h2', null, 'Produced fluid'), h('p', { class: 'note' }, 'The water-free well-stream composition. Pick a reference fluid, import a laboratory report (CSV / Excel with component names and mol %), or type the values. Every suite takes its fluid properties from this definition through the equation of state.'),
       h('div', { class: 'fields' },
-        F({ key: 'Q', label: 'Feed flow', unit: 'm³/h', value: f.Q, min: 0.01, max: 1e6, help: 'Raw-water flow to the plant.' }), F({ key: 'T', label: 'Temperature', unit: '°C', value: f.T, min: 0, max: 60 }),
-        F({ key: 'pH', label: 'pH', unit: '', value: f.pH, min: 1, max: 13 }), F({ key: 'P', label: 'Pressure', unit: 'bar', value: f.P, min: 0, max: 100 }),
-        F({ key: 'turbidity', label: 'Turbidity', unit: 'NTU', value: f.turbidity, min: 0, max: 1000 }), F({ key: 'sdi', label: 'Silt density index SDI₁₅', unit: '', value: f.sdi, min: 0, max: 6.7 }), F({ key: 'toc', label: 'Total organic carbon', unit: 'mg/L', value: f.toc, min: 0, max: 200 }),
-        F({ key: 'ions', label: 'Ionic analysis (mg/L)', type: 'ions', value: f.ions })),
-      sumBox));
+        F({ key: 'name', label: 'Fluid name', type: 'text' }),
+        F({ key: 'comp', label: 'Composition (mol %)', type: 'composition' }),
+        F({ key: 'c7MW', label: 'C7+ molar mass', unit: 'g/mol', min: 96, max: 600, help: 'Average molar mass of the heptanes-plus fraction from the laboratory report.' }),
+        F({ key: 'c7SG', label: 'C7+ specific gravity', unit: '(water = 1)', min: 0.7, max: 1.05 }),
+        F({ key: 'eos', label: 'Equation of state', type: 'select', options: Object.entries(EOS).map(([value, e]) => ({ value, label: e.name })) }),
+        F({ key: 'nPseudo', label: 'C7+ pseudo-components', type: 'select', options: [{ value: 1, label: '1 (single lump)' }, { value: 2, label: '2' }, { value: 3, label: '3 (recommended)' }] }))),
+    card(h('h2', null, 'Rates, water and chemicals'),
+      h('div', { class: 'fields' },
+        F({ key: 'rateBasis', label: 'Rate specified as', type: 'select', options: [{ value: 'oil', label: 'Stock-tank oil rate (oil systems)' }, { value: 'gas', label: 'Sales-gas rate (gas and condensate systems)' }, { value: 'mass', label: 'Hydrocarbon mass rate' }] }),
+        basis === 'oil' ? F({ key: 'qOil', label: 'Oil rate', unit: 'Sm³/d', min: 0, max: 1e6, help: 'Stock-tank oil. 1 Sm³/d = 6.29 bbl/d.' }) : basis === 'gas' ? F({ key: 'qGas', label: 'Gas rate', unit: 'MSm³/d', min: 0, max: 500, help: 'Million standard cubic metres per day. 1 MSm³/d = 35.3 MMscf/d.' }) : F({ key: 'mdot', label: 'Hydrocarbon mass rate', unit: 'kg/s', min: 0, max: 5000 }),
+        basis === 'oil' ? F({ key: 'wc', label: 'Water cut', unit: '%', min: 0, max: 98, help: 'Water as a share of the total liquid at standard conditions.' }) : F({ key: 'qWater', label: 'Water rate', unit: 'Sm³/d', min: 0, max: 1e6 }),
+        F({ key: 'salinity', label: 'Water salinity', unit: 'wt % NaCl eq.', min: 0, max: 26, help: 'Seawater is about 3.5 wt %. Salt lowers the hydrate temperature.' }),
+        F({ key: 'inhibitor', label: 'Hydrate inhibitor in the water', type: 'select', options: Object.entries(INHIBITORS).map(([value, i]) => ({ value, label: i.name })) }),
+        f.inhibitor !== 'none' ? F({ key: 'inhWt', label: 'Inhibitor concentration', unit: 'wt % of aqueous phase', min: 0, max: 95 }) : null)),
+    card(h('h2', null, 'Operating conditions'),
+      h('div', { class: 'fields' },
+        F({ key: 'Tin', label: 'Flowline inlet temperature', unit: '°C', min: -20, max: 200, help: 'Temperature where the fluid enters the flowline (wellhead or manifold).' }),
+        F({ key: 'Pout', label: 'Arrival pressure', unit: 'bara', min: 1, max: 600, help: 'Pressure at the receiving separator or terminal.' }),
+        F({ key: 'Pres', label: 'Reservoir pressure', unit: 'bara', min: 1, max: 1500 }), F({ key: 'Tres', label: 'Reservoir temperature', unit: '°C', min: 0, max: 250 })),
+      h('h3', null, 'What this fluid is'), sumBox, warnBox,
+      h('div', { class: 'row-tools' }, h('a', { class: 'btn primary', href: '#/suite/pvt' }, 'Open suite 1 for the full phase behaviour →'), btn('Reset fluid to the reference case', () => { store.setFluid({ ...DEFAULT_FLUID, comp: { ...DEFAULT_FLUID.comp } }); casePage(root); }, 'ghost'))));
 }
 
 // ---------------------------------------------------------------------------------- global site data
@@ -151,7 +197,7 @@ function slippyMap(lat, lon, onPick) {
 
 export function sitePage(root) {
   const s = store.case.site;
-  const latI = h('input', { type: 'number', step: 'any', min: -90, max: 90, value: s.lat ?? '', id: 's_lat', placeholder: 'e.g. 25.05' }), lonI = h('input', { type: 'number', step: 'any', min: -180, max: 180, value: s.lon ?? '', id: 's_lon', placeholder: 'e.g. 55.05' });
+  const latI = h('input', { type: 'number', step: 'any', min: -90, max: 90, value: s.lat ?? '', id: 's_lat', placeholder: 'e.g. 3.50' }), lonI = h('input', { type: 'number', step: 'any', min: -180, max: 180, value: s.lon ?? '', id: 's_lon', placeholder: 'e.g. 5.75' });
   const srcBox = h('div', { class: 'sources' }), dataBox = h('div'), results = h('ul', { class: 'search-results' });
   const map = slippyMap(s.lat, s.lon, (la, lo) => { latI.value = la.toFixed(4); lonI.value = lo.toFixed(4); });
   const paintSources = (live = {}) => fill(srcBox, SOURCES.map((src) => { const st = live[src.id] || store.case.site.status?.[src.id]; return h('div', { class: 'source ' + (st === 'loading' ? 'loading' : st?.ok ? 'ok' : st ? 'fail' : '') }, h('b', null, src.name), h('span', null, src.gives), h('small', null, src.provider + ' · ' + src.host), h('em', { title: st?.atlas ? `Live source not reachable${st.reason ? ' (' + st.reason + ')' : ''}: its values are answered from the world atlas bundled with the app.` : null }, st === 'loading' ? 'fetching…' : st ? (st.ok ? (st.cached ? 'on this device · fetched ' : 'live · ') + ago(st.at) : st.atlas ? st.message + ' — live source not reachable' : 'unavailable — ' + st.message) : 'not fetched')); }));
@@ -159,23 +205,29 @@ export function sitePage(root) {
   const paintData = () => {
     const site = store.case.site, d = site.data || {};
     clear(dataBox);
-    if (!site.fetchedAt) return dataBox.append(h('p', { class: 'note' }, 'Pick a coastal or inland point on the map (or search / type coordinates) and press “Fetch live site data”.'));
+    if (!site.fetchedAt) return dataBox.append(h('p', { class: 'note' }, 'Pick the field location on the map — offshore or on land — (or search / type coordinates) and press “Fetch live site data”.'));
     const AF = new Set(d.atlasFields || []), notes = d.atlasNotes || {}, vint = d.atlasVintage || {};
     // a tile whose value came from the built-in atlas says so in its label, is tinted, and explains itself on hover
     const K = (label, v, unit, key, extra) => { if (v === null || v === undefined) return null; const a = key && AF.has(key); return { label: a ? label + ' · built-in atlas' : label, value: v, unit, status: a ? 'warn' : undefined, help: a ? `From the built-in world atlas, not live${notes[key] ? ' — ' + notes[key] : ''}.` : extra }; };
     dataBox.append(h('h2', { class: 'sect' }, `${site.name || 'Site'}${site.country ? ', ' + site.country : ''}${AF.has('country') ? ' (country from the built-in atlas)' : ''} — ${fmt(site.lat, 5)}°, ${fmt(site.lon, 5)}°`));
     if (AF.size) {
-      const groups = [['sea temperature and salinity', ['sst', 'sstMonthly', 'salinity', 'salinityMonthly']], ['water depth and the seabed grid', ['depth', 'bathy', 'maxDepthNearby', 'elevation']], ['tides, currents and waves', ['tideRange', 'tide', 'currentSpeed', 'currentMax', 'currentDir', 'waveHeight', 'wavePeriod', 'waveDir']],
-        ['solar, wind and air-temperature climate', ['ghiAnnual', 'ghiDaily', 'windAnnual', 'airTempAnnual', 'airTemp', 'windSpeed']], ['country and national economic and energy figures', ['country', 'currency', 'inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'gridCarbon', 'renewableShare', 'electricityPrice', 'electricityPriceWB', 'renewableElectricity', 'freshwaterPerCapita', 'safeWaterAccess']], ['exchange rate', ['fxPerUSD']]];
-      const single = [...new Set([...AF].map((k) => ATLAS_LABELS[k]).filter(Boolean))], names = single.length <= 6 ? single : groups.filter(([, ks]) => ks.some((k) => AF.has(k))).map(([nm]) => nm), dates = [['ocean', 'sea climatology'], ['relief', 'relief'], ['coast', 'tides, currents and waves'], ['nations', 'national figures'], ['fx', 'exchange rates'], ['climate', 'solar and wind']].filter(([k]) => vint[k]).map(([k, nm]) => `${nm} ${vint[k]}`);
-      dataBox.append(h('div', { class: 'warns', role: 'status' }, h('div', { class: 'warn' }, h('b', null, 'Built-in atlas in use.'), `Some values come from the built-in world atlas because live services could not be reached: ${names.join(single.length <= 6 ? ', ' : '; ')}. They are long-term or recent-period statistics bundled with the app${dates.length ? ' (' + dates.join('; ') + ')' : ''}, not current conditions; each one is marked “built-in atlas” below. Fetch again when the live services are reachable to replace them.`)));
+      const groups = [['sea temperature and salinity', ['sst', 'sstMonthly', 'salinity', 'salinityMonthly']], ['water depth and the seabed grid', ['depth', 'bathy', 'maxDepthNearby', 'elevation', 'seabedSlope']], ['seabed temperature and the temperature profile', ['seabedTemp', 'tempProfile']], ['tides, currents and waves', ['tideRange', 'tide', 'currentSpeed', 'currentMax', 'currentDir', 'waveHeight', 'wavePeriod', 'waveDir']],
+        ['air-temperature and wind climate', ['airTempAnnual', 'airTemp', 'windSpeed', 'windAnnual', 'ghiAnnual', 'ghiDaily']], ['country and national economic and energy figures', ['country', 'currency', 'inflation', 'lendingRate', 'gdpPerCapita', 'gridCarbon', 'renewableShare', 'electricityPrice', 'electricityPriceWB', 'renewableElectricity']], ['exchange rate', ['fxPerUSD']], ['oil and gas prices', ['oilPrice', 'oilPriceWTI', 'gasPrice']]];
+      const single = [...new Set([...AF].map((k) => ATLAS_LABELS[k]).filter(Boolean))], names = single.length <= 6 ? single : groups.filter(([, ks]) => ks.some((k) => AF.has(k))).map(([nm]) => nm), dates = [['ocean', 'sea climatology'], ['relief', 'relief'], ['deep', 'temperature at depth'], ['coast', 'tides, currents and waves'], ['nations', 'national figures'], ['fx', 'exchange rates'], ['climate', 'climate'], ['prices', 'prices']].filter(([k]) => vint[k]).map(([k, nm]) => `${nm} ${vint[k]}`);
+      dataBox.append(h('div', { class: 'warns', role: 'status' }, h('div', { class: 'warn' }, h('b', null, 'Built-in atlas in use.'), `Some values come from the built-in world atlas (either because a live service could not be reached, or because no open live service publishes them): ${names.join(single.length <= 6 ? ', ' : '; ')}. They are long-term or recent-period statistics bundled with the app${dates.length ? ' (' + dates.join('; ') + ')' : ''}, not current conditions; each one is marked “built-in atlas” below. Fetch again when the live services are reachable to replace them.`)));
     }
+    const onLand = !(d.depth > 0);
     dataBox.append(
-      kpiGrid([K('Sea-surface temperature', d.sst, '°C', 'sst'), K(notes.salinity === 'regional estimate' ? 'Salinity (regional estimate)' : 'Salinity (climatology)', d.salinity, 'g/kg', 'salinity'), K(/nearshore/.test(d.depthEstimated || '') ? 'Water depth (nearshore estimate)' : 'Water depth at point', d.depth, 'm', 'depth'), K('Deepest nearby', d.maxDepthNearby, 'm', 'maxDepthNearby'), K('Mean current', d.currentSpeed, 'm/s', 'currentSpeed'), K('Peak current', d.currentMax, 'm/s', 'currentMax'),
-        K(AF.has('tideRange') ? 'Tidal range (typical)' : 'Tidal range', d.tideRange, 'm', 'tideRange'), AF.has('tideRange') ? K('Tidal range (spring)', d.tideSpring, 'm', 'tideRange') : null, K(AF.has('waveHeight') ? 'Wave height (annual mean)' : 'Wave height', d.waveHeight, 'm', 'waveHeight'), AF.has('waveHeight') ? K('Wave height (95th percentile)', d.waveHeightP95, 'm', 'waveHeight') : null, K('Wave period', d.wavePeriod, 's', 'wavePeriod'),
-        K(AF.has('airTemp') ? 'Air temperature (month mean)' : 'Air temperature', d.airTemp, '°C', 'airTemp'), K(AF.has('windSpeed') ? 'Wind speed (month mean)' : 'Wind speed', d.windSpeed, 'm/s', 'windSpeed'), K('Humidity', d.humidity, '%'), K(d.solarEstimated ? 'Solar resource (latitude estimate)' : 'Solar resource (long-term)', d.ghiDaily, 'kWh/m²·d', 'ghiDaily'), K('Wind (long-term, 10 m)', d.windAnnual, 'm/s', 'windAnnual'), K('Land elevation', d.elevation, 'm', 'elevation'),
+      h('h3', null, onLand ? 'Ground and climate at the site' : 'Seabed and sea at the site'),
+      kpiGrid([K(/nearshore/.test(d.depthEstimated || '') ? 'Water depth (nearshore estimate)' : 'Water depth at point', d.depth, 'm', 'depth'), K('Seabed temperature', d.seabedTemp, '°C', 'seabedTemp', 'Annual mean at the seabed: the governing ambient temperature for hydrate and wax in a subsea line.'), K(onLand ? 'Ground slope' : 'Seabed slope', d.seabedSlope, '°', 'seabedSlope'), K('Deepest nearby', d.maxDepthNearby, 'm', 'maxDepthNearby'), K('Land elevation', onLand ? d.elevation : null, 'm', 'elevation'), K('Ground temperature (0.5 m)', onLand ? d.groundTemp : null, '°C', 'groundTemp', 'Soil temperature at about half a metre: the ambient temperature of a buried onshore line.'),
+        K('Sea-surface temperature', d.sst, '°C', 'sst'), K(notes.salinity === 'regional estimate' ? 'Salinity (regional estimate)' : 'Salinity (climatology)', d.salinity, 'g/kg', 'salinity'), K('Mean current', d.currentSpeed, 'm/s', 'currentSpeed'), K('Peak current', d.currentMax, 'm/s', 'currentMax'),
+        K(AF.has('tideRange') ? 'Tidal range (typical)' : 'Tidal range', d.tideRange, 'm', 'tideRange'), K(AF.has('waveHeight') ? 'Wave height (annual mean)' : 'Wave height', d.waveHeight, 'm', 'waveHeight'), AF.has('waveHeight') ? K('Wave height (95th percentile)', d.waveHeightP95, 'm', 'waveHeight') : null, K('Wave period', d.wavePeriod, 's', 'wavePeriod'),
+        K(AF.has('airTemp') ? 'Air temperature (month mean)' : 'Air temperature', d.airTemp, '°C', 'airTemp'), K('Coldest air this fortnight', d.airTempMin, '°C'), K('Warmest air this fortnight', d.airTempMax, '°C'), K(AF.has('windSpeed') ? 'Wind speed (month mean)' : 'Wind speed', d.windSpeed, 'm/s', 'windSpeed'), K('Air temperature (long-term)', d.airTempAnnual, '°C', 'airTempAnnual')].filter(Boolean)),
+      h('h3', null, 'Prices and national figures'),
+      kpiGrid([K('Brent crude' + (d.oilPriceDate ? ` (${d.oilPriceDate})` : ''), d.oilPrice, '$/bbl', 'oilPrice'), K('Brent, 30-day mean', d.oilPriceMean30, '$/bbl'), K('WTI crude' + (d.oilPriceWTIDate ? ` (${d.oilPriceWTIDate})` : ''), d.oilPriceWTI, '$/bbl', 'oilPriceWTI'), K('Henry Hub gas' + (d.gasPriceDate ? ` (${d.gasPriceDate})` : ''), d.gasPrice, '$/MMBtu', 'gasPrice'), K('Brent volatility (1 year)', d.oilPriceVolatility != null ? 100 * d.oilPriceVolatility : null, '%/y', null, 'Annualised standard deviation of daily log returns over the last year; used by the real-options and Monte Carlo analyses of suite 7.'),
+        K('Carbon price' + (d.carbonPriceYear ? ` (${d.carbonPriceYear})` : ''), d.carbonPrice, '$/tCO₂', null, 'Emissions-weighted national carbon price.'), K('Petroleum profit tax (indicative)', d.taxRate, '%', null, 'Hand-entered planning default for the country; edit the fiscal terms in suite 7.'),
         K('Inflation' + (d.inflationYear ? ` (${d.inflationYear})` : ''), d.inflation, '%/y', 'inflation'), K('Lending rate' + (d.lendingRateYear ? ` (${d.lendingRateYear})` : ''), d.lendingRate, '%/y', 'lendingRate'), K(`${d.currency || ''} per USD` + (AF.has('fxPerUSD') && d.fxDate ? ` (${d.fxDate})` : ''), d.fxPerUSD, '', 'fxPerUSD'), K('Electricity (indicative)', d.electricityPrice, '$/kWh', 'electricityPrice'),
-        K((d.gridCarbonLive || AF.has('gridCarbon')) && !notes.gridCarbon ? `Grid carbon (${d.gridCarbonYear || 'latest'})` : 'Grid carbon (indicative)', d.gridCarbon, 'kgCO₂/kWh', 'gridCarbon'), K('Renewable electricity' + (AF.has('renewableShare') && d.renewableShareYear ? ` (${d.renewableShareYear})` : ''), d.renewableShare, '%', 'renewableShare'), K('Water stress' + (AF.has('waterStress') && d.waterStressYear ? ` (${d.waterStressYear})` : ''), d.waterStress, '%', 'waterStress')].filter(Boolean)));
+        K((d.gridCarbonLive || AF.has('gridCarbon')) && !notes.gridCarbon ? `Grid carbon (${d.gridCarbonYear || 'latest'})` : 'Grid carbon (indicative)', d.gridCarbon, 'kgCO₂/kWh', 'gridCarbon'), K('Renewable electricity' + (AF.has('renewableShare') && d.renewableShareYear ? ` (${d.renewableShareYear})` : ''), d.renewableShare, '%', 'renewableShare')].filter(Boolean)));
     const plots = [];
     if (d.bathy) {
       const flat = d.bathy.elev.flat(), zlo = Math.min(...flat), zhi = Math.max(...flat), allLand = zlo >= 0, allSea = zhi <= 0;
@@ -183,8 +235,10 @@ export function sitePage(root) {
       plots.push({ type: 'field', title: (allLand ? 'Terrain around the site (elevation above sea level, m)' : allSea ? 'Seabed around the site (m, negative = below sea level)' : 'Seabed and terrain around the site (m; blue = sea, green to brown = land)') + (coarse ? ' — built-in atlas' : ''), xlabel: 'Longitude (°)', ylabel: 'Latitude (°)', zlabel: 'Elevation (m)', zunit: 'm', x: d.bathy.lon, y: d.bathy.lat, z: d.bathy.elev,
         cmap: allLand ? 'land' : allSea ? 'sea' : 'topo', zmid: allLand || allSea ? undefined : 0, contours: allLand ? 8 : [...[-1000, -500, -200, -100, -50, -20, -10].filter((q) => q > zlo && q < zhi).map((level) => ({ level, color: 'rgba(8,48,107,.45)', width: 0.7 })), ...(allSea ? [] : [{ level: 0, color: '#ffffff', width: 1.6 }])], equal: true, shade: 'geo', exaggeration: zhi - zlo < 60 ? 10 : zhi - zlo < 300 ? 4 : 1.6, markers: [{ x: site.lon, y: site.lat, label: 'site' }],
         onPick: (lo, la) => { latI.value = la.toFixed(4); lonI.value = lo.toFixed(4); map.setView(la, lo); toast(`Site moved to ${la.toFixed(4)}°, ${lo.toFixed(4)}° — fetching live data for the new point…`); doFetch(); },
-        note: (coarse ? `Built-in atlas relief${vint.relief ? ' (' + vint.relief + ')' : ''}, not the live survey grid: about 5 km resolution at the coast and 25 km elsewhere, so harbours, reefs and channels are not resolved. ` : '') + 'Click anywhere on this panel to move the site to that point. ' + ( allLand ? `This point is inland: the ground is ${fmt(zlo, 3)}–${fmt(zhi, 3)} m above sea level and there is no sea within about ${coarse ? span : 13} km, so the marine figures above come from the nearest sea cell (or are unavailable). For a coastal or outfall study, click a point at the coast or just offshore.` : allSea ? 'Open water: the whole window is below sea level. Thin lines are depth contours at 10, 20, 50, 100, 200, 500 and 1000 m.' : 'The white line is the shoreline (0 m); thin blue lines are depth contours at 10, 20, 50, 100, 200, 500 and 1000 m.') });
+        note: (coarse ? `Built-in atlas relief${vint.relief ? ' (' + vint.relief + ')' : ''}, not the live survey grid: about 5 km resolution at the coast and 25 km elsewhere, so canyons, scarps and channels are not resolved. ` : '') + 'Click anywhere on this panel to move the site to that point. ' + ( allLand ? `This point is inland: the ground is ${fmt(zlo, 3)}–${fmt(zhi, 3)} m above sea level and there is no sea within about ${coarse ? span : 13} km, so the marine figures above come from the nearest sea cell (or are unavailable). For a subsea study, click a point offshore.` : allSea ? 'Open water: the whole window is below sea level. Thin lines are depth contours at 10, 20, 50, 100, 200, 500 and 1000 m.' : 'The white line is the shoreline (0 m); thin blue lines are depth contours at 10, 20, 50, 100, 200, 500 and 1000 m.') });
     }
+    if (d.tempProfile && d.depth > 0) plots.push({ type: 'line', title: 'Sea temperature with depth at the site — built-in atlas', xlabel: 'Temperature (°C)', ylabel: 'Elevation (m, sea level = 0)', series: [{ name: 'Annual-mean temperature', x: d.tempProfile.T, y: d.tempProfile.depth.map((z) => -z), mode: 'both' }], hlines: [{ y: -d.depth, label: `seabed ${fmt(d.depth, 4)} m`, color: '#b45309' }], note: `${notes.seabedTemp || 'World Ocean Atlas 2023 annual climatology'}. This profile is the ambient temperature seen by a riser from the seabed to the surface; suites 2, 3 and 5 take the seabed and surface values from it.` });
+    for (const [key, name, unit] of [['oilPrice', 'Brent crude oil', '$/bbl'], ['gasPrice', 'Henry Hub natural gas', '$/MMBtu']]) { const sr = d[key + 'Series']; if (sr?.v?.length > 20) plots.push({ type: 'line', title: `${name} — daily spot price, last year`, xlabel: 'Trading days before the latest price', ylabel: unit, series: [{ name, x: sr.v.map((_, i) => i - sr.v.length + 1), y: sr.v }], hlines: [{ y: d[key + 'Mean30'], label: '30-day mean', color: '#64748b' }], note: `Latest ${fmt(d[key], 4)} ${unit} on ${d[key + 'Date']}; one-year range ${fmt(d[key + 'Min1y'], 4)}–${fmt(d[key + 'Max1y'], 4)}. US Energy Information Administration spot series.` }); }
     if (d.tide) {
       const now = d.tide.nowHour ?? 72, m0 = d.seaLevelMean ?? d.tide.eta.reduce((a, b) => a + b, 0) / d.tide.eta.length;
       const synth = AF.has('tide') || d.tide.synthetic;
@@ -198,9 +252,8 @@ export function sitePage(root) {
       const sig = (p) => p.title + '|' + (p.type === 'field' ? p.z.length + ':' + p.z[0][0] + ':' + p.z[p.z.length - 1][p.z[0].length - 1] + ':' + (p.markers?.[0]?.x ?? '') + ':' + (p.markers?.[0]?.y ?? '') : p.series.map((q) => q.y.length + ':' + q.y[0] + ':' + q.y[q.y.length - 1] + ':' + q.x[0]).join(','));
       const next = new Map(); dataBox.append(h('div', { class: 'plots' }, plots.map((p) => { const k = sig(p), card = plotCache.get(k) || pc(p); next.set(k, card); return card; }))); plotCache = next;
     }
-    dataBox.append(card(h('h2', null, 'Where these values go'), h('p', { class: 'note' }, 'Open any suite: matching inputs appear in its “linked data” bar and, with auto-link on, are applied when you run. Use the buttons below to also set the case feed water from the site.'),
-      h('div', { class: 'row-tools' },
-        d.salinity ? btn(`Set case feed to seawater at ${fmt(d.salinity, 3)} g/kg${d.sst ? ' and ' + fmt(d.sst, 3) + ' °C' : ''}`, () => { const base = WATERS.seawater.ions, tdsT = d.salinity * 1000 * 1.025, f = tdsT / ION_IDS.reduce((a, k) => a + base[k], 0); store.setFeed({ ions: cloneIons(Object.fromEntries(ION_IDS.map((k) => [k, +(base[k] * f).toPrecision(5)]))), T: d.sst ?? store.case.feed.T, name: `Seawater at ${site.name || 'site'}`, source: 'site' }); toast('Case feed water updated from site data.', 'ok'); }, 'primary') : null,
+    dataBox.append(card(h('h2', null, 'Where these values go'), h('p', { class: 'note' }, 'Open any suite: matching inputs appear in its “linked data” bar and, with auto-link on, are applied when you run. Water depth, seabed and surface temperature and currents go to the network, flow, solids and operations suites; waves and currents to integrity; prices, tax, inflation, exchange rate, electricity and carbon figures to economics.'),
+      h('div', { class: 'row-tools' }, h('a', { class: 'btn primary', href: '#/chain' }, 'Run every suite with these site data →'),
         btn('Download site data (JSON)', () => download(JSON.stringify(site, null, 1), 'site-data.json', 'application/json')))));
   };
   const doFetch = async (opt = {}) => {
@@ -226,7 +279,7 @@ export function sitePage(root) {
   };
   const fetchBtn = btn('Fetch live site data', () => doFetch(), 'primary', 'Each source fills in as soon as it answers; answers already on this device appear instantly');
   const freshBtn = btn('Force refresh', () => doFetch({ fresh: true }), 'ghost', 'Ignore the copies kept on this device and ask every source again');
-  const q = h('input', { type: 'search', placeholder: 'Search a city, port or plant location…', 'aria-label': 'Search place', maxlength: 80 });
+  const q = h('input', { type: 'search', placeholder: 'Search a city, port, terminal or basin…', 'aria-label': 'Search place', maxlength: 80 });
   const doSearch = async () => {
     if (!q.value.trim()) return;
     try { const r = await searchPlace(q.value.trim()); fill(results, r.length ? r.map((p) => h('li', null, h('button', { type: 'button', class: 'linklike', onclick: () => { latI.value = p.lat.toFixed(4); lonI.value = p.lon.toFixed(4); map.setView(p.lat, p.lon, 9); clear(results); } }, `${p.name}${p.admin ? ', ' + p.admin : ''}, ${p.country}`))) : h('li', { class: 'note' }, 'No match — try another spelling.')); }
@@ -236,14 +289,14 @@ export function sitePage(root) {
   paintSources(); paintData();
   if (s.fetchedAt && s.data?.bathy && s.data.bathy.lat.length < 40 && navigator.onLine) setTimeout(() => doFetch(), 300); // stored by an earlier build with a coarse relief grid: refresh once
   fill(root, 
-    h('header', { class: 'page-head' }, h('h1', null, 'Global site data'), h('p', null, 'Choose any location on Earth. Your browser pulls current sea state, tides, currents, seabed relief, salinity and temperature climatology, weather, solar resource and national economic indicators directly from open global data services, and offers them to every suite.')),
+    h('header', { class: 'page-head' }, h('h1', null, 'Global site data'), h('p', null, 'Choose any location on Earth — land, shelf or deep water. Your browser pulls the seabed or terrain relief, water depth, seabed temperature and the temperature profile of the water column, sea state, tides and currents, weather and ground temperature, today’s oil and gas prices, exchange rate, and national economic, energy and carbon figures directly from open global data services, and offers them to every suite.')),
     card(
       h('div', { class: 'site-bar' },
         h('div', { class: 'site-search' }, q, btn('Search', doSearch)),
         h('label', { class: 'site-coord', for: 's_lat' }, h('span', null, 'Latitude °N'), latI), h('label', { class: 'site-coord', for: 's_lon' }, h('span', null, 'Longitude °E'), lonI),
         fetchBtn, freshBtn, btn('Use my location', () => navigator.geolocation?.getCurrentPosition((p) => { latI.value = p.coords.latitude.toFixed(4); lonI.value = p.coords.longitude.toFixed(4); map.setView(p.coords.latitude, p.coords.longitude, 9); }, () => toast('Location permission was not granted.', 'warn')), 'ghost')),
       results, map,
-      h('p', { class: 'note' }, 'Click or tap the map to place the site. For an outfall study choose a point in the sea a few hundred metres offshore; for a plant on land the marine sources report the nearest sea cell.'),
+      h('p', { class: 'note' }, 'Click or tap the map to place the site. For a subsea development choose the field location (the deepest point of the route governs the seabed temperature); for an onshore line the marine sources report the nearest sea cell and the ground temperature is used instead.'),
       h('h3', null, 'Live sources'), srcBox),
     dataBox);
 }
@@ -269,7 +322,7 @@ export function portalPage(root) {
     for (const f of files) checkFile(f);
     const file = files[0], ext = extOf(file.name);
     clear(out);
-    if (files.length === 1 && ext === 'json' && /brinelab/i.test(file.name)) { store.importJSON(await file.text()); toast('Case imported.', 'ok'); return out.append(card(h('h2', null, 'Case imported'), h('p', null, `“${store.case.name}” is now the active case.`), h('a', { class: 'btn primary', href: '#/case' }, 'Open the case'))); }
+    if (files.length === 1 && ext === 'json' && /hydraslug/i.test(file.name)) { store.importJSON(await file.text()); toast('Case imported.', 'ok'); return out.append(card(h('h2', null, 'Case imported'), h('p', null, `“${store.case.name}” is now the active case.`), h('a', { class: 'btn primary', href: '#/case' }, 'Open the case'))); }
     if (files.length > 1 || !TABULAR.includes(ext)) return showGeometry(await readFiles(files));
     const t = await readTable(file);
     if (!t.records.length) throw new Error('The file contains no data rows.');
@@ -290,7 +343,7 @@ export function portalPage(root) {
       h('div', { class: 'row-tools' }, btn('This file is geometry (coordinates, soundings, point cloud, network table) — read it as geometry', async () => { try { await showGeometry(await readFiles(files)); } catch (e) { toast(e.message, 'bad', 12000); } })),
       targets.length ? h('div', null, h('h3', null, 'Send to a suite as data'), h('div', { class: 'row-tools' }, sel), mapBox,
         h('div', { class: 'row-tools' }, btn('Load into suite', () => { const { su, f } = targets[+sel.value]; const m = Object.fromEntries([...mapBox.querySelectorAll('select')].map((s) => [s.dataset.key, s.value])); store.setInput(su.id, f.key, t.records.map((r) => Object.fromEntries(f.columns.map((c) => [c.key, m[c.key] ? r[m[c.key]] : null])))); toast(`${t.records.length} rows loaded into ${su.short}.`, 'ok'); location.hash = '#/suite/' + su.id; }, 'primary'))) : null,
-      h('p', { class: 'note' }, 'Water analyses (ion names with mg/L) can be imported directly inside any feed-analysis editor with its “Import analysis” button.')));
+      h('p', { class: 'note' }, 'A fluid composition (component names with mol %) is imported on the Case page with the “Import analysis” button of the composition editor.')));
   };
   const input = h('input', { type: 'file', hidden: true, multiple: true, accept: ACCEPT + ',.xlsx,.xlsm,.tsv' });
   const safe = async (files) => { try { await handle([...files]); } catch (e) { clear(out); const m = formatOf(files[0]?.name || ''); out.append(card(h('h2', null, `Could not read ${files[0]?.name || 'the file'} directly`), h('p', { class: m?.support === 'convert' ? 'summary' : 'bad' }, e.message || 'Unreadable file.'), m ? h('p', { class: 'note' }, `Recognised as ${m.name}.`) : h('p', { class: 'note' }, 'The file type was not recognised. See the list of supported formats below.'))); toast(m?.support === 'convert' ? 'This format needs one conversion step — see the instruction.' : 'Could not read the file.', m?.support === 'convert' ? 'warn' : 'bad', 8000); } };
@@ -300,60 +353,96 @@ export function portalPage(root) {
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files.length) safe([...e.dataTransfer.files]); });
   fill(root, 
-    h('header', { class: 'page-head' }, h('h1', null, 'Data portal'), h('p', null, 'One place to bring case data in: geometry of every kind, laboratory analyses, plant historian logs, pump curves, cost tables and complete case files. Each import is recognised, previewed, measured and routed to the suites that can use it.')),
+    h('header', { class: 'page-head' }, h('h1', null, 'Data portal'), h('p', null, 'One place to bring case data in: pipeline routes and elevation profiles, well deviation surveys, network tables, CAD and meshes, seabed terrain, inspection and deposit maps, laboratory PVT tables, historian logs, cost tables and complete case files. Each import is recognised, previewed, measured and routed to the suites that can use it.')),
     card(drop, h('div', { class: 'formats' },
-      h('div', null, h('b', null, 'CAD and surfaces'), h('span', null, 'STEP, IGES, STL, OBJ, PLY, OFF, 3MF, AMF, glTF/GLB, COLLADA, VRML/X3D, VTK')),
-      h('div', null, h('b', null, 'Computational meshes'), h('span', null, 'Gmsh, SU2, UNV, Nastran, VTK/VTU, Tecplot, Plot3D, node–element files')),
-      h('div', null, h('b', null, 'Drawings'), h('span', null, 'DXF, SVG, HPGL, x-y profiles')),
-      h('div', null, h('b', null, 'GIS, bathymetry, point clouds'), h('span', null, 'Shapefile, GeoJSON, KML/KMZ, GPX, GML, GeoTIFF, ASCII grid, NetCDF, XYZ, LAS, PTS/PTX')),
-      h('div', null, h('b', null, 'Images and voxels'), h('span', null, 'PNG/JPEG/BMP, TIFF stacks, RAW, NRRD, MetaImage, NIfTI, NPY/NPZ')),
-      h('div', null, h('b', null, 'Plant and piping networks'), h('span', null, 'JSON, YAML, XML, CSV connectivity, PCF, IFC, AutomationML')),
-      h('div', null, h('b', null, 'Tables'), h('span', null, 'CSV, TSV, TXT, JSON, Excel .xlsx — logs, analyses, curves, schedules')),
-      h('div', null, h('b', null, 'Cases'), h('span', null, '.brinelab.json — every input of all 13 suites in one file')))),
+      h('div', null, h('b', null, 'Pipeline, riser and well geometry'), h('span', null, 'Chainage–elevation, XYZ centrelines, easting/northing/elevation, latitude/longitude/depth, MD–inclination–azimuth and MD–TVD surveys as CSV, TXT, XLSX, JSON')),
+      h('div', null, h('b', null, 'Networks and topology'), h('span', null, 'Node–edge tables, JSON, YAML, XML, GraphML, PCF piping, IFC, AutomationML')),
+      h('div', null, h('b', null, 'GIS, bathymetry, terrain'), h('span', null, 'Shapefile, GeoJSON, KML/KMZ, GPX, GML, LandXML, GeoTIFF, DEM / ASCII grid, NetCDF, XYZ soundings, LAS, PTS/PTX, SEG-Y positions')),
+      h('div', null, h('b', null, 'CAD and surfaces'), h('span', null, 'STEP (AP203/214/242), IGES, STL, OBJ, PLY, OFF, 3MF, glTF/GLB, VRML/X3D, DXF, SVG')),
+      h('div', null, h('b', null, 'CFD and FEA meshes'), h('span', null, 'VTK/VTU/VTP, Gmsh, Fluent, OpenFOAM, UNV, Nastran BDF, Abaqus INP, ANSYS CDB, LS-DYNA K, SU2, Tecplot')),
+      h('div', null, h('b', null, 'Inspection and deposits'), h('span', null, 'Wall-thickness, corrosion and deposit maps (x, θ, value), defect lists, point clouds, voxel and image data')),
+      h('div', null, h('b', null, 'Tables'), h('span', null, 'CSV, TSV, TXT, JSON, Excel .xlsx, MATLAB .mat, NumPy — PVT reports, logs, curves, schedules, costs')),
+      h('div', null, h('b', null, 'Cases'), h('span', null, `${APP.caseExt} — every input of all ${N} suites in one file`)))),
     out,
-    card(h('h2', null, 'Generate geometry without a file'), h('p', { class: 'note' }, 'Procedural and parametric geometry: spacer-filled channels, filament lattices, periodic minimal surfaces, random packed grains and cellular foams — useful for spacer optimisation, porous membranes and deposits.'), generatorPanel((g) => showGeometry(g).catch((e) => toast(e.message, 'bad')))),
-    card(h('h2', null, 'Supported geometry formats'), h('p', { class: 'note' }, 'Open, documented formats are read directly on this device. Closed or kernel-specific formats cannot be decoded without the vendor’s licensed translator, so for those the portal tells you exactly which neutral format to export.'), formatCatalogue()));
+    card(h('h2', null, 'Generate geometry without a file'), h('p', { class: 'note' }, 'Parametric geometry for early studies before survey data exist: catenary and lazy-wave risers, undulating flowlines, build-and-hold well trajectories and jumpers, plus porous and packed structures for deposit studies.'), generatorPanel((g) => showGeometry(g).catch((e) => toast(e.message, 'bad')))),
+    card(h('h2', null, 'Supported geometry formats'), h('p', { class: 'note' }, 'Open, documented formats are read directly on this device. Closed or kernel-specific formats (Parasolid, ACIS, JT, DWG, DGN and the HDF5-based CGNS, Exodus II and MED) cannot be decoded without the vendor’s licensed translator or library, so for those the portal tells you exactly which neutral format to export.'), formatCatalogue()));
 }
 
 // ------------------------------------------------------------------------------------ integrated run
+// Quantities that tie the suites together in both directions. The chain is repeated until none of them moves by more
+// than the tolerance, which is what turns seven calculators into one coupled model.
+const COUPLED = [
+  ['flow', 'pIn', 'Inlet pressure', 'bara'], ['flow', 'tOut', 'Arrival temperature', '°C'], ['flow', 'liquidInventory', 'Liquid inventory', 'm³'],
+  ['solids', 'effectiveId', 'Smallest effective bore', 'm'], ['solids', 'inhibitorRequired', 'Inhibitor required', 'wt %'],
+  ['ops', 'cooldownTime', 'Cooldown time', 'h'], ['ops', 'inhibitorRate', 'Inhibitor rate', 'm³/d'], ['integ', 'pof', 'Annual failure probability', '1/y'], ['integ', 'remainingLife', 'Remaining life', 'y'],
+  ['econ', 'npv', 'Net present value', '$'], ['econ', 'eal', 'Expected annual loss', '$'],
+];
 export function chainPage(root) {
-  const rows = h('tbody'), bar = h('div', { class: 'progress', hidden: true }, h('i')), summary = h('div');
+  const rows = h('tbody'), bar = h('div', { class: 'progress', hidden: true }, h('i')), summary = h('div'), stat = h('span', { class: 'run-status', role: 'status', 'aria-live': 'polite' });
   const sel = Object.fromEntries(CHAIN.map((id) => [id, h('input', { type: 'checkbox', checked: store.pref('chain.' + id) !== false, 'aria-label': 'Include ' + byId(id).title, onchange: (e) => store.pref('chain.' + id, e.target.checked) })]));
+  const passes = h('select', { 'aria-label': 'Coupling passes' }, [[1, 'one forward pass (no feedback)'], [2, 'up to 2 passes'], [3, 'up to 3 passes'], [5, 'up to 5 passes']].map(([v, t]) => h('option', { value: v, selected: v === (store.pref('chain.passes') || 3) }, t)));
+  passes.addEventListener('change', () => store.pref('chain.passes', +passes.value));
   const cell = {};
   CHAIN.forEach((id, i) => { const s = byId(id); cell[id] = { st: h('td', null, store.case.outputs[id] ? badge('solved ' + ago(store.case.outputs[id]._at), 'ok') : badge('waiting', '')), kp: h('td', { class: 'kp' }, kpText(store.case.outputs[id])), ln: h('td', null, '') }; rows.append(h('tr', null, h('td', null, sel[id]), h('td', { class: 'num' }, i + 1), h('td', { class: 'lead' }, h('a', { href: '#/suite/' + id }, `${s.icon} ${s.num}. ${s.title}`)), cell[id].ln, cell[id].st, cell[id].kp)); });
   function kpText(o) { return o?._kpis?.length ? o._kpis.slice(0, 4).map((k) => `${k.label} ${typeof k.value === 'number' ? fmt(k.value, 3) : k.value} ${k.unit}`).join(' · ') : '—'; }
-  const go = btn('▶  Run the selected suites in sequence', async () => {
-    go.disabled = true; bar.hidden = false; clear(summary);
-    const list = CHAIN.filter((id) => sel[id].checked); let okN = 0, viol = 0;
-    for (let i = 0; i < list.length; i++) {
-      const id = list[i]; bar.firstChild.style.width = Math.round((100 * i) / list.length) + '%';
-      clear(cell[id].st).append(badge('running…', 'warn'));
-      try {
-        const su = await loadSuite(id), items = linkItems(su), n = applyLinks(su, items);
-        cell[id].ln.textContent = n ? `${n} linked` : '–'; cell[id].ln.title = items.map((x) => `${x.key} ← ${x.from}`).join('\n');
-        await new Promise((r) => setTimeout(r, 15));
-        const res = await runSuite(su), bad = res.warnings.filter((w) => w.level === 'bad').length;
-        viol += bad; okN++;
-        clear(cell[id].st).append(badge(bad ? `${bad} limit issue${bad > 1 ? 's' : ''}` : 'solved', bad ? 'warn' : 'ok'), h('small', null, ` ${Math.round(res._ms)} ms`));
-        cell[id].kp.textContent = kpText(store.case.outputs[id]);
-      } catch (e) { console.error(e); clear(cell[id].st).append(badge('failed', 'bad')); cell[id].kp.textContent = String(e.message || e).slice(0, 160); }
+  const snapshot = () => COUPLED.map(([id, key]) => { const v = store.case.outputs[id]?.[key]; return typeof v === 'number' && Number.isFinite(v) ? v : null; });
+  let stop = false;
+  const stopBtn = btn('Stop after this suite', () => { stop = true; stopBtn.disabled = true; }, 'ghost danger'); stopBtn.hidden = true;
+  const go = btn('▶  Run the selected suites', async () => {
+    go.disabled = true; bar.hidden = false; clear(summary); stop = false; stopBtn.hidden = false; stopBtn.disabled = false;
+    const list = CHAIN.filter((id) => sel[id].checked), maxPass = Math.max(1, +passes.value || 1), tol = 0.01, history = [];
+    let okN = 0, viol = 0, pass = 0, converged = false, failed = 0;
+    for (pass = 1; pass <= maxPass && !stop; pass++) {
+      // from the second pass on only the suites inside the feedback loops need to run again
+      const todo = pass === 1 ? list : list.filter((id) => id !== 'pvt');
+      viol = 0;
+      for (let i = 0; i < todo.length && !stop; i++) {
+        const id = todo[i]; bar.firstChild.style.width = Math.round((100 * ((pass - 1) * list.length + i)) / (maxPass * list.length)) + '%';
+        stat.textContent = `Pass ${pass} of up to ${maxPass}: ${byId(id).title}…`;
+        clear(cell[id].st).append(badge('running…', 'warn'));
+        try {
+          const su = await loadSuite(id), items = linkItems(su), n = applyLinks(su, items);
+          cell[id].ln.textContent = n ? `${n} linked` : '–'; cell[id].ln.title = items.map((x) => `${x.key} ← ${x.from}`).join('\n');
+          await new Promise((r) => setTimeout(r, 15));
+          const res = await runSuite(su), bad = res.warnings.filter((w) => w.level === 'bad').length;
+          viol += bad; if (pass === 1) okN++;
+          clear(cell[id].st).append(badge(bad ? `${bad} limit issue${bad > 1 ? 's' : ''}` : 'solved', bad ? 'warn' : 'ok'), h('small', null, ` ${Math.round(res._ms)} ms${pass > 1 ? ' · pass ' + pass : ''}`));
+          cell[id].kp.textContent = kpText(store.case.outputs[id]);
+        } catch (e) { console.error(e); failed++; clear(cell[id].st).append(badge('failed', 'bad')); cell[id].kp.textContent = String(e.message || e).slice(0, 200); }
+      }
+      history.push(snapshot());
+      if (history.length > 1) {
+        const a = history[history.length - 2], b = history[history.length - 1];
+        const change = Math.max(0, ...b.map((v, k) => (v === null || a[k] === null ? 0 : Math.abs(v - a[k]) / Math.max(Math.abs(v), Math.abs(a[k]), 1e-9))));
+        if (change < tol) { converged = true; break; }
+      }
+      if (maxPass === 1 || failed) break;
     }
-    bar.firstChild.style.width = '100%'; setTimeout(() => (bar.hidden = true), 600); go.disabled = false;
-    const o = store.case.outputs;
+    const done = Math.min(pass, maxPass);
+    bar.firstChild.style.width = '100%'; setTimeout(() => (bar.hidden = true), 600); go.disabled = false; stopBtn.hidden = true;
+    stat.textContent = stop ? 'Stopped.' : `Finished after ${history.length} pass${history.length > 1 ? 'es' : ''}.`;
+    const o = store.case.outputs, K = (cond, label, value, unit, status) => (cond !== undefined && cond !== null && value !== undefined && value !== null && !(typeof value === 'number' && !Number.isFinite(value)) ? { label, value, unit, status } : null);
     summary.append(h('h2', { class: 'sect' }, 'Case summary'), kpiGrid([
-      o.ro && { label: 'Product water', value: o.ro.permeateFlow, unit: 'm³/h' }, o.ro && { label: 'Recovery', value: 100 * o.ro.recovery, unit: '%' }, o.ro && { label: 'Feed pressure', value: o.ro.feedPressureBar, unit: 'bar' },
-      o.chem?.limitingMineral && { label: 'First scale to form', value: o.chem.limitingMineral }, o.chem?.maxRecovery && { label: 'Scaling-limited recovery', value: 100 * o.chem.maxRecovery, unit: '%' },
-      o.pump?.sec && { label: 'Net pumping energy', value: o.pump.sec, unit: 'kWh/m³' }, o.plant?.secElec && { label: 'Plant electricity', value: o.plant.secElec, unit: 'kWh/m³' },
-      o.sea?.nearFieldDilution && { label: 'Outfall near-field dilution', value: o.sea.nearFieldDilution, unit: '×' }, o.fouling?.daysToCleaning != null && { label: 'Days to next cleaning', value: o.fouling.daysToCleaning, unit: 'd' },
-      o.zld?.solids != null && { label: 'ZLD solids', value: o.zld.solids, unit: 't/d' }, o.econ?.lcow && { label: 'Levelised cost of water', value: o.econ.lcow, unit: '$/m³' }, o.econ?.capex && { label: 'CAPEX', value: o.econ.capex / 1e6, unit: 'M$' },
-    ].filter(Boolean)), h('p', { class: 'summary' }, `${okN} of ${list.length} suites solved` + (viol ? `, with ${viol} design-limit issue${viol > 1 ? 's' : ''} to review (open the flagged suites).` : ' with no design-limit violations.')),
-    h('div', { class: 'row-tools' }, btn('Export all results (JSON)', () => download(JSON.stringify({ case: store.case.name, site: { name: store.case.site.name, lat: store.case.site.lat, lon: store.case.site.lon }, outputs: store.case.outputs }, null, 1), `${store.case.name}_all_results.json`, 'application/json'))));
+      K(o.pvt?.gor, 'Gas–oil ratio', o.pvt?.gor, 'Sm³/Sm³'), K(o.pvt?.psat, 'Saturation pressure', o.pvt?.psat, 'bara'),
+      K(o.net?.length, 'Line length', (o.net?.length || 0) / 1000, 'km'), K(o.net?.uValue, 'U-value', o.net?.uValue, 'W/m²K'),
+      K(o.flow?.pIn, 'Inlet pressure', o.flow?.pIn, 'bara'), K(o.flow?.tOut, 'Arrival temperature', o.flow?.tOut, '°C'), K(o.flow?.slug, 'Slugging', o.flow?.slug?.type, '', o.flow?.slug?.type === 'severe' ? 'bad' : o.flow?.slug?.type === 'none' ? 'ok' : 'warn'), K(o.flow?.slug?.surge, 'Liquid surge', o.flow?.slug?.surge, 'm³'),
+      K(o.solids?.hydrateRisk, 'Hydrate risk index', o.solids?.hydrateRisk, '0–1', o.solids?.hydrateRisk > 0.5 ? 'bad' : o.solids?.hydrateRisk > 0.15 ? 'warn' : 'ok'), K(o.solids?.inhibitorRequired, 'Inhibitor required', o.solids?.inhibitorRequired, 'wt %'), K(o.solids?.piggingInterval, 'Pigging interval', o.solids?.piggingInterval, 'd'),
+      K(o.ops?.cooldownTime, 'Cooldown time', o.ops?.cooldownTime, 'h'), K(o.ops?.maxShutdown, 'Longest safe shutdown', o.ops?.maxShutdown, 'h'), K(o.ops?.uptime, 'Uptime', 100 * (o.ops?.uptime || 0), '%'),
+      K(o.integ?.remainingLife, 'Remaining life', o.integ?.remainingLife, 'y'), K(o.integ?.riskLevel, 'Integrity risk', o.integ?.riskLevel, '', /high/.test(o.integ?.riskLevel || '') ? 'bad' : 'ok'),
+      K(o.econ?.npv, 'Net present value', (o.econ?.npv || 0) / 1e6, 'M$', o.econ?.npv < 0 ? 'bad' : 'ok'), K(o.econ?.irr, 'Rate of return', o.econ?.irr, '%/y'), K(o.econ?.utc, 'Unit technical cost', o.econ?.utc, '$/boe'), K(o.econ?.bestOption, 'Best strategy', o.econ?.bestOption, ''),
+    ].filter(Boolean)), h('p', { class: 'summary' }, `${okN} of ${list.length} suites solved` + (failed ? `; ${failed} run${failed > 1 ? 's' : ''} failed (see the row for the reason)` : '') + (viol ? `, with ${viol} limit issue${viol > 1 ? 's' : ''} to review in the flagged suites.` : ', with no limit violations.') + (history.length > 1 ? (converged ? ` The couplings between the suites settled to within ${100 * tol} % after ${history.length} passes.` : ` The couplings were still moving after ${history.length} passes: allow more passes, or look at the table below to see which quantity keeps changing.`) : maxPass > 1 ? '' : ' One forward pass only: feedback from solids and operations to the flow solution was not iterated.')));
+    if (history.length > 1) {
+      const live = COUPLED.map((c, k) => ({ c, k })).filter(({ k }) => history.some((hh) => hh[k] !== null));
+      summary.append(dataTable({ title: 'Coupling history — the quantities that pass between suites, pass by pass', columns: ['Quantity', 'From suite', ...history.map((_, i) => `Pass ${i + 1}`), 'Last change %'], rows: live.map(({ c, k }) => { const a = history[history.length - 2][k], b = history[history.length - 1][k]; return [`${c[2]} (${c[3]})`, byId(c[0]).short, ...history.map((hh) => hh[k]), a === null || b === null ? '–' : (100 * Math.abs(b - a)) / Math.max(Math.abs(a), Math.abs(b), 1e-9)]; }), note: 'Example of the loop: deposits from suite 4 narrow the bore → suite 3 recomputes pressure drop and slugging → suite 6 recomputes loads → suite 5 changes the inhibitor and operating plan → suite 7 prices the result.' }));
+      summary.append(h('div', { class: 'plots' }, pc({ type: 'line', title: 'Convergence of the coupled quantities (each relative to its final value)', xlabel: 'Pass', ylabel: 'Value / final value', series: live.filter(({ k }) => history[history.length - 1][k]).map(({ c, k }) => ({ name: c[2], x: history.map((_, i) => i + 1), y: history.map((hh) => (hh[k] ?? history[history.length - 1][k]) / history[history.length - 1][k]), mode: 'both' })), hlines: [{ y: 1, label: 'final', color: '#64748b' }] })));
+    }
+    summary.append(h('div', { class: 'row-tools' }, btn('Export all results (JSON)', () => download(JSON.stringify({ case: store.case.name, site: { name: store.case.site.name, lat: store.case.site.lat, lon: store.case.site.lon }, fluid: store.case.fluid, outputs: store.case.outputs }, null, 1), `${store.case.name}_all_results.json`, 'application/json'))));
     summary.append(h('div', { class: 'linkbar' }, 'Next: ', h('a', { class: 'btn mini primary', href: '#/advisor' }, 'See ranked recommendations and the sustainability scorecard →')));
-    toast('Integrated run finished.', 'ok');
+    toast(failed ? 'Integrated run finished with failures.' : 'Integrated run finished.', failed ? 'warn' : 'ok');
   }, 'primary');
-  fill(root, 
-    h('header', { class: 'page-head' }, h('h1', null, 'Integrated run'), h('p', null, 'Solves the suites one after another in data-flow order. Before each suite runs, it receives the case feed water, the site data and the results of the suites before it — so one industrial case is analysed across all disciplines in a single pass.')),
-    card(h('div', { class: 'row-tools' }, go, btn('Select all', () => CHAIN.forEach((id) => { sel[id].checked = true; store.pref('chain.' + id, true); }), 'ghost'), btn('Select none', () => CHAIN.forEach((id) => { sel[id].checked = false; store.pref('chain.' + id, false); }), 'ghost')), bar,
+  fill(root,
+    h('header', { class: 'page-head' }, h('h1', null, 'Integrated run'), h('p', null, 'Solves the suites one after another in data-flow order — fluid → network → flow → solids → operations → integrity → economics — and then repeats the chain so that what the later suites found (deposits narrowing the bore, the inhibitor dose, the operating plan) is fed back to the earlier ones, until the quantities that pass between suites stop changing.')),
+    card(h('div', { class: 'row-tools' }, go, stopBtn, h('label', { class: 'inline' }, 'Coupling ', passes), btn('Select all', () => CHAIN.forEach((id) => { sel[id].checked = true; store.pref('chain.' + id, true); }), 'ghost'), btn('Select none', () => CHAIN.forEach((id) => { sel[id].checked = false; store.pref('chain.' + id, false); }), 'ghost'), stat), bar,
       h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl chain' }, h('thead', null, h('tr', null, ['Run', 'Step', 'Suite', 'Linked inputs', 'Status', 'Key results'].map((x) => h('th', { scope: 'col' }, x)))), rows))),
     summary);
 }
@@ -386,13 +475,13 @@ export function appPage(root, app) {
     h('header', { class: 'page-head' }, h('h1', null, 'Install, offline & availability'), h('p', null, `${APP.name} is a self-contained application: after the first visit it runs from this device, with or without a network, and keeps your cases locally.`)),
     card(h('h2', null, 'Install on this device'), stBox,
       h('div', { class: 'row-tools' }, btn('⬇  Install app', () => app.install(), 'primary'), btn('Check for updates', () => app.checkUpdate(true)), btn('Keep my data protected', async () => { const ok = await navigator.storage?.persist?.(); toast(ok ? 'Storage is now protected from automatic clean-up.' : 'The browser did not grant protected storage (install the app first).', ok ? 'ok' : 'warn'); paintStorage(); }, 'ghost'),
-        h('a', { class: 'btn', href: 'standalone.html', download: 'BrineLab-standalone.html', title: 'A single HTML file containing the whole application. Copy it to any computer or phone and open it — no server and no internet needed.' }, '⬇  Download single-file edition')),
+        h('a', { class: 'btn', href: 'standalone.html', download: 'HydraSlug-standalone.html', title: 'A single HTML file containing the whole application. Copy it to any computer or phone and open it — no server and no internet needed.' }, '⬇  Download single-file edition')),
       h('ul', { class: 'steps' },
         h('li', null, h('b', null, 'Windows · macOS · Linux · ChromeOS (Chrome, Edge): '), 'press “Install app” above, or the install icon at the right of the address bar.'),
         h('li', null, h('b', null, 'Android (Chrome, Edge, Samsung Internet): '), 'press “Install app”, or menu ⋮ → “Add to Home screen / Install app”.'),
         h('li', { class: ios ? 'hl' : '' }, h('b', null, 'iPhone · iPad (Safari): '), 'tap the Share button, then “Add to Home Screen”. Apple does not allow an install button inside web pages.'),
         h('li', null, h('b', null, 'macOS Safari: '), 'File → “Add to Dock”.'), h('li', null, h('b', null, 'Firefox desktop: '), 'no install prompt, but the app still works offline in a normal tab once loaded; or use the single-file edition.'))),
-    card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All 13 calculation engines, the plotting, file import and your cases run entirely on the device. Only two things need a connection: pulling live site data and checking for a newer build. Site data already fetched remain stored with the case. Without a connection the Global site data page answers from a built-in world atlas instead: sea temperature and salinity, seabed depth and a local relief grid, tidal range with a predicted tide series, currents, wave climate, country, national economic indicators, exchange rates and long-term solar, wind and air temperature — each value labelled as atlas data with its date.'),
+    card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All seven calculation engines, the plotting, file import and your cases run entirely on the device. Only three things need a connection: pulling live site data, looking up published evidence on the decision page, and checking for a newer build. Site data already fetched remain stored with the case. Without a connection the Global site data page answers from a built-in world atlas instead: seabed depth and a local relief grid, seabed temperature and the temperature profile of the water column, sea-surface temperature and salinity, tidal range, currents, wave climate, country, national economic indicators, exchange rates, long-term wind and air temperature, and the oil and gas prices known when the build was made — each value labelled as atlas data with its date.'),
       h('p', { class: 'note' }, 'While you are online the app checks for a newer build in the background and refreshes stored site data that are more than six hours old; installed copies on supporting browsers also refresh periodically in the background.')),
     card(h('h2', null, 'Availability and mirrors'), h('p', null, MIRRORS.length > 1 ? 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.' : 'Once installed (or saved as the single-file edition) the application needs no host at all.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
     card(h('h2', null, 'Security and privacy'), h('ul', { class: 'steps' },
@@ -400,7 +489,7 @@ export function appPage(root, app) {
       h('li', null, 'A strict content-security policy blocks inline and third-party scripts; the app loads no external code libraries.'),
       h('li', null, 'Imported files are parsed as data only, size-limited, and never executed; all text is displayed as plain text.'),
       h('li', null, 'Live data requests go over HTTPS only, to a fixed allow-list of public data services, without credentials or referrer.'),
-      h('li', null, 'Custom formulas in suite 11 are evaluated by a built-in safe expression parser, never by executing code.')),
+      h('li', null, 'Calculations run in a background thread of your own browser; no simulation data are sent to any server, because there is no server.')),
       h('div', { class: 'row-tools' }, btn('Erase all data stored by this app on this device', async () => { if (!confirm('Erase every stored case, input and preference on this device? This cannot be undone.')) return; try { localStorage.clear(); } catch { /* ignore */ } toast('Local data erased. Reloading…'); setTimeout(() => location.reload(), 600); }, 'ghost danger'))),
     card(h('h2', null, 'Live data sources'), h('div', { class: 'sources' }, SOURCES.map((s) => h('div', { class: 'source' }, h('b', null, s.name), h('span', null, s.gives), h('small', null, s.provider + ' · ' + s.host))))));
   check();

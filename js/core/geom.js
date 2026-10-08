@@ -151,7 +151,7 @@ export const SUITE_GEOMETRY = Object.freeze({
   solids: { classes: 'The pipe and network geometry of the flow suite plus deposit data: CSV / XYZ deposition maps (x, θ, t, δ), structured grids, voxel data, surface meshes (STL, OBJ, PLY, VTP) and CFD meshes (VTK, Gmsh, Fluent, OpenFOAM, UNV), particle and point clouds with size, velocity and density', accepts: ['table', 'grid', 'points', 'voxels', 'mesh', 'polylines', 'network', 'params'] },
   ops: { classes: 'Network topology and equipment connectivity: CSV, JSON, XML, YAML and GraphML node-edge tables with valve, choke, sensor and actuator locations, GIS pipeline routes, time-series operating data; STEP, IGES and DXF only where physical equipment geometry is needed', accepts: ['network', 'table', 'polylines', 'params'] },
   integ: { classes: 'STEP, IGES, STL, OBJ, DXF, IFC; structural / FEA meshes (Nastran BDF, Abaqus INP, ANSYS CDB, LS-DYNA KEY, UNV, Gmsh, VTK); inspection data: wall-thickness maps, corrosion and pit-depth grids, dent and free-span geometry, laser-scan point clouds (CSV, XYZ, VTK, PLY, LAS); GIS and bathymetric formats', accepts: ['mesh', 'table', 'grid', 'points', 'polylines', 'network', 'params'] },
-  econ: { classes: 'Normally no detailed geometry: route length, water depth, well depth and equipment counts taken from pipeline routes, networks, well surveys or parameter tables (CSV, JSON, XML)', accepts: ['network', 'polylines', 'table', 'params'] },
+  econ: { classes: 'No mandatory CAD geometry. Network and equipment identifiers and engineering results as CSV, TSV, TXT/DAT, JSON, XML, YAML, NetCDF and other tabular or scientific tables (HDF5 after conversion); optional GIS or network references where costs or risks depend on location (route length, water depth, well depth, equipment counts)', accepts: ['network', 'polylines', 'table', 'params'] },
 });
 
 const extName = (name) => { const s = String(name).toLowerCase(), m = s.match(/\.([a-z0-9_]+)$/); return /\.nii\.gz$/.test(s) ? 'nii.gz' : m ? m[1] : ''; };
@@ -195,7 +195,12 @@ function polyGeom(polys, extra = {}) {
   const good = polys.filter((p) => p.x.length > 0 && p.x.length === p.y.length && p.x.every(Number.isFinite) && p.y.every(Number.isFinite));
   if (!good.length) fail('No line or outline geometry could be read from the file.');
   const lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
-  for (const p of good) for (let i = 0; i < p.x.length; i++) { lo[0] = Math.min(lo[0], p.x[i]); hi[0] = Math.max(hi[0], p.x[i]); lo[1] = Math.min(lo[1], p.y[i]); hi[1] = Math.max(hi[1], p.y[i]); }
+  let zl = Infinity, zh = -Infinity;                     // optional p.z makes a polyline 3-D (routes, risers, well paths)
+  for (const p of good) {
+    if (p.z !== undefined && !(p.z && p.z.length === p.x.length && p.z.every(Number.isFinite))) delete p.z;
+    for (let i = 0; i < p.x.length; i++) { lo[0] = Math.min(lo[0], p.x[i]); hi[0] = Math.max(hi[0], p.x[i]); lo[1] = Math.min(lo[1], p.y[i]); hi[1] = Math.max(hi[1], p.y[i]); if (p.z) { zl = Math.min(zl, p.z[i]); zh = Math.max(zh, p.z[i]); } }
+  }
+  if (zl <= zh) { lo.push(zl); hi.push(zh); }
   return { kind: 'polylines', polylines: good, bbox: { min: lo, max: hi }, ...extra };
 }
 /** xyz: flat array of triples. Rows with a non-finite coordinate are dropped; large clouds are sub-sampled evenly. */
@@ -456,7 +461,12 @@ function cellMesh(xyz, store, extra = {}) {
   const stats = { nodes: nn, cells: store.t.length, cellTypes, ...(extra.stats || {}) };
   if (!nn) fail('No mesh nodes were found in the file.');
   if (!has3 && !has2) {
-    if (cellTypes.line) { const ch = chainEdges(store.v.filter((_, c) => store.t[c] === 'line')); return polyGeom(ch.map((c) => ({ x: c.ids.map((i) => xyz[3 * i]), y: c.ids.map((i) => xyz[3 * i + 1]), closed: c.closed })), { ...extra, warnings, stats: { ...stats, dimension: 1 } }); }
+    if (cellTypes.line) {
+      const ch = chainEdges(store.v.filter((_, c) => store.t[c] === 'line'));
+      let z3 = false;
+      for (let i = 0; i < nn && !z3; i++) if (xyz[3 * i + 2] !== xyz[2]) z3 = true;       // out-of-plane line meshes (pipes, beams) keep z
+      return polyGeom(ch.map((c) => ({ x: c.ids.map((i) => xyz[3 * i]), y: c.ids.map((i) => xyz[3 * i + 1]), ...(z3 ? { z: c.ids.map((i) => xyz[3 * i + 2]) } : {}), closed: c.closed })), { ...extra, warnings, stats: { ...stats, dimension: 1 } });
+    }
     warnings.push('The file holds nodes but no surface or volume cells; the nodes are returned as points.');
     return pointsGeom(xyz, { ...extra, warnings, stats });
   }
@@ -2177,7 +2187,7 @@ function kmlGeom(doc) {
     if (v.length < 2) continue;
     const x = v.map((c) => c[0]), y = v.map((c) => c[1]), closed = nd.name === 'linearring';
     if (closed) closeRing(x, y);
-    polys.push({ x, y, closed });
+    polys.push(!closed && v.some((c) => c[2]) && v.every((c) => Number.isFinite(c[2] ?? 0)) ? { x, y, z: v.map((c) => c[2] ?? 0), closed } : { x, y, closed });
   }
   return linesOrPoints(polys, pts, { geographic: true, warnings: ['Coordinates are geographic (longitude, latitude in degrees).'] });
 }
@@ -2237,11 +2247,11 @@ async function readSHP(ctx) {
       total += n;
       if (total > 5e6) fail('The shapefile holds too many vertices.');
       for (let k = 0; k < np; k++) {
-        const a = i32(po + 4 * k), b = k + 1 < np ? i32(po + 4 * k + 4) : n, x = [], y = [];
+        const a = i32(po + 4 * k), b = k + 1 < np ? i32(po + 4 * k + 4) : n, x = [], y = [], zo = co + 16 * n + 16, z = hasZ && base === 3 && zo + 8 * n <= s + len ? [] : null;
         if (a < 0 || b > n || b < a) continue;
-        for (let q = a; q < b; q++) { x.push(f64(co + 16 * q)); y.push(f64(co + 16 * q + 8)); }
+        for (let q = a; q < b; q++) { x.push(f64(co + 16 * q)); y.push(f64(co + 16 * q + 8)); if (z) z.push(f64(zo + 8 * q)); }
         if (base === 5) closeRing(x, y);
-        if (x.length > 1) polys.push({ x, y, closed: base === 5 });
+        if (x.length > 1) polys.push(z ? { x, y, z, closed: false } : { x, y, closed: base === 5 });
       }
     } else skipped++;
     p = s + len;
@@ -2586,7 +2596,7 @@ function readColumns(text, maxRows = 8e6) {
   if (headers && ncol && headers.length !== ncol) headers = headers.length > ncol ? headers.slice(0, ncol) : null;
   return { headers, ncol, rows, data: data.subarray(0, rows * ncol), breaks: breaks.filter((b) => b < rows), textCells };
 }
-const normHeader = (h) => String(h).toLowerCase().replace(/[[(].*$/, '').replace(/[_\s]+(m|mm|km|deg|degrees|dd)$/, '').replace(/[^a-z0-9]/g, '');
+const normHeader = (h) => String(h).toLowerCase().replace(/[[(].*$/, '').replace(/[_\s]+(m|mm|km|ft|usft|deg|degrees|dd|s|h|hr)$/, '').replace(/[^a-z0-9]/g, '');
 const ROLE = { x: /^(x|lon|long|longitude|lng|easting|east|e|xcoord|xm)$/, y: /^(y|lat|latitude|northing|north|n|ycoord|ym)$/, z: /^(z|elev|elevation|height|alt|altitude|h|level|zcoord|zm)$/, depth: /^(depth|d|sounding|soundings|bathy|bathymetry|waterdepth)$/ };
 function columnRoles(headers) {
   if (!headers) return null;
@@ -3264,7 +3274,9 @@ function objectGeom(j, opts) {
   if (recs && recs.length && recs.every((r) => r && typeof r === 'object' && !Array.isArray(r))) {
     const headers = [...new Set(recs.slice(0, 200).flatMap((r) => Object.keys(r)))].filter((k) => !SKIP_KEYS.has(k));
     if (headers.some((h) => FROM_KEYS.includes(normHeader(h))) && headers.some((h) => TO_KEYS.includes(normHeader(h)))) return buildNetwork([], recs, warnings);
-    return { kind: 'table', headers, records: recs.slice(0, L.rows).map((r) => Object.fromEntries(headers.map((h) => [h, r[h] ?? '']))), warnings, stats: { rows: recs.length } };
+    const tc = tableColumns(headers), records = recs.slice(0, L.rows).map((r) => Object.fromEntries(headers.map((h) => [h, r[h] ?? ''])));
+    if (tc.role === 'survey') return surveyFromRecords(headers, records, tc, warnings);
+    return { kind: 'table', headers, records, warnings, stats: { rows: recs.length, ...(tc.role ? { role: tc.role } : {}) } };
   }
   if (m && Object.keys(j).length) {             // flat parameter set, e.g. a parametric membrane or spacer definition
     const flat = {}, put = (o, pre, depth) => { for (const [k, v] of Object.entries(o)) { if (v && typeof v === 'object' && !Array.isArray(v) && depth < 4) put(v, pre + k + '.', depth + 1); else flat[pre + k] = Array.isArray(v) ? JSON.stringify(v).slice(0, 200) : v; } };
@@ -3306,6 +3318,8 @@ async function readXML(ctx) {
   const text = await ctx.text(), head = text.slice(0, 4000);
   if (/<VTKFile/i.test(head)) return Object.assign(await readVTKXML(ctx), { format: 'VTK XML' });
   const doc = parseXML(text), root = doc.children[0].name, as = (g, name) => Object.assign(g, { format: name });
+  if (root === 'landxml') return as(landxmlGeom(doc, ctx.opts), 'LandXML');
+  if (root === 'graphml') return as(graphmlGeom(doc), 'GraphML');
   if (root === 'kml') return as(kmlGeom(doc), 'KML / KMZ');
   if (root === 'gpx') return as(await readGPX(ctx, doc), 'GPX');
   if (root === 'svg') return as(await readSVG(ctx, doc), 'SVG');
@@ -3316,35 +3330,67 @@ async function readXML(ctx) {
   if (xAll(doc, 'poslist', 'linearring', 'linestring').length) return as(await readGML(ctx, doc), 'GML');
   return xmlNetwork(doc);
 }
-/** CSV / TSV / TXT / DAT / XYZ / ASC text: connectivity table, soundings, points, polyline, matrix or plain table. */
+/** Ordered points that trace one line (a route or centreline) rather than a scattered cloud: short hop-to-hop path. */
+function pathLike(xyz) {
+  const n = Math.floor(xyz.length / 3);
+  if (n < 3 || n > 2e5) return false;
+  const bb = bboxOf(xyz), diag = Math.hypot(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]);
+  let sum = 0;
+  for (let i = 1; i < n && sum <= 3 * diag; i++) sum += Math.hypot(xyz[3 * i] - xyz[3 * i - 3], xyz[3 * i + 1] - xyz[3 * i - 2]);
+  return diag > 0 && sum <= 3 * diag;
+}
+/**
+ * CSV / TSV / TXT / DAT / XYZ / ASC text: node-edge table, well survey, profile / route / wall-map table (stats.role),
+ * particle cloud, soundings, points, polyline, matrix or plain table.
+ */
 async function readDelimited(ctx) {
-  const text = await ctx.text(), tab = readColumns(text), warnings = [];
+  const text = await ctx.text(), tab = readColumns(text), warnings = [], hc = headerCells(text);
+  if (hc && tab.ncol && hc.length === tab.ncol) tab.headers = hc;
   const asTable = () => {
     const t = tableFromRows(parseDelimited(text, ctx.ext === 'tsv' ? '\t' : undefined));
     if (!t.records.length) fail('The file holds no rows of data.');
     return t;
   };
-  if (tab.headers) {
-    const hn = tab.headers.map(normHeader);
+  const heads = hc || tab.headers, tc = heads ? tableColumns(heads) : null, role = tc ? tc.role : null;
+  if (heads) {
+    const hn = heads.map(normHeader);
     if (hn.some((h) => FROM_KEYS.includes(h)) && hn.some((h) => TO_KEYS.includes(h))) return Object.assign(buildNetwork([], asTable().records, warnings), { pathway: 'network' });
+    if (role === 'survey') { const sv = surveyFromText(text, true); if (sv) return sv; }
   }
   if (!tab.rows || !tab.ncol) fail('The file holds no numeric rows.');
+  const tbl = (t) => ({ kind: 'table', ...t, warnings, stats: { rows: t.records.length, ...(role ? { role } : {}) } });
+  const numTable = () => {            // numeric rows keyed by header; also covers whitespace-separated tables
+    if (!tab.headers || tab.textCells) return asTable();
+    const records = [], nc = tab.ncol;
+    for (let i = 0; i < Math.min(tab.rows, L.rows); i++) { const r = {}; for (let c = 0; c < nc; c++) r[tab.headers[c]] = tab.data[i * nc + c]; records.push(r); }
+    if (tab.rows > L.rows) warnings.push(`Only the first ${L.rows} of ${tab.rows} rows are kept.`);
+    return { headers: tab.headers.slice(), records };
+  };
+  if (role === 'thicknessMap' || role === 'depositMap' || role === 'profile' || (role === 'route3d' && tc.c.chainage !== undefined)) return tbl(numTable());
   const roles = columnRoles(tab.headers);
-  if (tab.textCells > 0.05 * tab.rows * tab.ncol && !roles) return { kind: 'table', ...asTable(), warnings };
+  if (role === 'particles' && roles && !tab.textCells) {
+    const { xyz } = tableToXYZ(tab, warnings), g = pointsGeom(xyz, { warnings, stats: { columns: tab.headers, role } });
+    if (g.count === tab.rows) { g.attributes = {}; tab.headers.forEach((h, c) => { if (![roles.x, roles.y, roles.z, roles.depth].includes(c)) g.attributes[h] = Float64Array.from({ length: tab.rows }, (_, i) => tab.data[i * tab.ncol + c]); }); }
+    else warnings.push('Per-particle attributes were dropped because rows were removed or sub-sampled.');
+    return Object.assign(g, { pathway: 'points' });
+  }
+  if (tab.textCells > 0.05 * tab.rows * tab.ncol && !roles) return tbl(asTable());
   if (roles && (roles.z >= 0 || roles.depth >= 0)) {
     const { xyz } = tableToXYZ(tab, warnings), ex = { warnings, geographic: roles.geo, stats: { columns: tab.headers } };
     if (roles.geo || roles.depth >= 0) {
       const lg = latticeGrid(xyz, ex);
       if (lg) return Object.assign(lg, { pathway: 'gis' });
+      if (pathLike(xyz)) { warnings.push('The rows trace a single line, so they are kept as an ordered 3-D route rather than gridded as soundings.'); return Object.assign(pointsGeom(xyz, { ...ex, stats: { ...ex.stats, role: 'route3d' } }), { pathway: 'gis' }); }
       const pg = pointsGeom(xyz, { warnings }), n = pg.count, side = Math.max(8, Math.min(512, Math.round(Math.sqrt(n)))), w = pg.bbox.max[0] - pg.bbox.min[0], h = pg.bbox.max[1] - pg.bbox.min[1];
       const nx = Math.max(4, Math.round(side * Math.sqrt((w || 1) / (h || 1)))), ny = Math.max(4, Math.round((side * side) / nx)), gr = scatterGrid(pg.points, nx, ny);
       warnings.push(`${n} scattered soundings binned onto a ${nx} × ${ny} grid (empty cells filled by inverse-distance weighting); the original points are kept in "points".`);
       return { kind: 'grid', grid: { ...gr, nodata: 0, geographic: roles.geo }, points: pg.points, count: n, bbox: pg.bbox, pathway: 'gis', warnings, stats: { nx, ny, points: n, columns: tab.headers } };
     }
+    if (pathLike(xyz)) ex.stats.role = 'route3d';
     const g = pointsGeom(xyz, ex);
     return Object.assign(g, { pathway: 'points' });
   }
-  if (tab.headers && !roles) return { kind: 'table', ...asTable(), warnings };
+  if (tab.headers && !roles) return tbl(numTable());
   if (tab.ncol === 2) {
     const cuts = [0, ...tab.breaks, tab.rows], polys = [];
     for (let k = 0; k + 1 < cuts.length; k++) { const x = [], y = []; for (let i = cuts[k]; i < cuts[k + 1]; i++) { x.push(tab.data[2 * i]); y.push(tab.data[2 * i + 1]); } if (x.length > 1) polys.push({ x, y, closed: closeRing(x, y) || !!ctx.opts.closed }); }
@@ -3353,10 +3399,734 @@ async function readDelimited(ctx) {
   if (tab.ncol >= 3 && tab.ncol <= 7) {
     if (tab.ncol > 3) warnings.push(`Columns beyond x, y, z (${tab.ncol - 3} per row: intensity, colour or radius) are ignored.`);
     const { xyz } = tableToXYZ(tab, warnings);
-    return Object.assign(pointsGeom(xyz, { warnings, stats: { columns: tab.headers || undefined } }), { pathway: 'points' });
+    return Object.assign(pointsGeom(xyz, { warnings, stats: { columns: tab.headers || undefined, ...(pathLike(xyz) ? { role: 'route3d' } : {}) } }), { pathway: 'points' });
   }
   if (tab.ncol >= 8 && tab.rows >= 2 && !tab.textCells) { warnings.push(`Numeric matrix of ${tab.rows} rows × ${tab.ncol} columns read as a regular array (row 1 at y = 0).`); return imageGeom(tab.data, tab.ncol, tab.rows, 1, ctx.opts.spacing || [1, 1, 1], [0, 0, 0], ctx.opts, { warnings }); }
-  return { kind: 'table', ...asTable(), warnings };
+  return tbl(asTable());
+}
+
+// ---- Table roles: profiles, routes, well surveys, wall maps, particles --------------------------------------
+const LEN_UNIT = { m: 1, km: 1000, mm: 1e-3, cm: 0.01, ft: 0.3048, feet: 0.3048, usft: 1200 / 3937, in: 0.0254, inch: 0.0254 };
+/** Unit named in a column header such as "KP (km)", "MD [ft]" or "wt_mm"; null when none is given. */
+const headerUnit = (h) => { const m = /[[(]\s*([a-zµ°%/]+)\s*[\])]/i.exec(String(h)) || /[_\s](mm|km|cm|m|ft|usft|in|deg|rad|s|h|hr|min|d)$/i.exec(String(h)); return m ? m[1].toLowerCase() : null; };
+const COL = {
+  md: /^(md|mdepth|measureddepth|measdepth|alongholedepth|ahd|dept|mdrkb|mdkb|mdbrt|mdft)$/,
+  inc: /^(inc|incl|inclin|inclination|incdeg|incldeg|deviation|devi|dev|drift|holeangle)$/,
+  azi: /^(azi|azim|azimuth|az|azideg|azimdeg|hazi|azimuthtrue|azimuthgrid|azitrue|azigrid|bearing|direction)$/,
+  tvd: /^(tvd|tvdrkb|tvdkb|tvdbrt|tvdss|tvdmsl|trueverticaldepth|verticaldepth|tvdft)$/,
+  north: /^(ns|north|northing|n|dn|deltan|nsoffset|northoffset|localn|ynorth|dy|y|yoffset)$/,
+  east: /^(ew|east|easting|e|de|deltae|ewoffset|eastoffset|locale|xeast|dx|x|xoffset)$/,
+  chainage: /^(chainage|ch|kp|kilometrepoint|kilometerpoint|station|sta|stationing|distance|dist|horizontaldistance|pipelinedistance|routedistance|alongroute|arclength)$/,
+  lon: /^(lon|long|longitude|lng)$/, lat: /^(lat|latitude)$/,
+  x: ROLE.x, y: ROLE.y, z: ROLE.z,
+  depth: /^(depth|d|sounding|soundings|bathy|bathymetry|waterdepth|wd|seabeddepth)$/,
+  theta: /^(theta|angle|ang|clock|clockposition|clockpos|oclock|circumferential|circ|circumferentialposition|orientation|phi)$/,
+  thickness: /^(wt|wallthickness|thickness|thk|wallthk|remainingwall|remainingthickness|remainingwt|twall|tmeas|measuredthickness)$/,
+  loss: /^(metalloss|wallloss|corrosion|corrosiondepth|pitdepth|defectdepth|lossdepth|dentdepth|loss)$/,
+  deposit: /^(deposit|depositthickness|delta|hydrate|hydratethickness|wax|waxthickness|scale|scalethickness|depositheight|layerthickness|film|filmthickness)$/,
+  time: /^(t|time|timestamp|date|datetime|elapsed|elapsedtime|times|hours|days|seconds|minutes)$/,
+  diameter: /^(dp|diameter|diam|size|particlediameter|particlesize|radius|agglomeratesize|d50)$/,
+  velocity: /^(u|v|w|vx|vy|vz|velocity|speed|density|rho|hydratefraction|massfraction)$/,
+};
+/**
+ * Column roles of a header row. Returns { c: { md, inc, azi, tvd, north, east, chainage, lon, lat, x, y, z, depth, theta,
+ * thickness, loss, deposit, time, diameter, velocity → column index }, unit: { same keys → unit text or null }, role } where
+ * role is 'survey' | 'thicknessMap' | 'depositMap' | 'particles' | 'profile' | 'route3d' | 'timeseries' | null.
+ */
+export function tableColumns(headers) {
+  const hn = (headers || []).map(normHeader), c = {}, unit = {};
+  for (const k of Object.keys(COL)) { const i = hn.findIndex((h) => COL[k].test(h)); if (i >= 0) { c[k] = i; unit[k] = headerUnit(headers[i]); } }
+  if (c.md === undefined && c.inc !== undefined && c.depth !== undefined) { c.md = c.depth; unit.md = unit.depth; }
+  const has = (k) => c[k] !== undefined, value = has('deposit') || has('thickness') || has('loss'), axial = has('chainage') || has('x');
+  let role = null;
+  if (has('md') && (has('inc') || has('tvd'))) role = 'survey';
+  else if (value && axial && (has('theta') || (has('y') && !has('z')))) role = has('deposit') ? 'depositMap' : 'thicknessMap';
+  else if (has('x') && has('y') && (has('diameter') || has('velocity'))) role = 'particles';
+  else if (has('chainage') && (has('z') || has('depth')) && !(has('x') && has('y'))) role = 'profile';
+  else if (has('x') && has('y') && (has('z') || has('depth'))) role = 'route3d';
+  else if (has('time') && hn.length > 1) role = 'timeseries';
+  return { c, unit, role };
+}
+/** Header cells of the first non-comment line when that line is a header (holds a non-numeric cell), else null. */
+function headerCells(text) {
+  for (let pos = text.charCodeAt(0) === 0xfeff ? 1 : 0, k = 0; pos < text.length && k < 200; k++) {
+    let e = text.indexOf('\n', pos);
+    if (e < 0) e = text.length;
+    const l = text.slice(pos, e).trim();
+    pos = e + 1;
+    if (!l || /^(#|%|!|\/\/)/.test(l)) continue;
+    const cells = (/[,;\t]/.test(l) ? l.split(/[,;\t]/) : l.split(/\s+/)).map((s) => s.trim().replace(/^"|"$/g, '').trim());
+    return cells.some((s) => s !== '' && !Number.isFinite(+s)) ? cells : null;
+  }
+  return null;
+}
+
+// ---- Well deviation surveys ----------------------------------------------------------------------------------
+/**
+ * Minimum-curvature positions of a directional survey. stations: [{ md, inc, azi }] (or [md, inc, azi] triples, or
+ * { md[], inc[], azi[] }) in metres and degrees; start: { tvd, north, east } of the first station (default tvd = md of the
+ * first station, i.e. a vertical hole above it). Returns { md, inc, azi, tvd, north, east, dogleg (deg per interval),
+ * dls (deg / 30 m) } as arrays; dls[0] = dogleg[0] = 0.
+ */
+export function minimumCurvature(stations, start = {}) {
+  const src = stations && !Array.isArray(stations) && Array.isArray(stations.md) ? stations.md.map((m, i) => [m, stations.inc ? stations.inc[i] : 0, stations.azi ? stations.azi[i] : 0]) : stations;
+  if (!Array.isArray(src) || !src.length) throw new Error('minimumCurvature needs survey stations with md, inc and azi.');
+  const md = [], inc = [], azi = [], D = Math.PI / 180;
+  for (const q of src) {
+    const a = Array.isArray(q) ? q : q && typeof q === 'object' ? [q.md, q.inc ?? q.incl ?? q.inclination, q.azi ?? q.azim ?? q.azimuth ?? 0] : [];
+    if (![a[0], a[1], a[2]].every((v) => typeof v === 'number' && Number.isFinite(v))) throw new Error('Survey stations must hold numeric md, inc and azi.');
+    if (md.length && a[0] < md[md.length - 1]) throw new Error('Measured depth must not decrease along the survey.');
+    md.push(a[0]); inc.push(a[1]); azi.push(a[2]);
+  }
+  const fin0 = (v, d) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+  const tvd = [fin0(start.tvd, md[0])], north = [fin0(start.north, 0)], east = [fin0(start.east, 0)], dogleg = [0], dls = [0];
+  for (let i = 1; i < md.length; i++) {
+    const dm = md[i] - md[i - 1], i1 = inc[i - 1] * D, i2 = inc[i] * D, a1 = azi[i - 1] * D, a2 = azi[i] * D;
+    const dl = Math.acos(Math.max(-1, Math.min(1, Math.cos(i2 - i1) - Math.sin(i1) * Math.sin(i2) * (1 - Math.cos(a2 - a1))))), rf = dl < 1e-6 ? 1 + (dl * dl) / 12 : (2 / dl) * Math.tan(dl / 2);
+    north.push(north[i - 1] + 0.5 * dm * (Math.sin(i1) * Math.cos(a1) + Math.sin(i2) * Math.cos(a2)) * rf);
+    east.push(east[i - 1] + 0.5 * dm * (Math.sin(i1) * Math.sin(a1) + Math.sin(i2) * Math.sin(a2)) * rf);
+    tvd.push(tvd[i - 1] + 0.5 * dm * (Math.cos(i1) + Math.cos(i2)) * rf);
+    dogleg.push(dl / D); dls.push(dm > 0 ? ((dl / D) * 30) / dm : 0);
+  }
+  return { md, inc, azi, tvd, north, east, dogleg, dls };
+}
+/** Survey columns (metres, degrees; tvd / north / east optional) -> 3-D well path: x east, y north, z elevation (negative down). */
+function surveyGeom(col, extra = {}) {
+  const warnings = extra.warnings || [], rows = [], n0 = col.md.length, opt = ['inc', 'azi', 'tvd', 'north', 'east'].filter((k) => col[k]);
+  let dropped = 0;
+  for (let i = 0; i < n0; i++) {
+    const r = { md: col.md[i] };
+    for (const k of opt) r[k] = col[k][i];
+    if (!Number.isFinite(r.md) || opt.some((k) => !Number.isFinite(r[k])) || (rows.length && r.md <= rows[rows.length - 1].md)) { dropped++; continue; }
+    rows.push(r);
+    if (rows.length > L.rows) fail('The survey holds too many stations.');
+  }
+  if (rows.length < 2) fail('A well survey needs at least two stations with increasing measured depth.');
+  if (dropped) warnings.push(`${dropped} survey rows with missing values or non-increasing measured depth were dropped.`);
+  const md = rows.map((r) => r.md), D = Math.PI / 180;
+  let s;
+  if (col.inc) {
+    if (!col.azi) warnings.push('The survey has no azimuth column: the well is laid out in one vertical plane heading north.');
+    if (rows.some((r) => r.inc < 0 || r.inc > 180)) fail('Survey inclinations must lie between 0 and 180 degrees.');
+    s = minimumCurvature(rows.map((r) => [r.md, r.inc, col.azi ? r.azi : 0]), { tvd: col.tvd ? rows[0].tvd : rows[0].md, north: col.north ? rows[0].north : 0, east: col.east ? rows[0].east : 0 });
+    if (!col.tvd && rows[0].md > 0) warnings.push(`The first station is at MD ${+rows[0].md.toFixed(3)}; the hole above it is taken as vertical.`);
+    if (col.tvd) { const e = Math.abs(s.tvd[s.tvd.length - 1] - rows[rows.length - 1].tvd); if (e > 0.01 * Math.max(1, md[md.length - 1] - md[0])) warnings.push(`TVD recomputed by minimum curvature differs from the file's TVD column by ${+e.toFixed(2)} at the last station; the computed path is used.`); }
+  } else {
+    const tvd = rows.map((r) => r.tvd), ne = col.north && col.east, north = [ne ? rows[0].north : 0], east = [ne ? rows[0].east : 0], inc = [], azi = [];
+    let bad = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const dm = md[i] - md[i - 1], dz = tvd[i] - tvd[i - 1];
+      if (Math.abs(dz) > dm * (1 + 1e-6)) bad++;
+      if (ne) { north.push(rows[i].north); east.push(rows[i].east); } else { north.push(0); east.push(east[i - 1] + Math.sqrt(Math.max(0, dm * dm - dz * dz))); }
+      inc.push(Math.acos(Math.max(-1, Math.min(1, dz / dm))) / D);
+      azi.push(ne ? ((Math.atan2(east[i] - east[i - 1], north[i] - north[i - 1]) / D) + 360) % 360 : 90);
+    }
+    inc.unshift(inc[0]); azi.unshift(azi[0]);
+    const dogleg = [0], dls = [0];
+    for (let i = 1; i < rows.length; i++) { const i1 = inc[i - 1] * D, i2 = inc[i] * D, dl = Math.acos(Math.max(-1, Math.min(1, Math.cos(i2 - i1) - Math.sin(i1) * Math.sin(i2) * (1 - Math.cos((azi[i] - azi[i - 1]) * D))))) / D; dogleg.push(dl); dls.push((dl * 30) / (md[i] - md[i - 1])); }
+    if (bad) warnings.push(`${bad} intervals have a TVD change larger than their MD change; check the depth columns.`);
+    warnings.push(ne ? 'No inclination column: inclination, azimuth and dog-leg severity are derived from the MD, TVD and offset columns (interval averages).' : 'Only MD and TVD are given: the horizontal departure is laid out due east (azimuth unknown) and inclination is the interval average.');
+    s = { md, inc, azi, tvd, north, east, dogleg, dls };
+  }
+  const g = polyGeom([{ x: s.east.slice(), y: s.north.slice(), z: s.tvd.map((v) => 0 - v), closed: false }], { ...extra, warnings });
+  g.survey = { md: s.md, inc: s.inc, azi: s.azi, tvd: s.tvd, north: s.north, east: s.east, dls: s.dls };
+  g.stats = { ...(extra.stats || {}), md: md[md.length - 1], tvd: Math.max(...s.tvd), maxInclination: Math.max(...s.inc), maxDLS: Math.max(...s.dls), stations: md.length, wellSurvey: true };
+  g.pathway = 'well';
+  return g;
+}
+/** Survey table from records keyed by header. */
+function surveyFromRecords(headers, records, tc, warnings) {
+  const col = {}, toM = {};
+  for (const k of ['md', 'inc', 'azi', 'tvd', 'north', 'east']) if (tc.c[k] !== undefined) { const h = headers[tc.c[k]]; col[k] = records.map((r) => (typeof r[h] === 'number' ? r[h] : parseFloat(r[h]))); toM[k] = LEN_UNIT[tc.unit[k]] ?? null; }
+  return surveyGeom(surveyUnits(col, toM, warnings), { warnings });
+}
+function surveyUnits(col, toM, warnings) {
+  const f = toM.md ?? toM.tvd ?? 1;
+  if (f !== 1) { for (const k of ['md', 'tvd', 'north', 'east']) if (col[k]) col[k] = col[k].map((v) => v * (toM[k] ?? f)); warnings.push(`Survey depths converted to metres (× ${+f.toPrecision(6)}).`); }
+  if (!(col.north && col.east)) { delete col.north; delete col.east; }
+  return col;
+}
+/**
+ * Deviation-survey text: the last header line before the data that names MD + inclination (+ azimuth) or MD + TVD decides
+ * the columns. Returns null when no such header exists and `strict` is set; otherwise a header-less file is MD, inc, azi.
+ */
+function surveyFromText(text, strict) {
+  const ls = splitLines(text), warnings = [];
+  let tc = null, feet = false, first = -1;
+  for (let i = 0; i < ls.length && i < 500; i++) {
+    const raw = ls[i].replace(/^[\s#%!;*/]+/, '').trim();
+    if (!raw) continue;
+    const v = numsOf(raw);
+    if (v.length >= 2 && v.every(Number.isFinite)) { first = i; break; }
+    if (/\b(ft|feet|foot)\b/i.test(raw) && /\b(unit|units|depth|md|tvd)\b/i.test(raw)) feet = true;
+    for (const cells of [/[,;\t]/.test(raw) ? raw.split(/[,;\t]/) : raw.split(/\s{2,}/), raw.split(/[\s,;]+/)]) { const q = tableColumns(cells.map((s) => s.trim().replace(/^"|"$/g, ''))); if (q.role === 'survey') { tc = q; break; } }
+  }
+  if (first < 0) return strict ? null : fail('The survey file holds no numeric rows.');
+  if (!tc) {
+    if (strict) return null;
+    const nc = numsOf(ls[first].trim()).length;
+    tc = nc >= 3 ? { c: { md: 0, inc: 1, azi: 2 }, unit: {} } : { c: { md: 0, tvd: 1 }, unit: {} };
+    warnings.push(nc >= 3 ? 'No column header found: columns taken as MD, inclination, azimuth.' : 'No column header found: the two columns are taken as MD and TVD.');
+  }
+  const keys = ['md', 'inc', 'azi', 'tvd', 'north', 'east'].filter((k) => tc.c[k] !== undefined), col = Object.fromEntries(keys.map((k) => [k, []])), need = Math.max(...keys.map((k) => tc.c[k])) + 1, toM = {};
+  let skipped = 0;
+  for (let i = first; i < ls.length; i++) {
+    const l = ls[i].trim();
+    if (!l || /^(#|%|!|\/\/)/.test(l)) continue;
+    const v = numsOf(l);
+    if (v.length < need) { skipped++; continue; }
+    for (const k of keys) col[k].push(v[tc.c[k]]);
+    if (col.md.length > L.rows) fail('The survey holds too many stations.');
+  }
+  for (const k of keys) toM[k] = LEN_UNIT[tc.unit[k]] ?? (feet ? 0.3048 : null);
+  if (skipped) warnings.push(`${skipped} lines with too few columns were skipped.`);
+  return surveyGeom(surveyUnits(col, toM, warnings), { warnings, format: 'Well deviation survey (ASCII)' });
+}
+async function readSurvey(ctx) { return surveyFromText(await ctx.text(), false); }
+
+// ---- GraphML ---------------------------------------------------------------------------------------------------
+function graphmlGeom(doc) {
+  const keys = new Map(), warnings = [];
+  for (const k of xAll(doc, 'key')) if (k.attrs.id) keys.set(k.attrs.id, String(k.attrs['attr.name'] ?? k.attrs.id).toLowerCase());
+  const rec = (el) => { const o = {}; for (const d of xKids(el, 'data')) { const name = keys.get(d.attrs.key) ?? String(d.attrs.key ?? '').toLowerCase(), t = d.text.trim(); if (name && !SKIP_KEYS.has(name) && t !== '' && !d.children.length) o[name] = t; } return o; };
+  const nodes = xAll(doc, 'node').map((n) => {
+    const o = rec(n), yg = xAll(n, 'geometry')[0], lab = xAll(n, 'nodelabel')[0];
+    if (yg && o.x === undefined && o.y === undefined) { o.x = yg.attrs.x; o.y = yg.attrs.y; }
+    if (lab && o.name === undefined && lab.text.trim()) o.name = lab.text.trim();
+    o.id = n.attrs.id;
+    return o;
+  }).filter((o) => o.id !== undefined);
+  const edges = xAll(doc, 'edge').map((e) => { const o = rec(e); for (const k of [...FROM_KEYS, ...TO_KEYS]) delete o[k]; if (o.name === undefined && e.attrs.id !== undefined) o.name = e.attrs.id; return { ...o, from: e.attrs.source, to: e.attrs.target }; });
+  const hyper = xAll(doc, 'hyperedge').length;
+  if (hyper) warnings.push(`${hyper} hyperedges were skipped (only two-ended edges are read).`);
+  if (!nodes.length && !edges.length) fail('The GraphML file holds no nodes or edges.');
+  return buildNetwork(nodes, edges, warnings);
+}
+
+// ---- LandXML ---------------------------------------------------------------------------------------------------
+function landxmlGeom(doc, opts = {}) {
+  const root = doc.children[0], warnings = [], un = xAll(root, 'metric', 'imperial')[0], lu = un ? String(un.attrs.linearunit || '').toLowerCase() : '', du = un ? String(un.attrs.diameterunit || '').toLowerCase() : '';
+  const units = /foot|feet/.test(lu) ? 'ft' : lu.startsWith('millim') ? 'mm' : lu.startsWith('kilom') ? 'km' : 'm', stats = { units };
+  const named = new Map(), cg = [];
+  const pt = (el) => {
+    if (!el) return null;
+    if (el.attrs.pntref !== undefined && named.has(el.attrs.pntref)) return named.get(el.attrs.pntref);
+    const v = numsOf(el.text);
+    return v.length >= 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]) ? [v[1], v[0], v.length > 2 && Number.isFinite(v[2]) ? v[2] : NaN] : null;   // LandXML order is northing, easting, elevation
+  };
+  for (const p of xAll(root, 'cgpoint')) { const q = pt(p); if (q) { cg.push(q); if (p.attrs.name !== undefined) named.set(p.attrs.name, q); } }
+  let spirals = 0, badGeom = 0;
+  const chain = (coordGeom) => {
+    const P = [], push = (q) => { if (!q) { badGeom++; return; } const l = P[P.length - 1]; if (!l || l[0] !== q[0] || l[1] !== q[1]) P.push(q); };
+    for (const el of coordGeom.children) {
+      const a = pt(xKid(el, 'start')), b = pt(xKid(el, 'end'));
+      if (el.name === 'line') { push(a); push(b); }
+      else if (el.name === 'irregularline') { push(a); const pl = xKid(el, 'pntlist3d') || xKid(el, 'pntlist2d'), dim = pl && pl.name === 'pntlist3d' ? 3 : 2, v = pl ? numsOf(pl.text) : []; for (let k = 0; k + dim <= v.length; k += dim) push([v[k + 1], v[k], dim === 3 ? v[k + 2] : NaN]); push(b); }
+      else if (el.name === 'curve') {
+        const c = pt(xKid(el, 'center'));
+        if (!a || !b || !c) { badGeom++; continue; }
+        const r = Math.hypot(a[0] - c[0], a[1] - c[1]), t0 = Math.atan2(a[1] - c[1], a[0] - c[0]), cw = String(el.attrs.rot || '').toLowerCase() === 'cw';
+        let sw = Math.atan2(b[1] - c[1], b[0] - c[0]) - t0;
+        if (cw && sw >= 0) sw -= TAU; else if (!cw && sw <= 0) sw += TAU;
+        const n = Math.max(2, Math.ceil((Math.abs(sw) / TAU) * ARC_N)), za = a[2], zb = b[2];
+        push(a);
+        for (let k = 1; k < n; k++) { const t = t0 + (sw * k) / n; push([c[0] + r * Math.cos(t), c[1] + r * Math.sin(t), za + ((zb - za) * k) / n]); }
+        push(b);
+      } else if (el.name === 'spiral') { spirals++; push(a); push(b); }
+    }
+    return P;
+  };
+  const polys = [];
+  let vcurves = 0, flat = 0;
+  const addPoly = (P, prof, sta0) => {
+    if (P.length < 2 || polys.length > 2e4) return;
+    let x = P.map((q) => q[0]), y = P.map((q) => q[1]), z = P.every((q) => Number.isFinite(q[2])) ? P.map((q) => q[2]) : null;
+    if (prof && prof.length >= 2) {                    // vertical alignment: station -> elevation, vertices added at every PVI
+      const st = [sta0];
+      for (let i = 1; i < x.length; i++) st.push(st[i - 1] + Math.hypot(x[i] - x[i - 1], y[i] - y[i - 1]));
+      const all = [...new Set([...st, ...prof.map((q) => q[0]).filter((s) => s > st[0] && s < st[st.length - 1])])].sort((p, q) => p - q), lerp = (xs, ys, s) => { let k = 1; while (k < xs.length - 1 && xs[k] < s) k++; const t = xs[k] === xs[k - 1] ? 0 : Math.max(0, Math.min(1, (s - xs[k - 1]) / (xs[k] - xs[k - 1]))); return ys[k - 1] + t * (ys[k] - ys[k - 1]); };
+      const ps = prof.map((q) => q[0]), pz = prof.map((q) => q[1]), nx = all.map((s) => lerp(st, x, s)), ny = all.map((s) => lerp(st, y, s));
+      z = all.map((s) => lerp(ps, pz, s)); x = nx; y = ny;
+    }
+    if (!z) flat++;
+    polys.push(z ? { x, y, z, closed: false } : { x, y, closed: false });
+  };
+  for (const al of xAll(root, 'alignment')) {
+    const g = xKid(al, 'coordgeom');
+    if (!g) continue;
+    const pa = xAll(al, 'profalign')[0], ps = xAll(al, 'profsurf')[0];
+    let prof = null;
+    if (pa) { prof = []; for (const el of pa.children) { const v = numsOf(el.text); if (['pvi', 'paracurve', 'circcurve', 'unsymparacurve'].includes(el.name) && v.length >= 2) { prof.push([v[0], v[1]]); if (el.name !== 'pvi') vcurves++; } } }
+    else if (ps) { const pl = xKid(ps, 'pntlist2d'), v = pl ? numsOf(pl.text) : []; prof = []; for (let k = 0; k + 2 <= v.length; k += 2) prof.push([v[k], v[k + 1]]); }
+    if (prof) prof = prof.filter((q) => Number.isFinite(q[0]) && Number.isFinite(q[1])).sort((p, q) => p[0] - q[0]);
+    addPoly(chain(g), prof, Number.isFinite(+al.attrs.stastart) ? +al.attrs.stastart : 0);
+  }
+  for (const pf of xAll(root, 'planfeature')) { const g = xKid(pf, 'coordgeom'); if (g) addPoly(chain(g), null, 0); }
+  // pipe networks
+  const structs = xAll(root, 'struct'), pipes = xAll(root, 'pipe'), dscale = du.startsWith('millim') ? 0.001 : du.startsWith('inch') ? 0.0254 : du.startsWith('centim') ? 0.01 : 1;
+  // surfaces
+  const tri = [];
+  let surfaces = 0;
+  const readSurfaces = () => {
+    for (const sf of xAll(root, 'surface')) {
+      const def = xKid(sf, 'definition');
+      if (!def) continue;
+      const P = new Map();
+      for (const p of xAll(def, 'p')) { const q = pt(p); if (q && p.attrs.id !== undefined && Number.isFinite(q[2])) P.set(p.attrs.id, q); }
+      let n = 0;
+      for (const f of xAll(def, 'f')) {
+        if (f.attrs.i === '1') continue;
+        const ids = f.text.trim().split(/\s+/).map((k) => P.get(k));
+        if (ids.length < 3 || ids.some((q) => !q)) { badGeom++; continue; }
+        for (let k = 1; k + 1 < ids.length; k++) for (const q of [ids[0], ids[k], ids[k + 1]]) tri.push(q[0], q[1], q[2]);
+        n++;
+        if (tri.length > L.triangles * 9) fail(`The LandXML surface has too many triangles (limit ${L.triangles}).`);
+      }
+      if (n) surfaces++;
+    }
+  };
+  const have = { alignment: polys.length > 0, network: pipes.length > 0 && structs.length > 0, surface: xAll(root, 'surface').length > 0, points: cg.length > 0 };
+  const pref = ['alignment', 'network', 'surface', 'points'], want = String(opts.prefer || '').toLowerCase(), pick = have[want] ? want : pref.find((k) => have[k]);
+  if (!pick) fail('The LandXML file holds no alignments, plan features, surfaces, pipe networks or survey points.');
+  const other = pref.filter((k) => k !== pick && have[k]).map((k) => ({ alignment: `${polys.length} alignments / plan features`, network: `a pipe network of ${pipes.length} pipes`, surface: 'a TIN surface', points: `${cg.length} survey points` })[k]);
+  if (other.length) warnings.push(`The file also holds ${other.join(', ')}; only the ${{ alignment: 'alignments and plan features', network: 'pipe network', surface: 'surface', points: 'survey points' }[pick]} are returned (importGeometry option prefer selects another class).`);
+  if (badGeom) warnings.push(`${badGeom} geometry elements with missing or unresolved points were skipped.`);
+  if (units !== 'm') warnings.push(`Coordinates are in ${units === 'ft' ? 'feet' : units}; they are kept as written (stats.units = "${units}").`);
+  if (pick === 'alignment') {
+    if (spirals) warnings.push(`${spirals} spirals were replaced by their chords.`);
+    if (vcurves) warnings.push(`${vcurves} vertical curves were replaced by straight grades between their intersection points.`);
+    if (flat) warnings.push(`${flat} of ${polys.length} lines carry no elevations (no Profile and no 3-D points).`);
+    return polyGeom(polys, { warnings, stats: { ...stats, alignments: polys.length } });
+  }
+  if (pick === 'network') {
+    const nodes = structs.map((s) => { const c = pt(xKid(s, 'center')), z = [s.attrs.elevsump, s.attrs.elevrim].map(Number).find(Number.isFinite); return { id: s.attrs.name ?? s.attrs.id, type: xKid(s, 'inlet') ? 'inlet' : xKid(s, 'outlet') ? 'outlet' : xKid(s, 'connection') ? 'connection' : 'structure', name: s.attrs.desc || s.attrs.name, x: c ? c[0] : null, y: c ? c[1] : null, z: z ?? (c && Number.isFinite(c[2]) ? c[2] : null) }; }).filter((n) => n.id !== undefined);
+    const edges = pipes.map((p) => { const cp = xKid(p, 'circpipe') || xKid(p, 'ellippipe') || xKid(p, 'rectpipe'), d = cp ? +(cp.attrs.diameter ?? cp.attrs.span ?? cp.attrs.width) : NaN, o = { from: p.attrs.refstart, to: p.attrs.refend, name: p.attrs.name, type: 'pipe' }; if (Number.isFinite(+p.attrs.length)) o.length = +p.attrs.length; if (Number.isFinite(d)) o.diameter = d * dscale; return o; });
+    return buildNetwork(nodes, edges, warnings, { stats });
+  }
+  if (pick === 'surface') {
+    readSurfaces();
+    if (!tri.length) fail('The LandXML surfaces hold no usable faces (Pnts + Faces are required).');
+    if (surfaces > 1) warnings.push(`${surfaces} surfaces were merged into one mesh.`);
+    return meshGeom(tri, { warnings, stats: { ...stats, surfaces, surfaceOnly: true } });
+  }
+  const xyz = new Float64Array(cg.length * 3);
+  cg.forEach((q, i) => { xyz[3 * i] = q[0]; xyz[3 * i + 1] = q[1]; xyz[3 * i + 2] = Number.isFinite(q[2]) ? q[2] : 0; });
+  return pointsGeom(xyz, { warnings, stats });
+}
+async function readLandXML(ctx) {
+  const doc = parseXML(await ctx.text());
+  if (doc.children[0].name !== 'landxml') fail('Not a LandXML file (root element LandXML is missing).');
+  return landxmlGeom(doc, ctx.opts);
+}
+
+// ---- Structural decks: Abaqus, ANSYS CDB, LS-DYNA -----------------------------------------------------------------
+/** Eight node ids of a (possibly collapsed) hexahedron -> [cell type, ids] or null. */
+function degenerateSolid(v) {
+  const u = [];
+  for (const q of v) if (!u.includes(q)) u.push(q);
+  if (u.length === 8) return ['hex', v.slice(0, 8)];
+  if (u.length === 4) return ['tet', u];
+  if (u.length === 5 && v[4] === v[5] && v[5] === v[6] && v[6] === v[7]) return ['pyramid', [v[0], v[1], v[2], v[3], v[4]]];
+  if (u.length === 6 && v[2] === v[3] && v[6] === v[7]) return ['wedge', [v[0], v[1], v[2], v[4], v[5], v[6]]];
+  if (u.length === 6 && v[4] === v[5] && v[6] === v[7]) return ['wedge', [v[0], v[1], v[4], v[3], v[2], v[6]]];
+  return null;
+}
+const SOLID_N = { 4: ['tet', 4], 10: ['tet', 4], 8: ['hex', 8], 20: ['hex', 8], 27: ['hex', 8], 6: ['wedge', 6], 15: ['wedge', 6], 18: ['wedge', 6], 5: ['pyramid', 5], 13: ['pyramid', 5] };
+/** Abaqus element type name -> { type, n (corner nodes used), total (nodes listed), mid } or null. */
+function abaqusCell(name) {
+  const t = String(name).toUpperCase();
+  let m = /^(?:DC|AC|Q|EMC)?C3D(\d+)/.exec(t);
+  if (m) { const c = SOLID_N[+m[1]]; return c ? { type: c[0], n: c[1], total: +m[1] } : null; }
+  if ((m = /^(?:SC|CSS)([68])/.exec(t))) return { type: m[1] === '8' ? 'hex' : 'wedge', n: +m[1], total: +m[1] };
+  if ((m = /^(?:STRI|SFM3D|M3D|CPEG|CPS|CPE|CAX|DC2D|DCAX|R3D|DS|S)(\d)/.exec(t))) { const k = +m[1]; return k === 3 || k === 6 ? { type: 'tri', n: 3, total: k } : k === 4 || k === 8 || k === 9 ? { type: 'quad', n: 4, total: k } : null; }
+  if ((m = /^T(\d)D(\d)/.exec(t))) return +m[2] === 3 ? { type: 'line', n: 3, total: 3, mid: true } : { type: 'line', n: 2, total: 2 };
+  if ((m = /^(?:PIPE|ELBOW|B)(\d)(\d)/.exec(t))) return m[2] === '2' ? { type: 'line', n: 3, total: 3, mid: true } : { type: 'line', n: 2, total: 2 };
+  if (/^FRAME[23]D/.test(t)) return { type: 'line', n: 2, total: 2 };
+  return null;
+}
+async function readAbaqus(ctx) {
+  const ls = splitLines(await ctx.text()), coords = [], store = cellStore(), warnings = [], skippedTypes = Object.create(null), notApplied = new Set();
+  let idmap = new Map(), mode = null, cell = null, etype = '', pending = null, parts = 0, instances = 0, includes = 0, bad = 0, sawKeyword = false;
+  const emit = (f) => {
+    if (!cell) { skippedTypes[etype] = (skippedTypes[etype] || 0) + 1; return; }
+    const ids = f.slice(1, 1 + cell.n).map((q) => idmap.get(q));
+    if (ids.length < cell.n || ids.some((q) => q === undefined)) { bad++; return; }
+    if (cell.mid) { store.add('line', [ids[0], ids[1]]); store.add('line', [ids[1], ids[2]]); } else store.add(cell.type, ids);
+  };
+  for (const line of ls) {
+    if (line.startsWith('**')) continue;
+    const t = line.trim();
+    if (!t) continue;
+    if (t[0] === '*') {
+      const kw = t.slice(1).split(',')[0].trim().toUpperCase().replace(/\s+/g, ' ');
+      sawKeyword = true; mode = null; pending = null;
+      if (kw === 'NODE') { mode = 'node'; if (/SYSTEM\s*=\s*[CS]/i.test(t)) notApplied.add('*NODE, SYSTEM'); }
+      else if (kw === 'ELEMENT') { const m = /TYPE\s*=\s*([^,\s]+)/i.exec(t); etype = m ? m[1].toUpperCase() : '?'; cell = abaqusCell(etype); mode = 'elem'; }
+      else if (kw === 'PART') { parts++; idmap = new Map(); }
+      else if (kw === 'INSTANCE') instances++;
+      else if (kw === 'INCLUDE') includes++;
+      else if (['NGEN', 'NFILL', 'NCOPY', 'NMAP', 'ELGEN', 'ELCOPY', 'SYSTEM', 'TRANSFORM'].includes(kw)) notApplied.add('*' + kw);
+      continue;
+    }
+    if (mode === 'node') {
+      const f = t.split(','), id = parseInt(f[0], 10), x = parseFloat(f[1]);
+      if (!Number.isInteger(id) || !Number.isFinite(x)) { bad++; continue; }
+      if (coords.length > 9 * L.cells) fail('The Abaqus deck holds too many nodes.');
+      idmap.set(id, coords.length / 3); coords.push(x, parseFloat(f[2]) || 0, parseFloat(f[3]) || 0);
+    } else if (mode === 'elem') {
+      const f = t.split(',').map((s) => s.trim()).filter((s) => s !== '').map((s) => parseInt(s, 10));
+      pending = pending ? pending.concat(f) : f;
+      if (cell ? pending.length - 1 < cell.total && /,$/.test(t) : /,$/.test(t) && pending.length < 64) continue;
+      emit(pending); pending = null;
+    }
+  }
+  if (pending) emit(pending);
+  if (!coords.length) fail(sawKeyword ? 'No *NODE data were found in the Abaqus input deck.' : 'Not an Abaqus input deck (no keyword lines).');
+  const sk = Object.entries(skippedTypes);
+  if (sk.length) warnings.push(`Elements of unsupported type were ignored: ${sk.slice(0, 8).map(([k, n]) => `${n} × ${k}`).join(', ')}.`);
+  if (bad) warnings.push(`${bad} malformed node or element lines (or elements referring to missing nodes) were skipped.`);
+  if (includes) warnings.push(`${includes} *INCLUDE files are not followed; only the data in this file are read.`);
+  if (notApplied.size) warnings.push(`Not applied: ${[...notApplied].join(', ')} (generated nodes / elements and coordinate transforms are missing).`);
+  if (instances > 1 || (parts > 1 && instances)) warnings.push(`${parts} parts / ${instances} instances: instance translations and rotations of the assembly are not applied, parts are shown in their own coordinates.`);
+  return cellMesh(Float64Array.from(coords), store, { warnings, stats: parts ? { parts } : {} });
+}
+
+const CDB_FACE = new Set([13, 25, 28, 41, 42, 43, 55, 57, 63, 75, 77, 78, 82, 83, 93, 131, 132, 157, 163, 181, 182, 183, 208, 209, 223, 230, 233, 281]);
+const CDB_SOLID = new Set([5, 45, 62, 64, 65, 69, 70, 87, 90, 92, 95, 96, 97, 98, 117, 122, 123, 164, 168, 185, 186, 187, 190, 226, 227, 231, 232, 236, 237, 278, 279, 285, 291]);
+const CDB_LINE = new Set([1, 3, 4, 8, 10, 11, 12, 16, 17, 18, 20, 23, 24, 33, 44, 59, 180, 188, 189, 288, 289, 290]);
+async function readCDB(ctx) {
+  const ls = splitLines(await ctx.text()), et = new Map(), idmap = new Map(), coords = [], raw = [], warnings = [];
+  let i = 0, unblocked = 0, oldBlocks = 0;
+  const ints = (r, w) => { const out = []; for (let o = 0; o + 1 <= r.length; o += w) { const s = r.slice(o, o + w).trim(); if (s === '') break; out.push(parseInt(s, 10)); } return out; };
+  while (i < ls.length) {
+    const u = ls[i].trim().toUpperCase();
+    if (/^ET\s*,/.test(u)) { const f = u.split(','), m = /(\d+)\s*$/.exec(f[2] || ''); if (m) et.set(parseInt(f[1], 10), +m[1]); i++; }
+    else if (u.startsWith('NBLOCK')) {
+      const fm = /\(\s*(\d+)i(\d+)\s*,\s*(\d+)e(\d+)/i.exec(ls[i + 1] || '');
+      if (!fm) fail('The NBLOCK format line of the CDB file is missing or unusual.');
+      const ni = +fm[1], wi = +fm[2], wr = +fm[4], o = ni * wi;
+      for (i += 2; i < ls.length; i++) {
+        const r = ls[i];
+        if (/^\s*-1\s*$/.test(r) || /^[A-Za-z*/!]/.test(r.trim())) break;
+        const id = parseInt(r.slice(0, wi), 10);
+        if (!(id > 0)) continue;
+        if (coords.length > 9 * L.cells) fail('The CDB file holds too many nodes.');
+        idmap.set(id, coords.length / 3); coords.push(parseFloat(r.slice(o, o + wr)) || 0, parseFloat(r.slice(o + wr, o + 2 * wr)) || 0, parseFloat(r.slice(o + 2 * wr, o + 3 * wr)) || 0);
+      }
+    } else if (u.startsWith('EBLOCK')) {
+      const solid = /,\s*SOLID/.test(u), fm = /\(\s*(\d+)i(\d+)/i.exec(ls[i + 1] || '');
+      if (!fm) fail('The EBLOCK format line of the CDB file is missing or unusual.');
+      const w = +fm[2];
+      if (!solid) oldBlocks++;
+      for (i += 2; i < ls.length; i++) {
+        const r = ls[i];
+        if (/^\s*-1\s*$/.test(r) || /^[A-Za-z*/!]/.test(r.trim())) break;
+        if (!solid) continue;
+        const f = ints(r, w);
+        if (f.length < 12) continue;
+        const nn = f[8], nodes = f.slice(11);
+        if (!(nn > 0 && nn <= 64)) continue;
+        while (nodes.length < nn && i + 1 < ls.length && !/^\s*-1\s*$/.test(ls[i + 1])) nodes.push(...ints(ls[++i], w));
+        nodes.length = Math.min(nodes.length, nn);
+        raw.push([f[1], nodes]);
+        if (raw.length > L.cells) fail(`Mesh has too many cells (limit ${L.cells / 1e6} million).`);
+      }
+    } else { if (/^(N|EN|E)\s*,\s*\d/.test(u)) unblocked++; i++; }
+  }
+  if (!coords.length) fail(unblocked ? 'The CDB file uses unblocked N / EN commands. ' + fmtNamed('ANSYS CDB archive').convert : 'No NBLOCK node data were found: not an ANSYS CDB archive.');
+  const store = cellStore(), xyz = Float64Array.from(coords);
+  let skipped = 0, guessed = 0, missing = 0;
+  for (const [type, nodes] of raw) {
+    const en = et.get(type), nn = nodes.length, ids = nodes.map((q) => idmap.get(q)), ok = (k) => ids.slice(0, k).every((q) => q !== undefined);
+    let kind = CDB_SOLID.has(en) ? 'solid' : CDB_FACE.has(en) ? 'face' : CDB_LINE.has(en) ? 'line' : null;
+    if (!kind) {
+      guessed++;
+      if (nn <= 3) kind = 'line';
+      else if (nn === 4 && ok(4)) { const P = ids.map((q) => [xyz[3 * q], xyz[3 * q + 1], xyz[3 * q + 2]]), vol = Math.abs(dot(cross(sub(P[1], P[0]), sub(P[2], P[0])), sub(P[3], P[0]))), sc = vlen(sub(P[1], P[0])) * vlen(sub(P[2], P[0])) * vlen(sub(P[3], P[0])); kind = vol > 1e-6 * sc ? 'solid' : 'face'; }
+      else kind = 'solid';
+    }
+    if (kind === 'line') { if (nn >= 2 && ok(2)) store.add('line', [ids[0], ids[1]]); else missing++; }
+    else if (kind === 'face') {
+      const k = nn === 6 || nn === 3 ? 3 : 4;
+      if (nn < 3 || !ok(k)) { missing++; continue; }
+      if (k === 3 || ids[2] === ids[3]) store.add('tri', ids.slice(0, 3)); else store.add('quad', ids.slice(0, 4));
+    } else if (nn === 4 || nn === 10) { if (ok(4)) store.add('tet', ids.slice(0, 4)); else missing++; }
+    else if (nn >= 8) { const c = ok(8) ? degenerateSolid(ids.slice(0, 8)) : null; if (c) store.add(c[0], c[1]); else if (ok(8)) skipped++; else missing++; }
+    else if (nn === 6 && ok(6)) store.add('wedge', ids); else if (nn === 5 && ok(5)) store.add('pyramid', ids); else skipped++;
+  }
+  if (oldBlocks) warnings.push(`${oldBlocks} EBLOCK sections without the SOLID key use a different layout and were not read.`);
+  if (unblocked) warnings.push(`${unblocked} unblocked N / EN / E commands were ignored.`);
+  if (guessed) warnings.push(`${guessed} elements have no recognised ET type; they were classified by node count and shape.`);
+  if (skipped) warnings.push(`${skipped} elements of unsupported shape were ignored.`);
+  if (missing) warnings.push(`${missing} elements refer to nodes that are not in NBLOCK and were skipped.`);
+  return cellMesh(xyz, store, { warnings });
+}
+
+async function readDyna(ctx) {
+  const ls = splitLines(await ctx.text()), idmap = new Map(), coords = [], raw = [], warnings = [], other = Object.create(null);
+  let mode = null, longAll = false, long = false, twoCard = null, includes = 0, transforms = 0, sawKeyword = false, optCards = 0;
+  const cut = (l, widths) => { if (l.includes(',')) return l.split(',').map((s) => s.trim()); const out = []; let o = 0; for (const w of widths) { if (o >= l.length) break; out.push(l.slice(o, o + w).trim()); o += w; } return out; };
+  const intsOf8 = (l) => { const w = long ? 20 : 8, f = l.includes(',') ? l.split(',').map((s) => s.trim()) : cut(l, new Array(Math.ceil(l.length / w)).fill(w)); while (f.length && f[f.length - 1] === '') f.pop(); return f.map((s) => (s === '' ? 0 : parseInt(s, 10))); };
+  for (const l of ls) {
+    if (l[0] === '$' || !l.trim()) continue;
+    if (l[0] === '*') {
+      const kw = l.trim().toUpperCase(), name = kw.split(/\s+/)[0];
+      sawKeyword = true; twoCard = null;
+      if (name === '*KEYWORD') { longAll = /LONG\s*=\s*Y/.test(kw); mode = null; continue; }
+      long = /\s\+\s*$/.test(kw) ? true : /\s-\s*$/.test(kw) ? false : longAll;
+      if (name === '*END') break;
+      if (name === '*NODE' || name === '*NODE_MERGE') mode = 'node';
+      else if (name.startsWith('*ELEMENT_SHELL')) mode = 'shell';
+      else if (name.startsWith('*ELEMENT_SOLID')) mode = 'solid';
+      else if (name.startsWith('*ELEMENT_TSHELL')) mode = 'tshell';
+      else if (name.startsWith('*ELEMENT_BEAM')) mode = 'beam';
+      else { mode = null; if (name.startsWith('*ELEMENT_')) other[name] = 1; if (name.startsWith('*INCLUDE')) includes++; if (name === '*NODE_TRANSFORM' || name.startsWith('*DEFINE_TRANSFORMATION')) transforms++; }
+      continue;
+    }
+    if (!mode) continue;
+    if (mode === 'node') {
+      const f = cut(l, long ? [20, 20, 20, 20] : [8, 16, 16, 16]), id = parseInt(f[0], 10), x = parseFloat(f[1]);
+      if (!Number.isInteger(id) || !Number.isFinite(x)) continue;
+      if (coords.length > 9 * L.cells) fail('The LS-DYNA deck holds too many nodes.');
+      idmap.set(id, coords.length / 3); coords.push(x, parseFloat(f[2]) || 0, parseFloat(f[3]) || 0);
+      continue;
+    }
+    if (/[.eE]/.test(l) && !twoCard) { optCards++; continue; }      // thickness / beta / ortho option cards hold reals
+    const f = intsOf8(l);
+    if (f.some((v) => !Number.isInteger(v))) continue;
+    if (mode === 'solid') {
+      if (twoCard) { raw.push(['solid', f.slice(0, 10)]); twoCard = null; }
+      else if (f.length <= 2) twoCard = f;
+      else raw.push(['solid', f.slice(2, 12)]);
+    } else if (f.length >= 4) raw.push([mode, f.slice(2, 10)]);
+    if (raw.length > L.cells) fail(`Mesh has too many cells (limit ${L.cells / 1e6} million).`);
+  }
+  if (!coords.length) fail(sawKeyword ? 'No *NODE data were found in the LS-DYNA keyword deck.' : 'Not an LS-DYNA keyword deck (no keyword lines).');
+  const store = cellStore();
+  let skipped = 0, missing = 0;
+  for (const [kind, nodes] of raw) {
+    const ids = nodes.map((q) => (q > 0 ? idmap.get(q) : -1));
+    if (ids.some((q) => q === undefined)) { missing++; continue; }
+    if (kind === 'beam') { if (ids[0] >= 0 && ids[1] >= 0) store.add('line', [ids[0], ids[1]]); else skipped++; }
+    else if (kind === 'shell') { if (ids.length < 3 || ids[0] < 0 || ids[1] < 0 || ids[2] < 0) skipped++; else if (ids[3] === undefined || ids[3] < 0 || ids[3] === ids[2]) store.add('tri', ids.slice(0, 3)); else store.add('quad', ids.slice(0, 4)); }
+    else {
+      if (ids.length >= 10 && ids[8] >= 0 && ids[9] >= 0) { store.add('tet', ids.slice(0, 4)); continue; }
+      const v = ids.slice(0, 8).filter((q) => q >= 0);
+      if (v.length === 4) { store.add('tet', v); continue; }
+      while (v.length && v.length < 8) v.push(v[v.length - 1]);
+      const c = v.length === 8 ? degenerateSolid(v) : null;
+      if (c) store.add(c[0], c[1]); else skipped++;
+    }
+  }
+  const ot = Object.keys(other);
+  if (ot.length) warnings.push(`Element keywords that are not read: ${ot.slice(0, 8).join(', ')}.`);
+  if (optCards) warnings.push(`${optCards} element option cards (thickness, beta, orientation) were skipped.`);
+  if (skipped) warnings.push(`${skipped} elements of unsupported shape were ignored.`);
+  if (missing) warnings.push(`${missing} elements refer to nodes that are not defined in this file and were skipped.`);
+  if (includes) warnings.push(`${includes} *INCLUDE keywords are not followed; only the data in this file are read.`);
+  if (transforms) warnings.push('*NODE_TRANSFORM / *DEFINE_TRANSFORMATION are not applied.');
+  return cellMesh(Float64Array.from(coords), store, { warnings });
+}
+
+// ---- SEG-Y --------------------------------------------------------------------------------------------------------
+const EBCDIC = (() => { const t = new Array(256).fill(' '), put = (o, s) => { for (let k = 0; k < s.length; k++) t[o + k] = s[k]; }; put(0x81, 'abcdefghi'); put(0x91, 'jklmnopqr'); put(0xa2, 'stuvwxyz'); put(0xc1, 'ABCDEFGHI'); put(0xd1, 'JKLMNOPQR'); put(0xe2, 'STUVWXYZ'); put(0xf0, '0123456789'); for (const [o, c] of [[0x4b, '.'], [0x4c, '<'], [0x4d, '('], [0x4e, '+'], [0x50, '&'], [0x5b, '$'], [0x5c, '*'], [0x5d, ')'], [0x5e, ';'], [0x60, '-'], [0x61, '/'], [0x6b, ','], [0x6c, '%'], [0x6d, '_'], [0x6e, '>'], [0x6f, '?'], [0x7a, ':'], [0x7b, '#'], [0x7c, '@'], [0x7d, "'"], [0x7e, '='], [0x7f, '"']]) t[o] = c; return t; })();
+const SEGY_BPS = { 1: 4, 2: 4, 3: 2, 5: 4, 6: 8, 8: 1, 9: 8, 10: 4, 11: 2, 12: 8, 16: 1 };
+const SEGY_FMT = { 1: 'IBM float', 2: 'int32', 3: 'int16', 5: 'IEEE float32', 6: 'IEEE float64', 8: 'int8', 9: 'int64', 10: 'uint32', 11: 'uint16', 12: 'uint64', 16: 'uint8' };
+async function readSEGY(ctx) {
+  const u8 = await ctx.bytes(), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), warnings = [];
+  if (u8.length < 3600 + 240) fail('Not a SEG-Y file (shorter than its 3600-byte file header plus one trace header).');
+  let hi = 0;
+  for (let k = 0; k < 3200; k++) if (u8[k] >= 0x80 || u8[k] === 0x40) hi++;
+  const ebcdic = hi > 1600, head = ebcdic ? Array.from(u8.subarray(0, 3200), (b) => EBCDIC[b]).join('') : latin1.decode(u8.subarray(0, 3200)).replace(/[^\x20-\x7e]/g, ' ');
+  let be = true;
+  if (!SEGY_BPS[dv.getUint16(3224, false)]) { if (SEGY_BPS[dv.getUint16(3224, true)]) be = false; else fail('Not a SEG-Y file (the binary header holds no valid sample format code).'); }
+  const u16 = (o) => dv.getUint16(o, !be), i16 = (o) => dv.getInt16(o, !be), i32 = (o) => dv.getInt32(o, !be);
+  const fmt = u16(3224), bps = SEGY_BPS[fmt], dtUs = u16(3216), nsBin = u16(3220), ext = i16(3504), extraTH = u8.length >= 3508 ? i16(3506) : 0;
+  if (extraTH > 0 && extraTH < 100 && (u8[3500] === 2 || u8[3501] === 2)) fail('SEG-Y revision 2 files with additional trace-header blocks are not read. ' + fmtNamed('SEG-Y seismic').convert);
+  if (ext < 0 || ext > 100) warnings.push('The number of extended textual headers is not fixed; none are assumed.');
+  let off = 3600 + (ext > 0 && ext <= 100 ? ext * 3200 : 0), nTr = 0, samples = 0, cut = false, capped = false;
+  const pos = [], wd = [], tr = [];
+  let nzC = 0, nzS = 0, arcsec = false, degUnits = false;
+  while (off + 240 <= u8.length) {
+    const ns = u16(off + 114) || nsBin, size = 240 + ns * bps;
+    if (!ns) fail('The SEG-Y file declares no samples per trace.');
+    if (off + size > u8.length) { cut = true; break; }
+    if (nTr >= L.points) { capped = true; break; }
+    const sc = i16(off + 70), k = sc > 0 ? sc : sc < 0 ? -1 / sc : 1, es = i16(off + 68), ke = es > 0 ? es : es < 0 ? -1 / es : 1, cu = i16(off + 88);
+    const sx = i32(off + 72) * k, sy = i32(off + 76) * k, cx = i32(off + 180) * k, cy = i32(off + 184) * k;
+    if (cx || cy) nzC++; if (sx || sy) nzS++;
+    if (cu === 2) arcsec = true; else if (cu === 3) degUnits = true;
+    pos.push(sx, sy, cx, cy); wd.push(i32(off + 60) * ke); tr.push(off, ns, i16(off + 108), u16(off + 116) || dtUs);
+    samples += ns; nTr++; off += size;
+  }
+  if (!nTr) fail('The SEG-Y file holds no complete trace.');
+  if (cut) warnings.push(`The file ends inside trace ${nTr + 1}; ${nTr} complete traces were read.`);
+  if (capped) warnings.push(`Only the first ${nTr} traces were read.`);
+  const useC = nzC >= nzS && nzC > 0, o = useC ? 2 : 0, sA = arcsec ? 1 / 3600 : 1, xyz = new Float64Array(nTr * 3), hasWD = wd.some((v) => v !== 0), located = nzC > 0 || nzS > 0;
+  for (let t = 0; t < nTr; t++) { xyz[3 * t] = located ? pos[4 * t + o] * sA : t; xyz[3 * t + 1] = located ? pos[4 * t + o + 1] * sA : 0; xyz[3 * t + 2] = hasWD ? -Math.abs(wd[t]) : 0; }
+  if (!located) warnings.push('The trace headers carry no source or CDP coordinates; traces are placed by their index along x.');
+  else warnings.push(`Trace positions taken from the ${useC ? 'CDP (bytes 181-188)' : 'source (bytes 73-80)'} coordinates with the coordinate scalar applied${arcsec ? ', converted from arc-seconds to degrees' : ''}.`);
+  const stats = { traces: nTr, samplesPerTrace: nsBin || tr[1], sampleInterval: dtUs / 1e6, sampleFormat: SEGY_FMT[fmt], textHeader: ebcdic ? 'EBCDIC' : 'ASCII', byteOrder: be ? 'big-endian' : 'little-endian' };
+  let seabed = null;
+  if ((fmt === 1 || fmt === 5) && samples <= 2e7 && dtUs > 0) {
+    const ibm = (q) => { const b = dv.getUint32(q, !be), f = b & 0xffffff; return f ? (b >>> 31 ? -1 : 1) * (f / 16777216) * 16 ** (((b >>> 24) & 0x7f) - 64) : 0; }, val = fmt === 1 ? ibm : (q) => dv.getFloat32(q, !be);
+    const twt = new Array(nTr), dist = [0];
+    let picked = 0;
+    for (let t = 0; t < nTr; t++) {
+      const p = tr[4 * t] + 240, ns = tr[4 * t + 1];
+      let peak = 0, first = -1;
+      for (let s = 0; s < ns; s++) { const a = Math.abs(val(p + 4 * s)); if (a > peak && Number.isFinite(a)) peak = a; }
+      if (peak > 0) for (let s = 0; s < ns; s++) if (Math.abs(val(p + 4 * s)) >= 0.5 * peak) { first = s; break; }
+      twt[t] = first >= 0 ? Math.max(0, tr[4 * t + 2]) / 1000 + (first * tr[4 * t + 3]) / 1e6 : NaN;
+      if (first >= 0) picked++;
+      if (t) dist.push(dist[t - 1] + (arcsec || degUnits ? Math.hypot((xyz[3 * t] - xyz[3 * t - 3]) * 111320 * Math.cos((xyz[3 * t + 1] * Math.PI) / 180), (xyz[3 * t + 1] - xyz[3 * t - 2]) * 110540) : Math.hypot(xyz[3 * t] - xyz[3 * t - 3], xyz[3 * t + 1] - xyz[3 * t - 2])));
+    }
+    if (picked) {
+      seabed = { distance: dist, twt, depth: twt.map((v) => (v * 1500) / 2) };
+      stats.seabedPicked = picked;
+      warnings.push(`Seabed ESTIMATE: the first sample reaching half of each trace's peak amplitude was taken as the seabed two-way time and converted with 1500 m/s (${picked} of ${nTr} traces). It is not an interpreted horizon: direct arrivals, noise and processing mutes shift it.`);
+      if (!hasWD) { for (let t = 0; t < nTr; t++) xyz[3 * t + 2] = Number.isFinite(twt[t]) ? -seabed.depth[t] : 0; warnings.push('The trace headers hold no water depth, so the z of each trace position is that estimate.'); }
+    }
+  } else warnings.push(fmt === 1 || fmt === 5 ? 'The file is too large for the seabed estimate; only trace positions are returned.' : `Sample format ${SEGY_FMT[fmt]} is not decoded; only trace positions are returned.`);
+  const g = pointsGeom(xyz, { warnings, stats });
+  g.textHeader = head.match(/.{1,80}/g).map((s) => s.trimEnd()).filter(Boolean).slice(0, 40).join('\n');
+  if (seabed && g.count === nTr) g.seabed = seabed;
+  if (arcsec || degUnits) g.geographic = true;
+  return g;
+}
+
+// ---- MATLAB Level 5 MAT-file ----------------------------------------------------------------------------------------
+const MAT_DT = { 1: 'i1', 2: 'u1', 3: 'i2', 4: 'u2', 5: 'i4', 6: 'u4', 7: 'f4', 9: 'f8', 12: 'i8', 13: 'u8' };
+const MAT_CLASS = { 1: 'cell', 2: 'struct', 3: 'object', 4: 'char', 5: 'sparse', 16: 'function handle', 17: 'opaque' };
+async function readMAT(ctx) {
+  const u8 = await ctx.bytes(), head = latin1.decode(u8.subarray(0, Math.min(116, u8.length))), how = fmtNamed('MATLAB MAT-file').convert, opts = ctx.opts, warnings = [];
+  if (/^MATLAB 7\.3 MAT-file/.test(head) || (u8.length > 520 && u8[512] === 0x89 && u8[513] === 0x48 && u8[514] === 0x44 && u8[515] === 0x46)) fail('MATLAB v7.3 MAT-files are HDF5 containers and are not read. ' + how);
+  if (u8.length < 136 || !/^MATLAB 5\.0 MAT-file/.test(head)) fail('Not a Level 5 MAT-file (version 4 files and other data are not read). ' + how);
+  const little = u8[126] === 0x49 && u8[127] === 0x4d;
+  if (!little && !(u8[126] === 0x4d && u8[127] === 0x49)) fail('The MAT-file header has no valid byte-order mark.');
+  const vars = [], skipped = [];
+  let budget = L.inflated, count = 0;
+  const element = (b, p) => {
+    if (p + 8 > b.length) return null;
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), w = dv.getUint32(p, little);
+    if (w >>> 16) { const n = w >>> 16; if (n > 4) fail('The MAT-file is corrupt (bad small data element).'); return { type: w & 0xffff, data: b.subarray(p + 4, p + 4 + n), next: p + 8 }; }
+    const n = dv.getUint32(p + 4, little);
+    if (p + 8 + n > b.length) fail('The MAT-file is truncated.');
+    return { type: w, data: b.subarray(p + 8, p + 8 + n), next: p + 8 + n + (w === 15 ? 0 : (8 - (n % 8)) % 8) };
+  };
+  const matrix = (b) => {
+    const fl = element(b, 0), dm = fl && element(b, fl.next), nm = dm && element(b, dm.next), pr = nm && element(b, nm.next);
+    if (!fl || !dm || !nm || fl.data.length < 8) return;
+    const flags = new DataView(fl.data.buffer, fl.data.byteOffset, 8).getUint32(0, little), cls = flags & 0xff, name = latin1.decode(nm.data).replace(/\0.*$/, '') || `var${vars.length + skipped.length + 1}`;
+    const dims = Array.from(typed(dm.data, 0, Math.floor(dm.data.length / 4), 'i4', little));
+    if (cls < 6 || cls > 15) { skipped.push(`${name} (${MAT_CLASS[cls] || 'class ' + cls})`); return; }
+    const n = dims.reduce((a, k) => a * k, 1), dt = pr && MAT_DT[pr.type];
+    if (!dt || !(n > 0) || dims.some((k) => !(k >= 0))) { skipped.push(`${name} (empty or unsupported storage)`); return; }
+    if (n > L.voxels) fail(`Array "${name}" is too large.`);
+    vars.push({ name, dims, count: n, data: typed(pr.data, 0, n, dt, little), complex: !!(flags & 0x0800), logical: !!(flags & 0x0200) });
+  };
+  for (let p = 128; p + 8 <= u8.length && count < 4096 && vars.length < 256; count++) {
+    const el = element(u8, p);
+    if (!el) break;
+    p = el.next;
+    if (el.type === 15) { const inf = await inflate(el.data, 'deflate', budget); budget -= inf.length; if (budget <= 0) fail('Decompressed data is too large.'); const inner = element(inf, 0); if (inner && inner.type === 14) matrix(inner.data); }
+    else if (el.type === 14) matrix(el.data);
+  }
+  if (!vars.length) fail(`The MAT-file holds no numeric arrays${skipped.length ? ` (skipped: ${skipped.slice(0, 6).join(', ')})` : ''}.`);
+  if (skipped.length) warnings.push(`Variables that are not plain numeric arrays were skipped: ${skipped.slice(0, 8).join(', ')}.`);
+  if (vars.some((v) => v.complex)) warnings.push('Imaginary parts of complex arrays are ignored.');
+  const isVec = (v) => v.dims.length === 2 && (v.dims[0] === 1 || v.dims[1] === 1) && v.count > 1, byLen = new Map();
+  for (const v of vars) if (isVec(v)) { const l = byLen.get(v.count); if (l) l.push(v); else byLen.set(v.count, [v]); }
+  const groups = [...byLen.values()].filter((l) => l.length > 1).sort((a, b) => b.length * b[0].count - a.length * a[0].count), want = opts.variable !== undefined ? vars.find((v) => v.name === String(opts.variable)) : null, big = vars.slice().sort((a, b) => b.count - a.count)[0];
+  if (opts.variable !== undefined && !want) fail(`The MAT-file has no numeric variable "${String(opts.variable).slice(0, 60)}" (it holds ${vars.slice(0, 12).map((v) => v.name).join(', ')}).`);
+  const stats = { variables: vars.map((v) => v.name).slice(0, 40) };
+  const table = (headers, col, n) => {
+    const records = [];
+    for (let r = 0; r < Math.min(n, L.rows); r++) records.push(Object.fromEntries(headers.map((h, c) => [h, col(r, c)])));
+    if (n > L.rows) warnings.push(`Only the first ${L.rows} of ${n} rows are kept.`);
+    const tc = tableColumns(headers);
+    if (tc.role === 'survey') return surveyFromRecords(headers, records, tc, warnings);
+    return { kind: 'table', headers, records, warnings, stats: { ...stats, rows: n, ...(tc.role ? { role: tc.role } : {}) } };
+  };
+  let g;
+  if (!want && groups.length && groups[0].length * groups[0][0].count >= big.count) {
+    const grp = groups[0].slice(0, 64);
+    warnings.push(`${grp.length} vectors of length ${grp[0].count} were combined into one table (columns ${grp.map((v) => v.name).join(', ')}).`);
+    g = table(grp.map((v) => v.name), (r, c) => grp[c].data[r], grp[0].count);
+  } else {
+    const v = want || big, d = v.dims.slice();
+    while (d.length > 2 && d[d.length - 1] === 1) d.pop();
+    if (vars.length > 1) warnings.push(`The file holds ${vars.length} numeric variables; "${v.name}" (${v.dims.join(' × ')}) is used${want ? '' : ' because it is the largest'}.`);
+    stats.variable = v.name; stats.shape = v.dims;
+    if (d.length === 3) g = npyGeom({ shape: d, fortran: true, data: v.data, dtype: 'MATLAB' }, opts);
+    else if (d.length !== 2) fail(`MATLAB arrays with ${d.length} dimensions are not supported (use vectors, matrices or 3-D arrays).`);
+    else {
+      const [nr, nc] = d;
+      if (nr === 1 || nc === 1) g = table([v.name], (r) => v.data[r], v.count);
+      else if (nc <= 16 && nr > nc) g = table(Array.from({ length: nc }, (_, c) => `${v.name}_${c + 1}`), (r, c) => v.data[c * nr + r], nr);
+      else if (nr <= 4 && nc > 4 * nr) { warnings.push(`Matrix "${v.name}" of ${nr} × ${nc} is read with its rows as table columns.`); g = table(Array.from({ length: nr }, (_, c) => `${v.name}_${c + 1}`), (r, c) => v.data[r * nr + c], nc); }
+      else { const rm = new Float64Array(nr * nc); for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) rm[r * nc + c] = v.data[c * nr + r]; warnings.push(`Matrix "${v.name}" of ${nr} × ${nc} read as a regular array (row 1 at y = 0, column 1 at x = 0).`); g = imageGeom(rm, nc, nr, 1, opts.spacing || [1, 1, 1], [0, 0, 0], opts, {}); }
+    }
+  }
+  g.stats = { ...stats, ...(g.stats || {}) };
+  g.warnings = [...new Set([...warnings, ...(g.warnings || [])])];
+  return g;
+}
+
+// ---- DEM / DTM / DSM text elevation models ---------------------------------------------------------------------------
+/** USGS ASCII DEM (1024-byte record A, then one profile record per column) -> grid, or null when the header does not fit. */
+function usgsDEM(text, warnings) {
+  if (text.length < 1100) return null;
+  const A = text.slice(0, 1024), num = (s) => +s.trim().replace(/[dD]/, 'e'), int = (a, b) => parseInt(A.slice(a, b), 10);
+  const guni = int(528, 534), euni = int(534, 540), ncols = int(858, 864), res = [num(A.slice(816, 828)), num(A.slice(828, 840)), num(A.slice(840, 852))];
+  if (!(ncols > 0 && ncols <= 20000) || !(res[0] > 0 && res[1] > 0) || ![0, 1, 2, 3].includes(guni) || ![1, 2].includes(euni)) return null;
+  const re = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[dDeE][-+]?\d+)?/g, zres = res[2] > 0 ? res[2] : 1, hs = guni === 3 ? 1 / 3600 : guni === 1 ? 0.3048 : guni === 0 ? 180 / Math.PI : 1, zs = euni === 1 ? 0.3048 : 1;
+  re.lastIndex = 1024;
+  const next = () => { const m = re.exec(text); return m ? +m[0].replace(/[dD]/, 'e') : NaN; }, profs = [];
+  let total = 0;
+  for (let p = 0; p < ncols; p++) {
+    next(); const col = next(), m = next(), n = next(), x0 = next(), y0 = next(), datum = next();
+    next(); next();
+    if (!(m > 0 && m <= 1e5 && n === 1) || !Number.isFinite(col) || !Number.isFinite(datum)) break;
+    total += m;
+    if (total > L.voxels) fail('The DEM is too large.');
+    const z = new Float64Array(m);
+    for (let k = 0; k < m; k++) { const v = next(); z[k] = v === -32767 || v === -32768 || v !== v ? NaN : (datum + v * zres) * zs; }
+    profs.push({ x: x0 * hs, y: y0 * hs, z });
+  }
+  if (!profs.length) return null;
+  if (profs.length < ncols) warnings.push(`The DEM header declares ${ncols} profiles but ${profs.length} could be read; the file appears truncated.`);
+  profs.sort((a, b) => a.x - b.x);
+  const dy = res[1] * hs, y0 = Math.min(...profs.map((q) => q.y)), ny = Math.round(Math.max(...profs.map((q) => q.y + (q.z.length - 1) * dy - y0)) / dy) + 1, nx = profs.length;
+  if (!(ny > 0) || nx * ny > L.voxels) fail('The DEM is too large.');
+  const zf = new Float64Array(nx * ny).fill(NaN);
+  profs.forEach((q, i) => { const j0 = Math.round((q.y - y0) / dy); for (let k = 0; k < q.z.length; k++) if (j0 + k >= 0 && j0 + k < ny) zf[(j0 + k) * nx + i] = q.z[k]; });
+  if (euni === 1) warnings.push('Elevations converted from feet to metres.');
+  if (guni === 1) warnings.push('Ground coordinates converted from feet to metres.');
+  return gridGeom(zf, nx, ny, (i) => profs[i].x, (j) => y0 + j * dy, { nodata: (v) => v !== v, geographic: guni === 3 || guni === 0, warnings, stats: { cellsize: [res[0] * hs, dy], demFormat: 'USGS ASCII DEM' } });
+}
+async function readDEM(ctx) {
+  const u8 = await ctx.bytes(), n = Math.min(u8.length, 2048), how = fmtNamed('DEM / DTM / DSM elevation model').convert;
+  let odd = 0;
+  for (let k = 0; k < n; k++) if ((u8[k] < 9 || (u8[k] > 13 && u8[k] < 32) || u8[k] > 126)) odd++;
+  if (odd > 0.02 * n) fail('This elevation model is a binary file, which is not read. ' + how);
+  const text = await ctx.text(), warnings = [];
+  if (/^\s*ncols\s/i.test(text.slice(0, 200))) return Object.assign(readASCGrid(text), { format: 'ESRI ASCII grid' });
+  const us = usgsDEM(text, warnings);
+  if (us) return us;
+  let g = null;
+  try { g = await readDelimited(ctx); } catch (e) { if (!(e && e.user)) throw e; }
+  if (!g || (g.kind !== 'grid' && g.kind !== 'points')) fail('The elevation model is neither an ESRI ASCII grid, a USGS ASCII DEM nor rows of x y z. ' + how);
+  return Object.assign(g, { pathway: 'gis' });
+}
+
+async function readIFCZIP(ctx) {
+  const u8 = await ctx.bytes();
+  if (!isZip(u8)) return readIFC(ctx);
+  const f = await unzipFiles(await ctx.buf(), (n) => /\.(ifc|ifcxml)$/i.test(n)), ifc = [...f.keys()].find((n) => /\.ifc$/i.test(n));
+  if (!ifc) fail(f.size ? 'The IFCZIP archive holds ifcXML only, which is not read. ' + fmtNamed('IFCZIP').convert : 'No .ifc file was found inside the IFCZIP archive.');
+  const text = utf8.decode(f.get(ifc));
+  return readIFC({ ...ctx, text: async () => text });
 }
 
 // ---- Dispatch ------------------------------------------------------------------------------------------
@@ -3384,6 +4154,8 @@ const READERS = {
   xyz: async (ctx) => { const h = await sniffHead(ctx, 400), l1 = (splitLines(h).find((l) => l.trim()) || '').trim().split(/\s+/); if (l1.length <= 3 && l1.every((t) => /^\d+$/.test(t))) { const b = plot3dBlocks(numsOf(await ctx.text())); if (b) return Object.assign(structuredGeom(b, {}), { format: 'Plot3D grid (ASCII)' }); return readPoints(ctx, (await ctx.text()).replace(/^\s*\d+\s*(\r\n|\n|\r)/, '')); } return readDelimited(ctx); },
   png: readImage, jpg: readImage, jpeg: readImage, bmp: readImage, webp: readImage, gif: readImage,
   raw: readRAW, vol: readRAW, bin: readRAW, nrrd: readNRRD, nhdr: readNRRD, mha: readMHA, mhd: readMHA, nii: readNIfTI, 'nii.gz': readNIfTI, npy: readNPY, npz: readNPY, dcm: readDICOM, dicom: readDICOM,
+  graphml: async (ctx) => graphmlGeom(parseXML(await ctx.text())), landxml: readLandXML, inp: readAbaqus, cdb: readCDB, k: readDyna, key: readDyna, dyn: readDyna,
+  dev: readSurvey, wbt: readSurvey, survey: readSurvey, sgy: readSEGY, segy: readSEGY, mat: readMAT, dem: readDEM, dtm: readDEM, dsm: readDEM, ifczip: readIFCZIP,
   pcf: readPCF, ifc: readIFC, aml: async (ctx) => amlGeom(parseXML(await ctx.text())), yaml: readYAML, yml: readYAML, xml: readXML, csv: readDelimited, tsv: readDelimited, txt: readDelimited,
 };
 
@@ -3733,7 +4505,7 @@ export function dimensions(g) {
     let area = 0, len = 0, allClosed = g.polylines.length > 0;
     for (const p of g.polylines) {
       const n = p.x.length;
-      for (let i = 0; i + 1 < n; i++) len += Math.hypot(p.x[i + 1] - p.x[i], p.y[i + 1] - p.y[i]);
+      for (let i = 0; i + 1 < n; i++) len += Math.hypot(p.x[i + 1] - p.x[i], p.y[i + 1] - p.y[i], p.z ? p.z[i + 1] - p.z[i] : 0);
       if (p.closed && n > 2) { len += Math.hypot(p.x[0] - p.x[n - 1], p.y[0] - p.y[n - 1]); let s = 0; for (let i = 0; i < n; i++) { const j = (i + 1) % n; s += p.x[i] * p.y[j] - p.x[j] * p.y[i]; } area += Math.abs(s) / 2; } else allClosed = false;
     }
     out.area = area; out.length = len; out.closed = allClosed;
@@ -3778,13 +4550,76 @@ function csgCompile(node, boxes, depth = 0, count = { n: 0 }) {
   throw new Error(`Unknown CSG node "${kind}" (use union, difference, intersection, box, sphere or cylinder).`);
 }
 /**
- * Procedural geometry -> voxel Geometry (2-D when nz = 1). spec.type: 'tpms' | 'voronoi' | 'lattice' | 'spheres' | 'csg' |
- * 'implicit' | 'spacer'. Common fields: n (voxels along x, or [nx, ny, nz]), size ([lx, ly, lz]), seed.
- * spec.fn (type 'implicit') must be a function supplied by application code; strings are never evaluated.
+ * Line generators -> 3-D polylines with x = horizontal distance (m), y = 0 and z = elevation (m, negative below sea level),
+ * ordered in the production direction except the well, which runs from the wellhead down like a survey.
+ *   catenary  waterDepth, topAngle (hang-off from vertical, deg), flowline (seabed lead-in length), n
+ *   lazywave  as catenary plus sagHeight, hogHeight (above seabed) and buoyancyRatio (net uplift / submerged weight)
+ *   flowline  length, amplitude, wavelength, slope (deg, + uphill), waterDepth (at the start), seed, n
+ *   well      kickoff (m MD), buildRate (deg / 30 m), inclination (hold angle), md (total), azimuth, step
+ *   jumper    span, height, dip, leg (fraction of the span before the first drop), waterDepth
+ */
+function generateLine(kind, spec, seed) {
+  const pos = (v, d) => (Number.isFinite(+v) && +v > 0 ? +v : d), num = (v, d) => (v !== null && v !== undefined && v !== '' && Number.isFinite(+v) ? +v : d), warnings = [], stats = { type: kind }, D = Math.PI / 180;
+  const depth = pos(spec.waterDepth ?? spec.depth, 1000), x = [], z = [];
+  let g = null;
+  if (kind === 'catenary' || kind === 'lazywave') {
+    const hang = Math.max(1, Math.min(75, num(spec.topAngle ?? spec.hangoff, 12))), t = Math.tan((90 - hang) * D), ct = Math.sqrt(1 + t * t), lead = Math.max(0, num(spec.flowline ?? spec.lead, 0.25 * depth)), n = Math.max(8, Math.min(4000, Math.round(pos(spec.n, 200))));
+    let pieces;               // catenary arcs { a, sa, sb }: slope runs from sa to sb, concave up when sb > sa
+    if (kind === 'catenary') { const a = depth / (ct - 1); pieces = [{ a, sa: 0, sb: t }]; stats.catenaryParameter = a; }
+    else {
+      const hSag = Math.min(0.8 * depth, pos(spec.sagHeight, 0.12 * depth)), hHog = Math.min(0.95 * depth, Math.max(pos(spec.hogHeight, 0.25 * depth), hSag * 1.05)), r = pos(spec.buoyancyRatio, 1);
+      const a = (depth - hSag) / (ct - 1), a2 = a / r, c1 = 1 + hHog / (a + a2), c3 = 1 + (hHog - hSag) / (a + a2), s1 = Math.sqrt(c1 * c1 - 1), s3 = Math.sqrt(c3 * c3 - 1);
+      pieces = [{ a, sa: 0, sb: s1 }, { a: a2, sa: s1, sb: 0 }, { a: a2, sa: 0, sb: -s3 }, { a, sa: -s3, sb: 0 }, { a, sa: 0, sb: t }];
+      Object.assign(stats, { catenaryParameter: a, buoyantParameter: a2, sagHeight: hSag, hogHeight: hHog, buoyantLength: a2 * (s1 + s3) });
+    }
+    const susp = pieces.reduce((q, p) => q + p.a * Math.abs(p.sb - p.sa), 0);
+    if (lead > 0) { x.push(0); z.push(-depth); }
+    let x0 = lead, z0 = -depth;
+    x.push(x0); z.push(z0);
+    for (const p of pieces) {
+      const sg = p.sb > p.sa ? 1 : -1, w0 = sg * Math.asinh(p.sa), w1 = sg * Math.asinh(p.sb), m = Math.max(2, Math.round((n * p.a * Math.abs(p.sb - p.sa)) / susp));
+      for (let k = 1; k <= m; k++) { const w = w0 + ((w1 - w0) * k) / m; x.push(x0 + p.a * (w - w0)); z.push(z0 + sg * p.a * (Math.cosh(w) - Math.cosh(w0))); }
+      x0 = x[x.length - 1]; z0 = z[z.length - 1];
+    }
+    z[z.length - 1] = 0;
+    Object.assign(stats, { waterDepth: depth, topAngle: hang, touchdownX: lead, suspendedLength: susp, length: lead + susp, horizontalLength: x0 });
+  } else if (kind === 'flowline') {
+    const len = pos(spec.length, 5000), A = Math.abs(num(spec.amplitude, 20)), lam = pos(spec.wavelength, 500), slope = Math.max(-45, Math.min(45, num(spec.slope, 0))), n = Math.max(50, Math.min(4000, Math.round(pos(spec.n, (len / lam) * 24)))), R = rng(seed);
+    const hs = [[1, 0.5], [0.61, 0.25], [1.7, 0.15], [0.37, 0.1]].map(([f, w]) => ({ k: TAU / (lam * f * R.uniform(0.9, 1.1)), w, ph: R.uniform(0, TAU) }));
+    for (let i = 0; i <= n; i++) { const xi = (len * i) / n; x.push(xi); z.push(-depth + xi * Math.tan(slope * D) + A * hs.reduce((q, h) => q + h.w * Math.sin(h.k * xi + h.ph), 0)); }
+    Object.assign(stats, { seed, horizontalLength: len, amplitude: A, wavelength: lam, slope, waterDepth: depth });
+  } else if (kind === 'well') {
+    const kop = Math.max(0, num(spec.kickoff ?? spec.kop, 500)), bur = pos(spec.buildRate ?? spec.bur, 3), hold = Math.max(0, Math.min(95, num(spec.inclination ?? spec.hold, 45))), mdT = pos(spec.md ?? spec.length, 3000), az = num(spec.azimuth, 0), step = Math.max(mdT / 2000, pos(spec.step, 30)), eob = kop + (hold / bur) * 30;
+    const mds = new Set([0, mdT, ...(kop < mdT ? [kop] : []), ...(eob < mdT ? [eob] : [])]);
+    for (let m = step; m < mdT; m += step) mds.add(m);
+    const md = [...mds].sort((a, b) => a - b).filter((m, i, a) => !i || m - a[i - 1] > 1e-9), inc = md.map((m) => (m <= kop ? 0 : Math.min(hold, ((m - kop) * bur) / 30)));
+    g = surveyGeom({ md, inc, azi: md.map(() => az) }, { warnings });
+    Object.assign(g.stats, { type: kind, kickoff: kop, buildRate: bur, endOfBuild: eob, azimuth: az });
+    if (eob > mdT) warnings.push(`The hold angle is not reached: the build section would end at MD ${+eob.toFixed(1)} m, beyond the total depth.`);
+  } else {
+    const span = pos(spec.span, 30), h = pos(spec.height, 8), dip = Math.max(0, Math.min(h, num(spec.dip, 0.4 * h))), w1 = span * Math.max(0.02, Math.min(0.49, num(spec.leg, 0.2)));
+    x.push(0, 0, w1, w1, span - w1, span - w1, span, span); z.push(-depth, -depth + h, -depth + h, -depth + h - dip, -depth + h - dip, -depth + h, -depth + h, -depth);
+    if (!dip) { x.splice(3, 2); z.splice(3, 2); }
+    Object.assign(stats, { span, height: h, dip, length: 2 * h + 2 * dip + span, waterDepth: depth });
+    warnings.push('Bends are drawn as sharp corners; the bend radius is not modelled.');
+  }
+  if (!g) { g = polyGeom([{ x, y: x.map(() => 0), z, closed: false }], { warnings }); g.stats = stats; }
+  g.stats.polylines = 1; g.stats.vertices = g.polylines[0].x.length;
+  return { name: spec.name || `Procedural ${kind}`, format: 'Procedural: ' + kind, pathway: 'procedural', ...g, warnings };
+}
+/** Names accepted by generate() for the line generators, e.g. "catenary riser", "lazy-wave riser", "undulating flowline". */
+const lineKind = (type) => { const k = type.replace(/[^a-z]/g, ''); return /^catenary/.test(k) ? 'catenary' : /^lazy/.test(k) ? 'lazywave' : /^(undulating|flowline)/.test(k) ? 'flowline' : /^well/.test(k) ? 'well' : /^jumper/.test(k) ? 'jumper' : null; };
+
+/**
+ * Procedural geometry. Voxel types (2-D when nz = 1): 'tpms' | 'voronoi' | 'lattice' | 'spheres' | 'csg' | 'implicit' |
+ * 'spacer' with common fields n (voxels along x, or [nx, ny, nz]), size ([lx, ly, lz]) and seed. Line types (3-D polylines,
+ * see generateLine): 'catenary riser' | 'lazy-wave riser' | 'undulating flowline' | 'well trajectory (build-hold)' |
+ * 'jumper (M-shape)'. spec.fn (type 'implicit') must be a function supplied by application code; strings are never evaluated.
  */
 export function generate(spec = {}) {
   if (!spec || typeof spec !== 'object') throw new Error('generate() needs a specification object.');
   const type = String(spec.type || '').toLowerCase(), seed = Number.isFinite(+spec.seed) ? +spec.seed : 1, R = rng(seed), warnings = [], stats = { type, seed };
+  if (lineKind(type)) return generateLine(lineKind(type), spec, seed);
   const pos = (v, dflt) => (Number.isFinite(+v) && +v > 0 ? +v : dflt), clampPhi = (p) => Math.max(0.005, Math.min(0.995, +p));
   let size = vec3(spec.size, [1, 1, 1]), origin = [0, 0, 0], dimsGiven = Array.isArray(spec.n) ? spec.n.map((k) => Math.max(1, k | 0)) : null, n0 = pos(Array.isArray(spec.n) ? NaN : spec.n ?? spec.resolution, 0), two = !!spec.twoD || (dimsGiven && dimsGiven[2] === 1);
   let solidAt = null, field = null, target = null;      // solidAt(x, y, z) -> bool, or field(x, y, z) with a quantile target
@@ -3834,7 +4669,7 @@ export function generate(spec = {}) {
     if (!size.every((v) => v > 0 && Number.isFinite(v))) throw new Error('The implicit-geometry bounds are empty.');
     const fn = spec.fn;
     solidAt = (x, y, z) => { const v = fn(x, y, z); return typeof v === 'number' && v < 0; };
-  } else if (type !== 'spheres') throw new Error(`Unknown procedural geometry type "${spec.type}" (use tpms, voronoi, lattice, spheres, csg, implicit or spacer).`);
+  } else if (type !== 'spheres') throw new Error(`Unknown procedural geometry type "${spec.type}" (use tpms, voronoi, lattice, spheres, csg, implicit, spacer, catenary, lazywave, flowline, well or jumper).`);
   // grid
   let nx, ny, nz;
   if (dimsGiven) { [nx, ny] = dimsGiven; nz = two ? 1 : dimsGiven[2] || 1; ny = ny || nx; }
