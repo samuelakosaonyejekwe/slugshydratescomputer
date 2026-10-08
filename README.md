@@ -60,7 +60,7 @@ All requests go straight from the user's browser to public HTTPS services on a f
 through a server of this application, so the data are as fresh as the services wherever the app is opened:
 Open-Meteo (weather, marine, geocoding), NOAA NCEI (global relief), EMODnet / SeaDataCloud (sea climatology),
 World Bank (national indicators), Our World in Data (grid carbon, carbon price), NASA POWER (climate),
-US EIA daily spot series via DataHub (Brent, WTI, Henry Hub), an open exchange-rate service, and OpenAlex /
+US EIA daily spot series (Brent, WTI, Henry Hub), an open exchange-rate service, and OpenAlex /
 Crossref (research literature for the decision page). Stored copies are refreshed in the background.
 
 ## Security

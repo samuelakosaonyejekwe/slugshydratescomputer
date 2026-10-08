@@ -14,7 +14,7 @@ export const SOURCES = [
   { id: 'economy', name: 'Inflation and interest', host: 'api.worldbank.org', provider: 'World Bank Open Data', gives: 'Consumer-price inflation, lending interest rate' },
   { id: 'fx', name: 'Currency', host: 'open.er-api.com', provider: 'Open exchange-rate API', gives: 'Local currency per US dollar' },
   { id: 'energy', name: 'Grid carbon, renewables and carbon price', host: 'ourworldindata.org', provider: 'Our World in Data (Ember / Energy Institute / World Bank carbon-pricing series)', gives: 'Carbon intensity of electricity, renewable share of generation, national carbon price' },
-  { id: 'prices', name: 'Oil and gas prices', host: 'datahub.io', provider: 'US EIA daily spot series (Brent, WTI, Henry Hub) via DataHub; fallbacks: the same series on GitHub and the EIA open-data service', gives: 'Latest Brent and WTI crude and Henry Hub gas prices, 30-day mean and one-year range' },
+  { id: 'prices', name: 'Oil and gas prices', host: 'raw.githubusercontent.com', provider: 'US EIA daily spot series (Brent, WTI, Henry Hub) from the open “datasets” collection; fallback: the EIA open-data service', gives: 'Latest Brent and WTI crude and Henry Hub gas prices, 30-day mean and one-year range' },
   { id: 'climate', name: 'Solar and wind climatology', host: 'power.larc.nasa.gov', provider: 'NASA POWER long-term climatology', gives: 'Monthly and annual solar irradiation, wind speed, air temperature' },
 ];
 export const EVIDENCE_SOURCES = [
@@ -22,7 +22,7 @@ export const EVIDENCE_SOURCES = [
   { name: 'Crossref', host: 'api.crossref.org', gives: 'DOI registry of scholarly and technical publications' },
 ];
 const GEOCODE_HOST = 'geocoding-api.open-meteo.com';
-const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu', 'r2.datahub.io', 'raw.githubusercontent.com', 'api.eia.gov']);
+const ALLOWED = new Set([...SOURCES.map((s) => s.host), ...EVIDENCE_SOURCES.map((s) => s.host), GEOCODE_HOST, 'pae-paha.pacioos.hawaii.edu', 'api.eia.gov']);
 
 /** GET text (CSV) from an allow-listed HTTPS host with a timeout and a size cap. */
 export async function getText(url, ms = 20000, maxChars = 400000) {
@@ -82,8 +82,12 @@ const TAX = { NG: 50, AO: 50, GH: 35, EG: 40, DZ: 50, LY: 65, GQ: 35, GA: 35, CG
 const connectors = {
   async place(lat, lon) {
     const j = await getJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
-    const code = txt(j.countryCode, 2).toUpperCase(), e = ENERGY[code];
-    return { meta: { name: txt(j.city || j.locality || j.principalSubdivision || ''), country: txt(j.countryName), countryCode: code },
+    let code = txt(j.countryCode, 2).toUpperCase(), country = txt(j.countryName), offshoreKm = null;
+    if (!code) { // open sea: the nearest country (from the bundled outlines) supplies the national context — prices, tax, currency
+      try { const p = await (await loadAtlas()).atlasPlace(lat, lon); if (p?.countryCode) { code = p.countryCode; country = p.country; offshoreKm = p.offshoreKm ?? null; } } catch { /* stays without a country */ }
+    }
+    const e = ENERGY[code];
+    return { meta: { name: txt(j.city || j.locality || j.principalSubdivision || ''), country, countryCode: code, ...(offshoreKm ? { offshoreKm } : {}) },
       data: { ...(e ? { electricityPrice: e[0], gridCarbon: e[1] } : {}), currency: CURRENCY[code] || 'USD', ...(TAX[code] ? { taxRate: TAX[code] } : {}) } };
   },
   async weather(lat, lon) {
@@ -189,7 +193,7 @@ const connectors = {
     const parse = (csv) => csv.trim().split('\n').map((l) => l.split(',')).filter((c) => /^\d{4}-\d\d-\d\d$/.test(c[0]) && num(parseFloat(c[1])) !== null).map((c) => [c[0], parseFloat(c[1])]);
     const series = async (paths) => { let err; for (const u of paths) { try { const rows = parse(await getText(u, 20000, 4e6)); if (rows.length > 30) return rows; } catch (e) { err = e; } } throw err || new Error('No price series'); };
     const eia = async (path, id) => { const j = await getJSON(`https://api.eia.gov/v2/${path}/data/?api_key=DEMO_KEY&frequency=daily&data[0]=value&facets[series][]=${id}&sort[0][column]=period&sort[0][direction]=desc&length=260`); return (j?.response?.data || []).map((r) => [txt(r.period, 10), parseFloat(r.value)]).filter((r) => Number.isFinite(r[1])).reverse(); };
-    const get = (dh, gh, path, id) => series([`https://datahub.io/core/${dh}`, `https://raw.githubusercontent.com/datasets/${gh}`]).catch(() => eia(path, id));
+    const get = (dh, gh, path, id) => series([`https://raw.githubusercontent.com/datasets/${gh}`]).catch(() => eia(path, id));
     const [b, w, g] = await Promise.allSettled([get('oil-prices/r/brent-daily.csv', 'oil-prices/main/data/brent-daily.csv', 'petroleum/pri/spt', 'RBRTE'), get('oil-prices/r/wti-daily.csv', 'oil-prices/main/data/wti-daily.csv', 'petroleum/pri/spt', 'RWTC'), get('natural-gas/r/daily.csv', 'natural-gas/main/data/daily.csv', 'natural-gas/pri/fut', 'RNGWHHD')]);
     const data = {}, stat = (rows, key) => { if (!rows?.length) return; const last = rows[rows.length - 1], y = rows.slice(-252).map((r) => r[1]), m = rows.slice(-22).map((r) => r[1]); data[key] = last[1]; data[key + 'Date'] = last[0]; data[key + 'Mean30'] = +mean(m).toFixed(2); data[key + 'Min1y'] = Math.min(...y); data[key + 'Max1y'] = Math.max(...y); data[key + 'Series'] = { t: rows.slice(-252).map((r) => r[0]), v: y }; data[key + 'Volatility'] = +(Math.sqrt(252) * Math.sqrt(mean(y.slice(1).map((v, i) => Math.log(v / y[i]) ** 2)))).toFixed(3); };
     stat(b.status === 'fulfilled' ? b.value : null, 'oilPrice'); stat(w.status === 'fulfilled' ? w.value : null, 'oilPriceWTI'); stat(g.status === 'fulfilled' ? g.value : null, 'gasPrice');
