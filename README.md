@@ -88,11 +88,11 @@ node tools/build.mjs             # stamp version.json + sw.js (and standalone.ht
 
 ## Scope, evidence and limits
 
-* **What is solved where.** Every item of the specification catalogue (1,531 across the seven suites) is either
-  solved by the built-in engines on the user's device or handed to an established open-source solver. The in-app
-  engines are one-dimensional, lumped or small two-dimensional models. Three-dimensional LES/DES/DNS, LES with
-  interface capturing, 1-D/3-D coupling and CFD + finite-element coupling cannot run in a browser at useful
-  resolution: for those the *External solvers* page writes a complete, ready-to-run case (OpenFOAM, CalculiX,
+* **What is solved where.** Every item of the specification catalogue (1,531 across the seven suites) is solved
+  by the built-in engines on the user's device. The engines are one-dimensional, lumped or small two- and
+  three-dimensional models, so the three-dimensional items (LES, DES, DNS, interface capturing, fluid–structure
+  coupling) run at coarse, stated resolution; a fully resolved turbulent channel DNS is beyond a browser. For
+  production resolution the *External solvers* page writes a complete, ready-to-run case (OpenFOAM, CalculiX,
   preCICE, CoolProp, teqp) from the study and reads the results back. `node tools/coverage.mjs --strict` lists
   the status of every item.
 * **Where the numbers come from.** Each suite's *Equations* tab carries a provenance table: every set of literature
@@ -105,9 +105,15 @@ node tools/build.mjs             # stamp version.json + sw.js (and standalone.ht
 * **Costs and fiscal terms.** The cost basis is dated and escalated with a producer-price index; each entry is
   marked as sourced, derived or an engineering estimate. Tax and fiscal terms, cost indices, interest rates and
   energy prices are read live where an open service exists, with a dated bundled snapshot offline.
-* **File formats.** Besides open formats the portal reads DWG (R13–2018 except 2007), DGN V7, ACIS SAT and
-  Parasolid X_T text files (recognising pipe runs, bends and diameters), CGNS, Exodus II, MED, NetCDF-4, HDF5,
-  MATLAB v7.3, GeoPackage, E57 and LAZ. JT, binary SAB/X_B, DWG 2007 and DGN V8 are recognised but not read.
+* **File formats.** Besides open formats the portal reads DWG (R13–2018, with labels and embedded solids),
+  DGN V7 and the basic elements of V8, ACIS SAT/SAB and Parasolid X_T/X_B (recognising pipe runs, bends and
+  diameters), CGNS (HDF5 and ADF), Exodus II, MED, NetCDF-4, HDF5, MATLAB v7.3, BAG, GeoPackage, S-57 charts,
+  E57 and LAZ/COPC. JT is read when it carries a Parasolid body; pre-R13 DWG and native CAD part files are
+  recognised but not read.
+* **Shared data cache.** Rate-limited public services (US cost indices, OECD tax rates and others) are fetched
+  once per period for all users by a small function on the mirror (`functions/api/feed.js`), with the direct
+  source and a dated bundled snapshot as fallbacks. `docs/DATA_SOURCES.md` lists every bundled data set and
+  constant set with its source and licence.
 * **Use.** These are engineering models for design studies, screening, teaching and decision support. Results
   for a real asset should be calibrated and validated against that asset's data with the built-in tools, and
   checked against the governing design code, before they are relied on.

@@ -1,6 +1,7 @@
 // Pipe-flow kernel shared by the suites: friction factors, heat-transfer resistances, two-phase flow-pattern
-// prediction (Taitel–Dukler / Taitel–Barnea–Dukler), liquid holdup and pressure-gradient closures (Beggs–Brill,
-// drift flux, mechanistic stratified / slug unit cell), slug closures, severe-slugging criteria, sea-temperature
+// prediction at any inclination (Taitel–Dukler / Barnea unified model), liquid holdup and pressure-gradient closures (Beggs–Brill,
+// drift flux, mechanistic stratified / slug unit cell with the Taitel–Barnea film), slug closures (frequency, development-aware
+// length), severe-slugging criteria, sea-temperature
 // profile and a steady-state marching solver for pressure and temperature along an elevation profile.
 // SI units throughout except pressure in bara and temperature in °C at the interface of marchSteady.
 // Where each constant set was checked against an openly readable source is listed in PROVENANCE of js/suites/s03_flow.js.
@@ -165,18 +166,39 @@ export function slugVelocity(vm, D, theta = 0) {
 }
 /** Liquid holdup in the slug body (Gregory et al., 1978). */
 export const slugBodyHoldup = (vm) => 1 / (1 + (vm / 8.66) ** 1.39);
-/** Slug frequency (1/s). model: 'zabaras' (inclination-corrected) | 'gregory' (Gregory & Scott). */
+/**
+ * Slug frequency (1/s) from a correlation of developed flow. model:
+ *  'gregory'    Gregory & Scott (1969): 0.0226 [(vsl / gD)(19.75 / vm + vm)]^1.2 (SI; 19.75 m²/s²), horizontal, 19 and 35 mm;
+ *  'zabaras'    Zabaras (2000): the Gregory–Scott value times (0.836 + 2.75 sin θ), fitted for 0 ≤ θ ≤ 11° (the factor is held beyond 11°);
+ *  'greskovich' Greskovich & Shrier (1972): 0.0226 [λ (2.02 / D + vm² / gD)]^1.2;
+ *  'heywood'    Heywood & Richardson (1979): 0.0434 [λ (2.02 / D + vm² / gD)]^1.02, λ = vsl / vm (2.02 in metres).
+ */
 export function slugFrequency(vsl, vm, D, theta = 0, model = 'zabaras') {
   if (vm <= 0 || vsl <= 0) return 0;
-  if (model === 'gregory') return 0.0226 * ((vsl / (G * D)) * (19.75 / vm + vm)) ** 1.2;
-  const ft = 3.28084, vslF = vsl * ft, vmF = vm * ft, dF = D * ft;
-  return 0.0226 * (vslF / (32.174 * dF)) ** 1.2 * (212.6 / vmF + vmF) ** 1.2 * (0.836 + 2.75 * Math.sin(Math.max(theta, 0)) ** 0.25);
+  if (model === 'heywood' || model === 'greskovich') { const x = (vsl / vm) * (2.02 / D + (vm * vm) / (G * D)); return model === 'heywood' ? 0.0434 * x ** 1.02 : 0.0226 * x ** 1.2; }
+  const gs = 0.0226 * ((vsl / (G * D)) * (19.75 / vm + vm)) ** 1.2;
+  return model === 'gregory' ? gs : gs * (0.836 + 2.75 * Math.sin(clamp(theta, 0, (11 * Math.PI) / 180)));
 }
-/** Mean slug-body length (m): Scott et al. (1989) for large pipes, 32 diameters for small ones. model 'brill' uses Brill et al. (1981). */
-export function slugLength(D, vm = 3, model = 'scott') {
+// Mean slug-body length (diameters) against the distance from the point of slug formation (diameters), computed once with the kinematic
+// slug-train model of Barnea & Taitel (1993): slugs enter with random short lengths (uniform, mean 3.2 D horizontal / 4.2 D inclined), every bubble
+// nose moves at v∞ [1 + a exp(−b L/D)] with L the slug ahead of it (Moissis & Griffith wake law; a = 0.4, b = 1.0 horizontal and a = 8, b = 1.06
+// inclined and vertical, as used with this model in the open literature), a slug overtaken by its bubble disappears. Mean of 3 × 6,000 slugs.
+const TRAIN = { x: [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000], hor: [3.2, 3.8, 4.2, 4.48, 4.9, 5.3, 5.6, 6.11, 6.47, 7.05, 7.93, 8.73, 9.34, 10.34, 10.79, 11.36], inc: [4.2, 5.95, 6.75, 7.25, 7.98, 8.61, 9.1, 9.9, 10.5, 11.49, 12.93, 14.34, 14.8, 15.2, 15.51, 15.88] };
+/**
+ * Mean slug-body length (m).
+ * Developed flow (default): Scott, Shoham & Brill (1989) ln L = −26.6 + 28.5 [ln D + 3.67]^0.1 (L and D in metres) for large pipes, 32 diameters
+ * for small ones; model 'brill' uses Brill et al. (1981), ln L[ft] = −2.663 + 5.441 √ln d[in] + 0.059 ln vm[ft/s].
+ * With o.xD (distance from the inlet or from the point of slug formation, in diameters) the length is development-aware: up to 3,000 D it is the
+ * mean length of the slug-train model (table above; horizontal and inclined curves blended with sin|θ| / sin 10°), i.e. 4–8 D at 50–100 D and
+ * 11–16 D at 3,000 D; from there it approaches the developed-flow value on a logarithmic distance scale and reaches it at 30,000 D (this
+ * blending range is an assumption: no open measurements of slug length between 10³ and 10⁵ diameters were found). o: { xD, theta }.
+ */
+export function slugLength(D, vm = 3, model = 'scott', o = null) {
   const dIn = D / 0.0254;
-  if (model === 'brill') return Math.exp(-2.663 + 5.441 * Math.sqrt(Math.log(dIn)) + 0.059 * Math.log(Math.max(vm * 3.28084, 0.1))) * 0.3048;
-  return D < 0.1 ? 32 * D : Math.max(32 * D, Math.exp(-26.6 + 28.5 * (Math.log(D) + 3.67) ** 0.1)); // D and length in metres
+  const dev = model === 'brill' ? Math.exp(-2.663 + 5.441 * Math.sqrt(Math.log(Math.max(dIn, 1.01))) + 0.059 * Math.log(Math.max(vm * 3.28084, 0.1))) * 0.3048 : D < 0.1 ? 32 * D : Math.max(32 * D, Math.exp(-26.6 + 28.5 * (Math.log(D) + 3.67) ** 0.1));
+  if (!o || !(o.xD >= 0)) return dev;
+  const w = clamp(Math.abs(Math.sin(o.theta || 0)) / Math.sin((10 * Math.PI) / 180), 0, 1), x = Math.min(o.xD, 3000), lt = ((1 - w) * interp1(TRAIN.x, TRAIN.hor, x) + w * interp1(TRAIN.x, TRAIN.inc, x)) * D;
+  return o.xD <= 3000 ? lt : lt + (dev - lt) * clamp(Math.log10(o.xD / 3000), 0, 1);
 }
 /**
  * Film zone of a slug unit (Taitel & Barnea 1990, equilibrium-film form). In the frame moving with the slug the liquid shed at the tail,
@@ -206,16 +228,16 @@ export function slugFilm(p, o = {}) {
 /**
  * Hydrodynamic slug unit-cell summary at one location. The unit cell obeys freq × unitLength = vt and length = slugFraction × unitLength,
  * so only one of slug length and slug frequency can come from a correlation; the other is derived:
- *   basis 'length' (default): the developed-slug length correlation (lengthModel) is kept and freq = slugFraction · vt / length;
+ *   basis 'length' (default): the slug length (lengthModel; development-aware when xD, the distance from the inlet in diameters, is given) is kept and freq = slugFraction · vt / length;
  *   basis 'frequency': the frequency correlation (freqModel) is kept and length = slugFraction · vt / freq.
  * The value of the correlation that was not used is still reported (freqCorrelation, lengthCorrelation) for comparison.
  * Returns { vt, C0, vd, holdupSlug, holdupFilm, holdup (unit average), freq (1/s), period (s), length (m), lengthFromFreq (= length, kept for older callers),
  *           lengthMax (1-in-1000 slug of a log-normal distribution, σ = 0.5), unitLength, slugFraction, volume (m³ liquid per slug), freqCorrelation, lengthCorrelation, basis }.
  */
-export function slugUnit({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, freqModel = 'zabaras', lengthModel = 'scott', basis = 'length', sigma = 0.02 }) {
+export function slugUnit({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, freqModel = 'zabaras', lengthModel = 'scott', basis = 'length', sigma = 0.02, xD = null }) {
   const vm = vsl + vsg, A = (Math.PI * D * D) / 4, { vt, C0, vd } = slugVelocity(vm, D, theta), HLS = slugBodyHoldup(vm);
   const film = slugFilm({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta, sigma }, { vt, HLS }), holdup = film.HU, HLF = clamp(film.HLF, 1e-4, Math.min(0.999 * HLS, holdup)); // film zone from the Taitel–Barnea equilibrium film
-  const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), lengthCorrelation = slugLength(D, vm, lengthModel), freqCorrelation = slugFrequency(vsl, vm, D, theta, freqModel);
+  const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), lengthCorrelation = slugLength(D, vm, lengthModel, xD === null || xD === undefined ? null : { xD, theta }), freqCorrelation = slugFrequency(vsl, vm, D, theta, freqModel);
   const useF = basis === 'frequency' && freqCorrelation > 0, length = useF ? (beta * vt) / freqCorrelation : lengthCorrelation, freq = useF ? freqCorrelation : (beta * vt) / length;
   return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, freq, length, lengthFromFreq: length, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength: length / beta, slugFraction: beta, volume: length * A * HLS, period: freq > 0 ? 1 / freq : Infinity, freqCorrelation, lengthCorrelation, basis: useF ? 'frequency' : 'length', film };
 }

@@ -330,9 +330,12 @@ export function createFlow3D(o = {}) {
         const d = q > 0 ? k : k + s, jd = dir === 1 ? (q > 0 ? j : j + 1) : j, h = dir === 0 ? dx : dir === 1 ? dy[jd] : dz, c = (Math.abs(q) * dt) / h, sg = q > 0 ? s : -s, cd = C[d];
         let f;
         if (cd <= 1e-8 || cd >= 1 - 1e-8) f = c * cd;
-        else { const gx = Math.abs(C[d + 1] - C[d - 1]) * rdx, gy = Math.abs(C[d + Y] - C[d - Y]) / (2 * dy[Math.min(Math.max(jd, 1), ny)]) * 2, gz = Math.abs(C[d + Z] - C[d - Z]) * rdz, gsum = gx + gy + gz, wgt = gsum < 1e-12 ? 1 / 3 : (dir === 0 ? gx : dir === 1 ? gy : gz) / gsum; f = wgt * thincFlux(C[d - sg], cd, C[d + sg], c, beta) + (1 - wgt) * c * cd; }
+        else { const zp = d + Z < N ? C[d + Z] : cd, zm = d - Z >= 0 ? C[d - Z] : cd, gx = Math.abs(C[d + 1] - C[d - 1]) * rdx, gy = Math.abs((d + Y < N ? C[d + Y] : cd) - (d - Y >= 0 ? C[d - Y] : cd)) / dy[Math.min(Math.max(jd, 1), ny)], gz = Math.abs(zp - zm) * rdz, gsum = gx + gy + gz, wgt = gsum < 1e-12 ? 1 / 3 : (dir === 0 ? gx : dir === 1 ? gy : gz) / gsum; const iu = d - sg, id = d + sg; f = wgt * thincFlux(iu >= 0 && iu < N ? C[iu] : cd, cd, id >= 0 && id < N ? C[id] : cd, c, beta) + (1 - wgt) * c * cd; }
         flux[k] = (q > 0 ? f : -f) * h;
       }
+      if (dir === 0 && perX) for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const r = sx * (j + sy * l); flux[r] = flux[r + nx]; } // the face shared across a periodic boundary carries one flux
+      if (dir === 1 && perY) for (let l = 1; l <= nz; l++) for (let i = 1; i <= nx; i++) { const r = i + Z * l; flux[r] = flux[r + ny * Y]; }
+      if (dir === 2 && perZ) for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const r = i + Y * j; flux[r] = flux[r + nz * Z]; }
       for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const h = dir === 0 ? dx : dir === 1 ? dy[j] : dz; for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l); C[k] += (-(flux[k] - flux[k - s]) + cc[k] * (vel[k] - vel[k - s]) * dt) / h; } }
       for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l); if (C[k] < 0 && C[k] > -1e-12) C[k] = 0; else if (C[k] > 1 && C[k] < 1 + 1e-12) C[k] = 1; }
       fill(C, 0);
@@ -353,8 +356,10 @@ export function createFlow3D(o = {}) {
     for (let l = 1; l <= nz; l++) for (let i = 1; i <= nx; i++) { const a = idx(i, 1, l), b = idx(i, ny, l); s += wall3 ? gs1 * u[a] + gs2 * u[a + Y] + gn1 * u[b] + gn2 * u[b - Y] : u[a] / y1s + u[b] / y1n; }
     return s / (2 * nx * nz);
   }
-  function kinetic() { // volume-averaged kinetic energy per unit mass (or per unit volume with two phases)
-    let e = 0, vol = 0; for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const a = cellVolume(j); for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l), uc = 0.5 * (u[k] + u[k - 1]), vc = 0.5 * (v[k] + v[k - Y]), wc = 0.5 * (w[k] + w[k - Z]); e += 0.5 * (uc * uc + vc * vc + wc * wc) * a * (vof ? rho[k] : 1); vol += a; } } return e / vol;
+  function kinetic() { // volume-averaged kinetic energy per unit mass from the face velocities (the quantity the advection scheme conserves); per unit volume from cell-centre values with two phases
+    let e = 0, vol = 0;
+    if (!vof) { for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const a = dy[j], b = j <= nyV ? dyc[j] : 0; for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l); e += 0.5 * ((i <= nxU ? u[k] * u[k] : 0) * a + v[k] * v[k] * b + (l <= nzW ? w[k] * w[k] : 0) * a); vol += a; } } return e / vol; }
+    for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const a = cellVolume(j); for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l), uc = 0.5 * (u[k] + u[k - 1]), vc = 0.5 * (v[k] + v[k - Y]), wc = 0.5 * (w[k] + w[k - Z]); e += 0.5 * (uc * uc + vc * vc + wc * wc) * a * rho[k]; vol += a; } } return e / vol;
   }
   function enstrophy() { // volume average of ½ |ω|² (vorticity from the face velocities, evaluated on the cell edges and averaged)
     let e = 0, vol = 0; for (let l = 1; l <= nz; l++) for (let j = 1; j <= ny; j++) { const a = cellVolume(j), rn = 1 / dyc[j]; for (let i = 1; i <= nx; i++) { const k = i + sx * (j + sy * l), ox = (w[k + Y] - w[k]) * rn - (v[k + Z] - v[k]) * rdz, oy = (u[k + Z] - u[k]) * rdz - (w[k + 1] - w[k]) * rdx, oz = (v[k + 1] - v[k]) * rdx - (u[k + Y] - u[k]) * rn; e += 0.5 * (ox * ox + oy * oy + oz * oz) * a; vol += a; } } return e / vol;
@@ -365,7 +370,7 @@ export function createFlow3D(o = {}) {
   // ---- one time step
   let first = true, volume0 = 0;
   function step(dtFixed) {
-    if (first) { fillVel(); if (vof) { properties(); volume0 = liquidVolume(); if (o.vof.hydrostaticStart !== false) { const keep = [u.slice(), v.slice(), w.slice()], n0 = Math.max(0, vof.startIterations ?? 20); for (let q = 0; q < n0; q++) { u.set(keep[0]); v.set(keep[1]); w.set(keep[2]); const g = 1e-3; for (let k = 0; k < N; k++) { u[k] += g * grav[0]; v[k] += g * grav[1]; w[k] += g * grav[2]; } pOld.set(p); project(g); } u.set(keep[0]); v.set(keep[1]); w.set(keep[2]); pOld.set(p); fillVel(); } } updateUTau(); eddyViscosity(0); properties(); first = false; }
+    if (first) { fillVel(); if (vof) { properties(); volume0 = liquidVolume(); if (o.vof.hydrostaticStart !== false) { if (grav[1] < 0 && grav[0] === 0 && grav[2] === 0 && !perY) { for (let l = 0; l < sz; l++) for (let i = 0; i < sx; i++) { let ph = 0; for (let j = ny; j >= 1; j--) { const k = idx(i, j, l); ph += -grav[1] * (j === ny ? 0.5 * rho[k] * dy[j] : 0.5 * (rho[k] * dy[j] + rho[k + Y] * dy[j + 1])); p[k] = ph; } } fill(p, 0); pOld.set(p); } const keep = [u.slice(), v.slice(), w.slice()], n0 = Math.max(0, vof.startIterations ?? 20); for (let q = 0; q < n0; q++) { u.set(keep[0]); v.set(keep[1]); w.set(keep[2]); const g = 1e-3; for (let k = 0; k < N; k++) { u[k] += g * grav[0]; v[k] += g * grav[1]; w[k] += g * grav[2]; } pOld.set(p); project(g); } u.set(keep[0]); v.set(keep[1]); w.set(keep[2]); pOld.set(p); fillVel(); } } updateUTau(); eddyViscosity(0); properties(); first = false; }
     const rate = maxRates(), lim = scheme === 'rk3' ? 0.55 : 0.2; let dt = Math.min(cfl / Math.max(rate.adv, 1e-30), lim / Math.max(rate.diff, 1e-30), o.dtMax ?? Infinity);
     if (vof) { const gm = Math.hypot(grav[0], grav[1], grav[2]); if (gm > 0) dt = Math.min(dt, 0.3 * Math.sqrt(Math.min(dx, dyMin, dz) / gm)); }
     if (dtFixed > 0) dt = dtFixed;
@@ -417,7 +422,16 @@ const now = () => (typeof performance !== 'undefined' && performance.now ? perfo
 /** Wraps a solver in a steppable run: { done, advance(maxSteps or ms budget), progress, result() }. */
 function runner(sim, tEnd, maxSteps, each, finish) {
   const R = { sim, done: false, wall: 0, progress: 0,
-    advance(n = 50, budgetMs = Infinity) { const t0 = now(); let k = 0; while (!R.done && k < n && now() - t0 < budgetMs) { let dt; const left = tEnd - sim.state.t; if (left <= 1e-12 * Math.max(tEnd, 1)) { R.done = true; break; } const rate = 0; dt = sim.step(R.dtFixed ? Math.min(R.dtFixed, left) : 0); if (!R.dtFixed && dt > left * 1.0000001) { /* overshoot of the last step is accepted */ } k++; if (each) each(sim, dt); if (!Number.isFinite(dt) || !Number.isFinite(sim.u[sim.grid.idx(1, 1, 1)])) { R.failed = true; R.done = true; } if (sim.state.steps >= maxSteps || sim.state.t >= tEnd * (1 - 1e-12)) R.done = true; } R.wall += now() - t0; R.progress = Math.min(1, Math.max(sim.state.t / tEnd, sim.state.steps / maxSteps)); return R; },
+    advance(n = 50, budgetMs = Infinity) { // up to n steps or budgetMs of wall time, whichever comes first
+      const t0 = now(); let k = 0;
+      while (!R.done && k < n && now() - t0 < budgetMs) {
+        if (tEnd - sim.state.t <= 1e-12 * Math.max(tEnd, 1)) { R.done = true; break; }
+        const dt = sim.step(); k++; if (each) each(sim, dt);
+        if (!Number.isFinite(dt) || !Number.isFinite(sim.u[sim.grid.idx(1, 1, 1)])) { R.failed = true; R.done = true; }
+        if (sim.state.steps >= maxSteps || sim.state.t >= tEnd * (1 - 1e-12)) R.done = true;
+      }
+      R.wall += now() - t0; R.progress = Math.min(1, Math.max(sim.state.t / tEnd, sim.state.steps / maxSteps)); return R;
+    },
     result() { return finish(sim, R); } };
   return R;
 }
@@ -479,7 +493,7 @@ export function channel3D(o = {}) {
     const cells = g.cells, ms = R.wall / Math.max(s.state.steps, 1);
     return { reTau, sgs: s.sgs, mode, nx, ny, nz, lx, lz, y: toArr(g.yc.subarray(1, half + 1)), yPlus, uPlus: Um.map((x) => x / ut), uRms: uu, vRms: vv, wRms: ww, uvPlus: uv, nutPlus: sym(Array.from(acc.nut, (x) => x / n)).map((x) => x * reTau),
       reTauActual: reA, uTau: ut, uBulk: ub, uBulkPlus: ub / ut, uCentrePlus: Um[half - 1] / ut, cf: (2 * tauW) / (ub * ub), reBulk: 2 * ub * reTau, forcingMean: s.state.forcingMean / Math.max(s.state.forcingTime, 1e-30),
-      resolution: { dxPlus: g.dx * reA, dzPlus: g.dz * reA, dyPlusWall: g.dy[1] * reA, dyPlusMax: g.dy[half] * reA, firstCentrePlus: g.yc[1] * reA }, history: hist, samples: acc.n, time: s.state.t, steps: s.state.steps, cells, msPerStep: ms, usPerCellStep: (1000 * ms) / cells, divergenceMax: s.divergence(), failed: !!R.failed,
+      slice: (() => { const q = s.slice('u', 'x'); return { z: q.a, y: q.b, u: q.z.map((row) => row.map((x) => x / ut)) }; })(), resolution: { dxPlus: g.dx * reA, dzPlus: g.dz * reA, dyPlusWall: g.dy[1] * reA, dyPlusMax: g.dy[half] * reA, firstCentrePlus: g.yc[1] * reA }, history: hist, samples: acc.n, time: s.state.t, steps: s.state.steps, cells, msPerStep: ms, usPerCellStep: (1000 * ms) / cells, divergenceMax: s.divergence(), failed: !!R.failed,
       balance: { wallShear: tauW, forcing: s.state.forcingMean / Math.max(s.state.forcingTime, 1e-30) } };
   });
 }

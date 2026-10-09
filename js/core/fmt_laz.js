@@ -1,11 +1,15 @@
 // LAZ (LASzip-compressed LAS) reader: point coordinates.
 //
 // Read:   LAS 1.0-1.4 headers, the LASzip VLR (record 22204), the "pointwise" and "pointwise chunked" compressors with
-//         the arithmetic coder, the chunk table, and the version-2 item codecs POINT10, GPSTIME11, RGB12 and BYTE (extra
-//         bytes), i.e. point formats 0-3. Only x, y, z are kept (scaled to real coordinates); the other fields are decoded
-//         as far as needed to stay in step with the stream. Clouds above the cap are evenly sub-sampled.
-// Not read: the "layered chunked" compressor of LAS 1.4 point formats 6-10 (POINT14 items), wave packets (formats 4, 5),
-//         version-1 item codecs of very old LASzip releases and the LASzip "compatibility mode" re-mapping.
+//         the arithmetic coder and the version-2 item codecs POINT10, GPSTIME11, RGB12 and BYTE (point formats 0-3), and
+//         the "layered chunked" compressor of LAS 1.4 (point formats 6-10, item version 3): per chunk the raw first
+//         point, the point count and layer sizes, then the "channel, returns and XY" layer and the Z layer with one
+//         context per scanner channel; the chunk table with fixed or variable chunk sizes (COPC files read as LAZ).
+//         Only x, y, z are kept (scaled to real coordinates); the other fields are decoded as far as needed to stay in
+//         step with the stream. Clouds above the cap are evenly sub-sampled.
+// Not read: wave packets of formats 4, 5 (rejected), version-1 item codecs of LASzip releases before 2.0 (rejected), the
+//         LASzip "compatibility mode" re-mapping, and every attribute other than the coordinates. Formats 9 and 10 share
+//         the coordinate layers of 6-8 but were not checked against a file.
 // File content is untrusted: counts and offsets are bounds-checked and reading past the end of the data stops the chunk.
 
 function fail(msg) { const e = new Error(msg); e.user = true; throw e; }
@@ -181,6 +185,44 @@ function bytes(dec, n) {
   return { read() { for (let k = 0; k < n; k++) dec.symbol(m[k]); } };
 }
 
+// ---- LAS 1.4 points (POINT14, item version 3): one arithmetic-coded layer per attribute ----------------------------------
+// return-map context of (number of returns, return number); the return level is their difference capped at 7
+const MAP6 = ['0123453445555555', '1013333333333333', '2124444444433333', '3345444444444444', '4344544444444444', '5344454444444444', '3344445444444444', '4344444544444444', '4344444454444444', '5344444445444444', '5344444444544444', '5334444444455444', '5334444444455544', '5334444444445554', '5334444444444555', '5334444444444455'];
+/**
+ * Decoder of the x, y, z of a layered chunk: the "channel, returns and XY" layer and the Z layer. The other layers
+ * (classification, flags, intensity, scan angle, user data, point source, GPS time, colour, extra bytes) are skipped by
+ * their sizes; of their content only the change flags carried by the first layer are needed. Each scanner channel keeps
+ * a context of its own, started from the point at which the channel is first met.
+ */
+function point14(u8, p, decXY, decZ) {
+  const dv = new DataView(u8.buffer, u8.byteOffset + p, 30), ctx = [null, null, null, null];
+  const make = (X, Y, Z, n, r) => {
+    const c = { X, Y, Z, n, r, gps: 0, mChanged: [], mChannel: new SymbolModel(3), mN: [], mR: [], mSame: new SymbolModel(13), icX: new IntCoder(decXY, 32, 2), icY: new IntCoder(decXY, 32, 22), icZ: decZ ? new IntCoder(decZ, 32, 20) : null, mx: [], my: [], lastZ: new Int32Array(8).fill(Z) };
+    for (let i = 0; i < 8; i++) c.mChanged.push(new SymbolModel(128));
+    for (let i = 0; i < 12; i++) { c.mx.push(new Median5()); c.my.push(new Median5()); }
+    return c;
+  };
+  let cur = (u8[p + 15] >> 4) & 3, c = (ctx[cur] = make(dv.getInt32(0, true), dv.getInt32(4, true), dv.getInt32(8, true), u8[p + 14] >> 4, u8[p + 14] & 15));
+  const st = { x: c.X, y: c.Y, z: c.Z };
+  st.read = () => {
+    const ch = decXY.symbol(c.mChanged[(c.r === 1 ? 1 : 0) + (c.r >= c.n ? 2 : 0) + (c.gps ? 4 : 0)]);
+    if (ch & 64) { const to = (cur + decXY.symbol(c.mChannel) + 1) & 3; if (!ctx[to]) ctx[to] = make(c.X, c.Y, c.Z, c.n, c.r); cur = to; c = ctx[to]; }
+    const gps = (ch >> 4) & 1;
+    if (ch & 4) c.n = decXY.symbol(c.mN[c.n] || (c.mN[c.n] = new SymbolModel(16)));
+    const how = ch & 3;
+    if (how === 1) c.r = (c.r + 1) & 15; else if (how === 2) c.r = (c.r + 15) & 15;
+    else if (how === 3) c.r = gps ? decXY.symbol(c.mR[c.r] || (c.mR[c.r] = new SymbolModel(16))) : (c.r + decXY.symbol(c.mSame) + 2) & 15;
+    const n = c.n, r = c.r, mi = ((MAP6[n].charCodeAt(r) - 48) << 1) | gps, l = Math.min(7, Math.abs(n - r)), n1 = n === 1 ? 1 : 0;
+    const dx = c.icX.read(c.mx[mi].v[2], n1);
+    c.X = (c.X + dx) | 0; c.mx[mi].add(dx);
+    const kx = c.icX.k, dy = c.icY.read(c.my[mi].v[2], n1 + (kx < 20 ? kx & ~1 : 20));
+    c.Y = (c.Y + dy) | 0; c.my[mi].add(dy);
+    if (c.icZ) { const kb = (kx + c.icY.k) >> 1; c.Z = c.lastZ[l] = c.icZ.read(c.lastZ[l], n1 + (kb < 18 ? kb & ~1 : 18)); }
+    c.gps = gps; st.x = c.X; st.y = c.Y; st.z = c.Z;
+  };
+  return st;
+}
+
 /** True for a LAS file whose points are LASzip-compressed. */
 export const isLAZ = (u8) => u8.length > 110 && u8[0] === 0x4c && u8[1] === 0x41 && u8[2] === 0x53 && u8[3] === 0x46 && (u8[104] & 0xc0) !== 0;
 
@@ -202,30 +244,39 @@ export function parseLAZ(u8, opts = {}) {
   const compressor = dv.getUint16(vlr, true), coder = dv.getUint16(vlr + 2, true), lazVersion = `${u8[vlr + 4]}.${u8[vlr + 5]}.${dv.getUint16(vlr + 6, true)}`, chunkSize = dv.getUint32(vlr + 12, true), nItems = dv.getUint16(vlr + 32, true), items = [];
   if (vlr + 34 + 6 * nItems > offPts || nItems > 32) fail('The LASzip record is corrupt.');
   for (let k = 0; k < nItems; k++) items.push({ type: dv.getUint16(vlr + 34 + 6 * k, true), size: dv.getUint16(vlr + 36 + 6 * k, true), version: dv.getUint16(vlr + 38 + 6 * k, true) });
-  if (compressor === 3 || items.some((i) => i.type >= 10)) fail(`This LAZ file holds LAS 1.4 points (format ${fmt}) in the layered LASzip compression, which is not read (point formats 0-3 are). ${HOW}`);
-  if (items.some((i) => i.type === 9)) fail(`This LAZ file holds wave-packet points (format ${fmt}), which are not read. ${HOW}`);
-  if ((compressor !== 1 && compressor !== 2) || coder !== 0 || !items.length || items[0].type !== 6 || items.some((i) => ![0, 6, 7, 8].includes(i.type))) fail(`This LAZ file uses an unsupported LASzip layout (compressor ${compressor}). ${HOW}`);
-  if (items.some((i) => i.version !== 2)) fail(`This LAZ file was written by a very old LASzip release (item codec version ${items.find((i) => i.version !== 2).version}), which is not read. ${HOW}`);
+  const layered = compressor === 3;
+  if (!layered && items.some((i) => i.type === 9)) fail(`This LAZ file holds wave-packet points (format ${fmt}), which are not read. ${HOW}`);
+  if (layered ? coder !== 0 || !items.length || items[0].type !== 10 || items.some((i) => i.type < 10 || i.type > 14) : (compressor !== 1 && compressor !== 2) || coder !== 0 || !items.length || items[0].type !== 6 || items.some((i) => ![0, 6, 7, 8].includes(i.type))) fail(`This LAZ file uses an unsupported LASzip layout (compressor ${compressor}). ${HOW}`);
+  if (items.some((i) => i.version !== (layered ? 3 : 2))) fail(`This LAZ file uses item codec version ${items.find((i) => i.version !== (layered ? 3 : 2)).version}${layered ? '' : ' of a very old LASzip release'}, which is not read. ${HOW}`);
   const rawLen = items.reduce((s, i) => s + i.size, 0);
-  if (rawLen !== recLen || items[0].size !== 20) fail('The LASzip record does not match the point record length.');
+  if (rawLen !== recLen || items[0].size !== (layered ? 30 : 20)) fail('The LASzip record does not match the point record length.');
+  // layered chunks: point count, then one size word per layer (9 of the point item, 1 colour, 2 colour + NIR, 1 wave packet, 1 per extra byte)
+  const nLayers = items.reduce((s, i) => s + (i.type === 10 ? 9 : i.type === 12 ? 2 : i.type === 14 ? i.size : 1), 0);
   if (!(total > 0)) fail('The LAZ file holds no points.');
   // chunk byte ranges
   const chunks = [];
   if (compressor === 1) chunks.push([offPts, N, total]);
   else {
-    if (!(chunkSize > 0) || chunkSize === 0xffffffff) fail(`This LAZ file uses variable-size chunks, which are not read. ${HOW}`);
+    const variable = chunkSize === 0xffffffff;
+    if (!(chunkSize > 0)) fail('The LASzip record is corrupt (chunk size 0).');
     let tp = Number(dv.getBigInt64(offPts, true));
     if (tp === -1 && N >= offPts + 16) tp = Number(dv.getBigInt64(N - 8, true));
-    const nch = Math.ceil(total / chunkSize);
+    const nch = variable ? (tp + 8 <= N && tp >= 0 ? dv.getUint32(tp + 4, true) : 0) : Math.ceil(total / chunkSize);
     if (!(tp >= offPts + 8 && tp + 8 <= N) || dv.getUint32(tp, true) !== 0) fail('The LAZ chunk table is missing or corrupt; the file appears truncated.');
     const stored = dv.getUint32(tp + 4, true);
     if (stored > 1e7 || stored < nch - 1) fail('The LAZ chunk table is corrupt.');
     let start = offPts + 8;
     if (stored) {
       const d = new Decoder(u8, tp + 8, N), ic = new IntCoder(d, 32, 2);
-      for (let k = 0, prev = 0; k < stored && k < nch; k++) { prev = ic.read(prev, 1) >>> 0; if (start + prev > tp) fail('The LAZ chunk table is corrupt.'); chunks.push([start, start + prev, Math.min(chunkSize, total - k * chunkSize)]); start += prev; }
+      for (let k = 0, prev = 0, cnt = 0, done = 0; k < stored && k < nch; k++) {
+        if (variable) cnt = ic.read(cnt, 0) >>> 0;        // variable chunks (as written for COPC) carry their point counts
+        prev = ic.read(prev, 1) >>> 0;
+        if (start + prev > tp) fail('The LAZ chunk table is corrupt.');
+        const n = variable ? cnt : Math.min(chunkSize, total - k * chunkSize);
+        chunks.push([start, start + prev, Math.min(n, total - done)]); start += prev; done += n;
+      }
     }
-    if (chunks.length < nch) chunks.push([start, tp, total - chunks.length * chunkSize]);
+    if (!variable && chunks.length < nch) chunks.push([start, tp, total - chunks.length * chunkSize]);
   }
   // even sub-sampling: every `step`-th point of every `cstep`-th chunk
   const cstep = Math.max(1, Math.ceil(total / maxDecode)), decoded = cstep === 1 ? total : chunks.reduce((s, c, k) => s + (k % cstep ? 0 : c[2]), 0), step = Math.max(1, Math.ceil(decoded / maxPoints));
@@ -235,8 +286,19 @@ export function parseLAZ(u8, opts = {}) {
   for (let c = 0; c < chunks.length; c += cstep) {
     const [a, b, n] = chunks[c];
     if (!(n > 0) || a + rawLen + 4 > b || b > N) { truncated = true; break; }
-    const dec = new Decoder(u8, a + rawLen, b), pt = point10(dec, u8, a), rest = [];
-    for (let k = 1, o = 20; k < items.length; o += items[k].size, k++) rest.push(items[k].type === 7 ? gpstime11(dec) : items[k].type === 8 ? rgb12(dec) : bytes(dec, items[k].size));
+    let dec, pt;
+    const rest = [];
+    if (layered) {
+      const sizes = a + rawLen + 4, data = sizes + 4 * nLayers;
+      if (data > b) { truncated = true; break; }
+      const nxy = dv.getUint32(sizes, true), nz = dv.getUint32(sizes + 4, true);
+      if (data + nxy + nz > b || (n > 1 && nxy < 4)) { truncated = true; break; }
+      dec = new Decoder(u8, data, data + nxy);
+      pt = point14(u8, a, dec, nz ? new Decoder(u8, data + nxy, data + nxy + nz) : null);
+    } else {
+      dec = new Decoder(u8, a + rawLen, b); pt = point10(dec, u8, a);
+      for (let k = 1; k < items.length; k++) rest.push(items[k].type === 7 ? gpstime11(dec) : items[k].type === 8 ? rgb12(dec) : bytes(dec, items[k].size));
+    }
     keep(pt);
     for (let i = 1; i < n; i++) {
       pt.read();
@@ -249,5 +311,5 @@ export function parseLAZ(u8, opts = {}) {
   if (truncated) warnings.push(`The LAZ data ends early; ${seen} of ${decoded} points were decoded.`);
   if (cstep > 1) warnings.push(`Very large cloud: only every ${cstep}th chunk of ${chunkSize} points was decompressed.`);
   if (step > 1 || cstep > 1) warnings.push(`Point cloud of ${total} points sub-sampled to ${kept}.`);
-  return { xyz: xyz.subarray(0, 3 * kept), total, kept, version: `${major}.${minor}`, pointFormat: fmt, compressor: compressor === 1 ? 'pointwise' : 'pointwise chunked', lazVersion, chunks: chunks.length, warnings };
+  return { xyz: xyz.subarray(0, 3 * kept), total, kept, version: `${major}.${minor}`, pointFormat: fmt, compressor: compressor === 1 ? 'pointwise' : layered ? 'layered chunked' : 'pointwise chunked', lazVersion, chunks: chunks.length, warnings };
 }

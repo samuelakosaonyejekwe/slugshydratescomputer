@@ -9,9 +9,13 @@
 //         units with the global origin applied.
 // Not read: text (7, 17), tags, dimensions, raster and application elements (counted in `skipped`); the placement of
 //         shared-cell instances (35) is not decoded: when a file uses shared cells, each definition (34) is delivered
-//         once in its own coordinates; B-spline knots and weights are ignored. DGN V8 files (OLE2 compound documents with an unpublished element stream) and
-//         cell libraries are recognised and rejected with an explanation.
+//         once in its own coordinates; B-spline knots and weights are ignored. Cell libraries are
+//         recognised and rejected with an explanation. DGN V8 files (compound files) are read by parseDGN8 below for their
+//         basic elements; see its comment for what that covers and how far it was verified.
 // File content is untrusted: element lengths and vertex counts are bounds-checked and element / vertex totals are capped.
+
+import { openCFB } from './fmt_cfb.js';
+import { inflateSync } from './hdf5.js';
 
 function fail(msg) { const e = new Error(msg); e.user = true; throw e; }
 const TAU = 2 * Math.PI, ARC_N = 48;
@@ -33,7 +37,7 @@ export function dgnKind(u8) {
  */
 export function parseDGN(u8, opts = {}) {
   const kind = dgnKind(u8);
-  if (kind === 'v8') fail('This is a MicroStation V8 design file: an OLE2 compound document whose element stream is not publicly documented, so it is not read (V7 design files are). In MicroStation use File > Save As and choose "MicroStation V7 DGN", or File > Export > DXF.');
+  if (kind === 'v8') return parseDGN8(u8, opts);
   if (kind === 'cell') fail('This is a MicroStation V7 cell library, not a design file: it holds cell definitions without a model. Place the cells in a design file and save that, or export DXF.');
   if (kind !== 'v7') fail('Not a MicroStation V7 design file (the design-file header element is missing).');
   const maxElements = opts.maxElements ?? 2e6, maxVertices = opts.maxVertices ?? 5e6, N = u8.length;
@@ -160,4 +164,86 @@ export function parseDGN(u8, opts = {}) {
   else if (counts[35]) warnings.push(`${counts[35]} shared-cell instances were not expanded.`);
   const polylines = useDefs ? main.polylines.concat(defs.polylines) : main.polylines, points = useDefs ? main.points.concat(defs.points) : main.points;
   return { version: 'V7', is3d, units, origin, polylines, points, counts, levels: [...levels].sort((a, b) => a - b), skipped, warnings };
+}
+
+/**
+ * MicroStation V8 design file: a compound file whose model storages ("Dgn-Md/#000000" …) hold the graphic elements as one
+ * zlib-packed stream ("Dgn^G/$1": 16-byte block header, then the packed element records). No specification is published;
+ * the record layout below was established on a file written through the Open Design Alliance library and checked element
+ * by element against GDAL's reading of it: a 32-byte header (type, size in 16-bit words behind the first four bytes, offset
+ * of the linkages, level, element id, time stamp), 24 bytes of symbology whose property word marks 3-D elements, a 48-byte
+ * integer range, then from byte 104 the geometry as IEEE doubles in units of resolution: lines (3), line strings, shapes,
+ * curves and point strings (4, 6, 11, 22: a count, then the points), ellipses (15: axes, rotation or quaternion, centre) and
+ * arcs (16: start, sweep, axes, rotation or quaternion, centre); complex chains (12), complex shapes (14) and cells (2)
+ * are followed by their components. Text, B-splines, shared cells, references, further models and element blocks beyond
+ * the first one are not read. Same result structure as for V7, with version 'V8'.
+ */
+function parseDGN8(u8, opts = {}) {
+  const cfb = openCFB(u8), maxElements = opts.maxElements ?? 2e6, maxVertices = opts.maxVertices ?? 5e6, warnings = [], counts = {}, skipped = {}, levels = new Set(), polylines = [], points = [];
+  const models = cfb.find(/^Dgn-Md\/#[0-9A-Fa-f]+$/).filter((e) => e.type === 'storage').map((e) => e.path).sort(), how = 'In MicroStation use File > Save As and choose "MicroStation V7 DGN", or File > Export > DXF.';
+  if (!models.length) fail(`This compound file holds no MicroStation V8 model (streams: ${cfb.entries.filter((e) => e.type === 'stream').slice(0, 6).map((e) => e.path).join(', ') || 'none'}).`);
+  const stream = cfb.find((e) => e.type === 'stream' && e.path.startsWith(models[0] + '/Dgn^G/$'))[0];
+  if (!stream) fail(`The default model of this MicroStation V8 design file holds no graphic-element stream. ${how}`);
+  const unpack = (b, skip) => { let k = skip; while (k + 2 < b.length && !(b[k] === 0x78 && (b[k + 1] === 0x9c || b[k + 1] === 0x01 || b[k + 1] === 0xda || b[k + 1] === 0x5e))) k++; if (k + 2 >= b.length) fail(`The element stream of this MicroStation V8 design file is not zlib-packed as expected, so it is not read. ${how}`); return inflateSync(b.subarray(k), 256e6); };
+  const d = unpack(cfb.read(stream), 16), N = d.length, dv = new DataView(d.buffer, d.byteOffset, N), f64 = (p) => dv.getFloat64(p, true);
+  // model header: units of resolution per master unit and the unit labels (UTF-16 linkages)
+  let uor = 0, master = '', sub = '', name = '';
+  const mh = cfb.find((e) => e.type === 'stream' && e.path === models[0] + '/Dgn~Mh')[0];
+  if (mh) {
+    try {
+      const h = unpack(cfb.read(mh), 0), hv = new DataView(h.buffer, h.byteOffset, h.length), at = 4100;
+      if (h.length >= at + 248) { const v = hv.getFloat64(at + 224, true); if (v > 0 && Number.isFinite(v)) uor = v; }
+      for (let k = at + 240; k + 16 <= h.length; k += 4) {
+        if (hv.getUint16(k + 2, true) !== 0x56d2) continue;
+        const id = hv.getUint16(k, true), len = hv.getUint32(k + 8, true);
+        if (h[k + 12] !== 0xff || h[k + 13] !== 0xfd || len > 512 || k + 12 + len > h.length) continue;
+        let t = '';
+        for (let q = k + 14; q + 1 < k + 12 + len; q += 2) { const c = hv.getUint16(q, true); if (!c) break; t += String.fromCharCode(c); }
+        if (id === 0x100f) name = t; else if (id === 0x1007) master = t; else if (id === 0x100b) sub = t;
+      }
+    } catch (e) { if (!(e && e.user) && !(e instanceof RangeError)) throw e; }
+  }
+  if (!(uor > 0)) { uor = 1; warnings.push('The model header gives no resolution; coordinates are returned in units of resolution.'); }
+  let nVert = 0, nEl = 0, is3d = false, group = null, p = 4;
+  const count = (t) => { counts[t] = (counts[t] || 0) + 1; };
+  const emit = (pts, closed, level, type) => {
+    if (group) { for (const q of pts) group.pts.push(q); if (--group.left <= 0) { const g = group; group = null; emit(g.pts.filter((q, i) => !i || q.some((v, k) => v !== g.pts[i - 1][k])), g.type === 14, g.level, g.type); } return; }
+    if (pts.length === 1 || (pts.length === 2 && pts[0].every((v, k) => v === pts[1][k]))) { points.push(pts[0][0], pts[0][1], pts[0][2] || 0); return; }
+    if (pts.length < 2) return;
+    if (closed && pts.length > 2 && pts[0].every((v, k) => v === pts[pts.length - 1][k])) pts = pts.slice(0, -1);
+    nVert += pts.length;
+    polylines.push({ x: pts.map((q) => q[0]), y: pts.map((q) => q[1]), ...(is3d ? { z: pts.map((q) => q[2] || 0) } : {}), closed, level, type });
+  };
+  for (; p + 104 <= N; ) {
+    const type = d[p], words = dv.getUint32(p + 4, true), attr = dv.getUint32(p + 8, true), level = dv.getUint32(p + 12, true), size = 4 + 2 * words, end = p + Math.min(size, 4 + 2 * Math.max(attr, 52));
+    if (!(words >= 50) || p + size > N) { if (p + 4 < N && words) warnings.push('The element stream ends inside an element; the elements read so far are kept.'); break; }
+    if (++nEl > maxElements || nVert > maxVertices) { warnings.push('The design file holds more elements than can be shown; the remaining ones were not read.'); break; }
+    const three = !!(dv.getUint32(p + 40, true) & 0x800), w = three ? 24 : 16, g = p + 104, pt = (q) => (three ? [f64(q) / uor, f64(q + 8) / uor, f64(q + 16) / uor] : [f64(q) / uor, f64(q + 8) / uor, 0]);
+    if (three) is3d = true;
+    if (type === 3 && g + 2 * w <= end) { count(3); levels.add(level); emit([pt(g), pt(g + w)], false, level, 3); }
+    else if ((type === 4 || type === 6 || type === 11 || type === 22) && g + 8 <= end) {
+      const n = dv.getUint32(g, true);
+      if (n > 0 && g + 8 + n * w <= end) { count(type); levels.add(level); const pts = []; for (let k = 0; k < n; k++) pts.push(pt(g + 8 + k * w)); if (type === 22 && !group) for (const q of pts) points.push(q[0], q[1], q[2]); else emit(pts, type === 6, level, type); }
+      else skipped['damaged element'] = (skipped['damaged element'] || 0) + 1;
+    } else if ((type === 15 || type === 16) && g + (type === 16 ? 16 : 0) + (three ? 72 : 40) <= end) {
+      const a = type === 16 ? g + 16 : g, start = type === 16 ? f64(g) : 0, sweep = type === 16 ? f64(g + 8) : TAU, r1 = f64(a) / uor, r2 = f64(a + 8) / uor, c = three ? pt(a + 48) : pt(a + 24), n = Math.max(2, Math.ceil((Math.abs(sweep) / TAU) * ARC_N - 1e-9)), pts = [];
+      // orientation: a rotation about z (radians) in 2-D, a quaternion (w, x, y, z) in 3-D
+      let X = [1, 0, 0], Y = [0, 1, 0];
+      if (three) { const qw = f64(a + 16), qx = f64(a + 24), qy = f64(a + 32), qz = f64(a + 40); X = [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)]; Y = [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)]; }
+      else { const r = f64(a + 16); X = [Math.cos(r), Math.sin(r), 0]; Y = [-Math.sin(r), Math.cos(r), 0]; }
+      if ([start, sweep, r1, r2, ...c, ...X, ...Y].every(Number.isFinite)) {
+        count(type); levels.add(level);
+        const full = type === 15 || Math.abs(Math.abs(sweep) - TAU) < 1e-9;
+        for (let k = 0; k <= n - (full && !group ? 1 : 0); k++) { const t = start + (sweep * k) / n, u = r1 * Math.cos(t), v = r2 * Math.sin(t); pts.push([c[0] + u * X[0] + v * Y[0], c[1] + u * X[1] + v * Y[1], c[2] + u * X[2] + v * Y[2]]); }
+        emit(pts, full, level, type);
+      } else skipped['damaged element'] = (skipped['damaged element'] || 0) + 1;
+    } else if ((type === 12 || type === 14) && g + 4 <= end && !group) { const n = dv.getUint32(g, true); count(type); levels.add(level); if (n > 0 && n < 1e6) group = { left: n, pts: [], type, level }; }
+    else if (type === 2) count(2);
+    else { if (group) { group.left--; if (group.left <= 0) { const q = group; group = null; emit(q.pts, q.type === 14, q.level, q.type); } } const nm = TYPE_NAME[type] || `type ${type}`; skipped[nm] = (skipped[nm] || 0) + 1; }
+    p += size;
+  }
+  if (group && group.pts.length > 1) { const q = group; group = null; emit(q.pts, q.type === 14, q.level, q.type); }
+  if (models.length > 1) warnings.push(`The design file holds ${models.length} models; only the first one is read.`);
+  warnings.push('MicroStation V8 files have no published specification: the element layout was established on files written through the Open Design Alliance library; check the result against the drawing.');
+  return { version: 'V8', is3d, units: { master, sub, subPerMaster: 0, uorPerSub: 0, uorPerMaster: uor }, origin: [0, 0, 0], model: name, polylines, points, counts, levels: [...levels].sort((a, b) => a - b), skipped, warnings };
 }
