@@ -94,32 +94,65 @@ export function stratifiedLevel({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0 }
   return { hD, holdup: s.g.AL / s.g.A, vL: s.vL, vG: s.vG, tauWL: s.tL, tauWG: s.tG, tauI: s.ti, geom: s.g };
 }
 
+// section geometry of a stratified layer as a function of the liquid holdup (wetted wall arc and interface chord, both per diameter)
+const SECT = (() => { const M = 400, SL = new Float64Array(M + 1), Si = new Float64Array(M + 1); for (let j = 0; j <= M; j++) { const H = j / M, hD = j === 0 ? 0 : j === M ? 1 : brent((x) => { const c = 2 * x - 1; return (Math.PI - Math.acos(c) + c * Math.sqrt(1 - c * c)) / Math.PI - H; }, 0, 1, 1e-13), c = 2 * hD - 1; SL[j] = Math.PI - Math.acos(c); Si[j] = Math.sqrt(Math.max(1 - c * c, 0)); } return { M, SL, Si }; })();
+const sect = (t, H) => { const u = clamp(H, 0, 1) * SECT.M, j = Math.min(Math.floor(u), SECT.M - 1); return t[j] + (t[j + 1] - t[j]) * (u - j); };
+
 /**
- * Flow pattern. Returns { pattern, strat } with pattern one of 'stratified smooth', 'stratified wavy', 'slug',
- * 'annular', 'dispersed bubble', 'bubble', 'churn', 'single-phase liquid', 'single-phase gas'.
+ * Annular-flow film of the Barnea (1986, 1987) annular ↔ intermittent transition: film holdup H from the combined momentum balance
+ * Y = (1 + 75 H) / [(1 − H)^2.5 H] − X² / H³ (interfacial friction f_i = f_G (1 + 300 δ/D), i.e. 1 + 75 H), X² = (dp/dx)_SL / (dp/dx)_SG,
+ * Y = (ρL − ρG) g sinθ / (dp/dx)_SG. The film is unstable when Y ≥ (2 − 1.5 H) X² / [H³ (1 − 1.5 H)]; the gas core is blocked when H ≥ 0.24
+ * (half of the maximum packing 0.48 of the liquid in a slug). Returns { H, stable, blocked, X2, Y }.
+ */
+export function annularFilm({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0 }) {
+  const dpL = (2 * fanning((rhoL * vsl * D) / muL) * rhoL * vsl * vsl) / D, dpG = (2 * fanning((rhoG * vsg * D) / muG) * rhoG * vsg * vsg) / D, X2 = dpL / dpG, Y = ((rhoL - rhoG) * G * Math.sin(theta)) / dpG;
+  const F = (h) => (1 + 75 * h) / ((1 - h) ** 2.5 * h) - X2 / h ** 3 - Y;
+  let a = 1e-6, fa = F(a), H = null;
+  for (let i = 1; i <= 96; i++) { const b = 10 ** (-6 + (6 * i) / 96) * 0.999, fb = F(b); if (fa * fb <= 0) { H = brent(F, a, b, 1e-12); break; } a = b; fa = fb; } // the thinnest film is the stable solution
+  if (H === null) return { H: 1, stable: false, blocked: true, X2, Y };
+  return { H, stable: H < 2 / 3 && Y < ((2 - 1.5 * H) / (H ** 3 * (1 - 1.5 * H))) * X2, blocked: H >= 0.24, X2, Y };
+}
+
+/**
+ * Flow pattern at any inclination (unified model after Taitel & Dukler 1976, Taitel, Barnea & Dukler 1980 and Barnea 1986, 1987).
+ * Order of the tests: (1) stratified flow exists (not steeper upward than +10°) when the equilibrium level is stable against the
+ * Kelvin–Helmholtz criterion of Taitel & Dukler and, in downward flow, the film is slower than the velocity at which liquid is torn off
+ * and carried to the upper wall, v_L < [g D (1 − h/D) cosθ / f_L]^½ (Barnea, Shoham & Taitel 1982); it is wavy above the wind criterion
+ * (sheltering coefficient 0.01) or, downward, above a film Froude number of 1.5; (2) dispersed bubbles when turbulence keeps the bubbles
+ * smaller than both the deformation and the creaming size (Barnea 1986) at a gas fraction below 0.52, or, near the horizontal, when the
+ * turbulent fluctuations of the liquid overcome buoyancy (Taitel & Dukler); (3) annular flow: near the horizontal (|θ| ≤ 10°) when the
+ * equilibrium level is below 0.35 D, otherwise when the annular film is stable and does not block the core (annularFilm);
+ * (4) bubble flow in steep upward pipes (≥ 60° from the horizontal) wide enough for small bubbles to rise slower than a Taylor bubble, at a
+ * void fraction below 0.25; otherwise (5) intermittent: slug, or churn in upward flow above 0.6 of the annular (droplet-lifting) velocity.
+ * Returns { pattern, strat, film } with pattern one of 'stratified smooth', 'stratified wavy', 'slug', 'annular', 'dispersed bubble',
+ * 'bubble', 'churn', 'single-phase liquid', 'single-phase gas'.
  */
 export function flowPattern({ vsl, vsg, rhoL, rhoG, muL, muG, sigma = 0.02, D, theta = 0 }) {
   if (vsg <= 1e-9) return { pattern: 'single-phase liquid' };
   if (vsl <= 1e-9) return { pattern: 'single-phase gas' };
-  const vm = vsl + vsg, dRho = Math.max(rhoL - rhoG, 1e-6);
-  if (theta > (10 * Math.PI) / 180) { // steeply upward: Taitel–Barnea–Dukler
-    const vAnn = (3.1 * (sigma * G * dRho) ** 0.25) / Math.sqrt(rhoG);
-    if (vsg >= vAnn && vsl / vm < 0.24) return { pattern: 'annular' }; // a thick film bridges the pipe: no stable annular flow above ~24 % liquid
-    const vDB = 4 * ((D ** 0.429 * (sigma / rhoL) ** 0.089) / (muL / rhoL) ** 0.072) * ((G * dRho) / rhoL) ** 0.446;
-    if (vm >= vDB && vsg / vm < 0.52) return { pattern: 'dispersed bubble' };
+  const vm = vsl + vsg, dRho = Math.max(rhoL - rhoG, 1e-6), sinT = Math.sin(theta), cosT = Math.cos(theta), deg = (theta * 180) / Math.PI;
+  let st = null;
+  if (deg <= 10 && deg > -89.99) { // (1) stratified
+    st = stratifiedLevel({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta }); const g = st.geom, c = Math.max(cosT, 1e-6), fL = fanning((rhoL * st.vL * 4 * g.AL) / (g.SL * muL));
+    const stable = st.vG < (1 - st.hD) * Math.sqrt((dRho * G * c * g.AG) / (rhoG * Math.max(g.Si, 1e-9))), torn = theta < 0 && st.vL > Math.sqrt((G * D * (1 - st.hD) * c) / fL);
+    if (stable && !torn && st.hD < 0.999) {
+      const wind = st.vG >= Math.sqrt((4 * muL * dRho * G * c) / (0.01 * rhoL * rhoG * Math.max(st.vL, 1e-9))), froude = st.vL / Math.sqrt(G * Math.max(st.hD * D, 1e-9));
+      return { pattern: wind || (theta < 0 && froude > 1.5) ? 'stratified wavy' : 'stratified smooth', strat: st };
+    }
+  }
+  // (2) dispersed bubble
+  const fm = fanning((rhoL * vm * D) / muL), dMax = (0.725 + 4.15 * Math.sqrt(vsg / vm)) * (sigma / rhoL) ** 0.6 * ((2 * fm * vm ** 3) / D) ** -0.4, dCD = 2 * Math.sqrt((0.4 * sigma) / (dRho * G)), dCB = (0.375 * rhoL * fm * vm * vm) / (dRho * G * Math.max(Math.abs(cosT), 1e-9));
+  if (dMax < Math.min(dCD, dCB) && vsg / vm <= 0.52) return { pattern: 'dispersed bubble', strat: st };
+  if (st && Math.abs(deg) <= 10 && st.hD >= 0.35) { const g = st.geom, fL = fanning((rhoL * st.vL * 4 * g.AL) / (g.SL * muL)); if (st.vL >= Math.sqrt((4 * g.AG * G * Math.max(cosT, 0.02) * (1 - rhoG / rhoL)) / (Math.max(g.Si, 1e-9) * fL))) return { pattern: 'dispersed bubble', strat: st }; }
+  // (3) annular
+  if (st && Math.abs(deg) <= 10) { if (st.hD < 0.35) return { pattern: 'annular', strat: st }; }
+  else { const film = annularFilm({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta }); if (film.stable && !film.blocked) return { pattern: 'annular', strat: st, film }; }
+  // (4) bubble, (5) intermittent
+  if (deg > 10) {
     const vBub = 1.53 * ((G * sigma * dRho) / (rhoL * rhoL)) ** 0.25;
-    if (D > 19 * Math.sqrt((sigma * dRho) / (rhoL * rhoL * G)) && vsg < (vsl + 0.75 * vBub * Math.sin(theta)) / 3) return { pattern: 'bubble' }; // α = 0.25: vsl = 3 vsg − 0.75 v∞ sinθ (0.75 × 1.53 = 1.15)
-    return { pattern: vsg > 0.6 * vAnn ? 'churn' : 'slug' };
+    if (deg >= 60 && D > 19 * Math.sqrt((sigma * dRho) / (rhoL * rhoL * G)) && vsg < (vsl + 0.75 * vBub * sinT) / 3) return { pattern: 'bubble' }; // α = 0.25: vsl = 3 vsg − 0.75 v∞ sinθ (0.75 × 1.53 = 1.15)
+    return { pattern: vsg > (0.6 * 3.1 * (sigma * G * dRho) ** 0.25) / Math.sqrt(rhoG) ? 'churn' : 'slug' };
   }
-  const st = stratifiedLevel({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta }), g = st.geom, cosT = Math.max(Math.cos(theta), 0.02);
-  const stable = st.vG < (1 - st.hD) * Math.sqrt((dRho * G * cosT * g.AG) / (rhoG * Math.max(g.Si, 1e-9)));
-  if (stable && st.hD < 0.999) {
-    const wavy = st.vG >= Math.sqrt((4 * muL * dRho * G * cosT) / (0.01 * rhoL * rhoG * Math.max(st.vL, 1e-9)));
-    return { pattern: wavy || theta < -0.005 ? 'stratified wavy' : 'stratified smooth', strat: st };
-  }
-  if (st.hD < 0.35) return { pattern: 'annular', strat: st };
-  const DL = (4 * g.AL) / g.SL, fL = fanning((rhoL * st.vL * DL) / muL);
-  if (st.vL >= Math.sqrt((4 * g.AG * G * cosT * (1 - rhoG / rhoL)) / (Math.max(g.Si, 1e-9) * fL))) return { pattern: 'dispersed bubble', strat: st };
   return { pattern: 'slug', strat: st };
 }
 
@@ -146,6 +179,31 @@ export function slugLength(D, vm = 3, model = 'scott') {
   return D < 0.1 ? 32 * D : Math.max(32 * D, Math.exp(-26.6 + 28.5 * (Math.log(D) + 3.67) ** 0.1)); // D and length in metres
 }
 /**
+ * Film zone of a slug unit (Taitel & Barnea 1990, equilibrium-film form). In the frame moving with the slug the liquid shed at the tail,
+ * x = (v_t − v_LLS) H_LS, flows back through the film: v_LF = v_t − x / H_LF, and the gas of the bubble v_GF = v_t − (v_t − v_GLS)(1 − H_LS) / (1 − H_LF).
+ * The film holdup is the level at which the film and the gas above it are in momentum equilibrium,
+ *   τ_F S_F / A_F − τ_G S_G / A_G − τ_i S_i (1/A_F + 1/A_G) + (ρL − ρG) g sinθ = 0
+ * (stratified section; a symmetric falling film steeper than 75°), the root reached first when the film thins from the slug tail.
+ * The liquid balance then gives the slug fraction β = (H_U − H_LF) / (H_LS − H_LF) with the unit holdup H_U = (v_sl + x) / v_t.
+ * p: { vsl, vsg, rhoL, rhoG, muL, muG, sigma, D, theta }; o: { vt, HLS } to override the closures.
+ * Returns { vt, HLS, HLF, beta, HU, vLLS, vGLS, vLF, vGF, x, tauF, tauG (Pa, signed), SF, SG (m), wall (film-zone wall force per pipe volume, Pa/m) }.
+ */
+export function slugFilm(p, o = {}) {
+  const { vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, sigma = 0.02 } = p, vm = vsl + vsg, A = (Math.PI * D * D) / 4, vt = o.vt ?? slugVelocity(vm, D, theta).vt, HLS = clamp(o.HLS ?? slugBodyHoldup(vm), 0.05, 1), dRho = Math.max(rhoL - rhoG, 1e-6), sinT = Math.sin(theta);
+  const vGLS = Math.min(1.2 * vm + 1.53 * ((G * sigma * Math.max(dRho, 1)) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * Math.sin(Math.max(theta, 0)), vt), vLLS = (vm - vGLS * (1 - HLS)) / HLS, x = Math.max((vt - vLLS) * HLS, 1e-9 * vt), y = (vt - vGLS) * (1 - HLS), ring = theta > (75 * Math.PI) / 180;
+  const at = (H) => {
+    const AF = H * A, AG = (1 - H) * A, SF = ring ? Math.PI * D : D * sect(SECT.SL, H), SG = ring ? 0 : Math.PI * D - SF, Si = ring ? Math.PI * D * Math.sqrt(1 - H) : D * sect(SECT.Si, H);
+    const vLF = vt - x / H, vGF = vt - y / (1 - H), fF = fanning((rhoL * Math.abs(vLF) * 4 * AF) / (SF * muL)), fG = fanning((rhoG * Math.abs(vGF) * 4 * AG) / (Math.max(SG + Si, 1e-12) * muG)), fi = Math.max(fG, 0.0142);
+    const tF = 0.5 * fF * rhoL * vLF * Math.abs(vLF), tG = 0.5 * fG * rhoG * vGF * Math.abs(vGF), ti = 0.5 * fi * rhoG * (vGF - vLF) * Math.abs(vGF - vLF);
+    return { F: (tF * SF) / AF - (tG * SG) / AG - ti * Si * (1 / AF + 1 / AG) + dRho * G * sinT, tF, tG, SF, SG, vLF, vGF };
+  };
+  const hi = Math.min(HLS, 0.999) * 0.9999, lo = 1e-4, n = 40; let hb = hi, fb = at(hb).F, HLF = null;
+  for (let i = 1; i <= n; i++) { const h = hi * (lo / hi) ** (i / n), fh = at(h).F; if (fb * fh <= 0) { HLF = brent((q) => at(q).F, h, hb, 1e-10); break; } hb = h; fb = fh; }
+  if (HLF === null) HLF = Math.abs(at(lo).F) < Math.abs(at(hi).F) ? lo : hi;
+  const e = at(HLF), HU = clamp((vsl + x) / vt, Math.min(vsl / Math.max(vm, 1e-9), 1), 1), beta = clamp((HU - HLF) / Math.max(HLS - HLF, 1e-9), 0, 1);
+  return { vt, HLS, HLF, beta, HU, vLLS, vGLS, vLF: e.vLF, vGF: e.vGF, x, tauF: e.tF, tauG: e.tG, SF: e.SF, SG: e.SG, wall: (e.tF * e.SF + e.tG * e.SG) / A };
+}
+/**
  * Hydrodynamic slug unit-cell summary at one location. The unit cell obeys freq × unitLength = vt and length = slugFraction × unitLength,
  * so only one of slug length and slug frequency can come from a correlation; the other is derived:
  *   basis 'length' (default): the developed-slug length correlation (lengthModel) is kept and freq = slugFraction · vt / length;
@@ -156,13 +214,10 @@ export function slugLength(D, vm = 3, model = 'scott') {
  */
 export function slugUnit({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta = 0, freqModel = 'zabaras', lengthModel = 'scott', basis = 'length', sigma = 0.02 }) {
   const vm = vsl + vsg, A = (Math.PI * D * D) / 4, { vt, C0, vd } = slugVelocity(vm, D, theta), HLS = slugBodyHoldup(vm);
-  const vGb = 1.2 * vm + 1.53 * ((G * sigma * Math.max(rhoL - rhoG, 1)) / (rhoL * rhoL)) ** 0.25 * Math.sqrt(HLS) * Math.sin(Math.max(theta, 0));
-  const holdup = clamp((vt * HLS + vGb * (1 - HLS) - vsg) / vt, vsl / Math.max(vm, 1e-9), 1);
-  let HLF = clamp(stratifiedLevel({ vsl: Math.max(vsl * 0.3, 1e-4), vsg, rhoL, rhoG, muL, muG, D, theta: Math.min(theta, 0.15) }).holdup, 0.01, 0.9 * HLS);
-  HLF = Math.min(HLF, holdup * 0.98);
+  const film = slugFilm({ vsl, vsg, rhoL, rhoG, muL, muG, D, theta, sigma }, { vt, HLS }), holdup = film.HU, HLF = clamp(film.HLF, 1e-4, Math.min(0.999 * HLS, holdup)); // film zone from the Taitel–Barnea equilibrium film
   const beta = clamp((holdup - HLF) / Math.max(HLS - HLF, 1e-6), 0.02, 1), lengthCorrelation = slugLength(D, vm, lengthModel), freqCorrelation = slugFrequency(vsl, vm, D, theta, freqModel);
   const useF = basis === 'frequency' && freqCorrelation > 0, length = useF ? (beta * vt) / freqCorrelation : lengthCorrelation, freq = useF ? freqCorrelation : (beta * vt) / length;
-  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, freq, length, lengthFromFreq: length, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength: length / beta, slugFraction: beta, volume: length * A * HLS, period: freq > 0 ? 1 / freq : Infinity, freqCorrelation, lengthCorrelation, basis: useF ? 'frequency' : 'length' };
+  return { vt, C0, vd, holdupSlug: HLS, holdupFilm: HLF, holdup, freq, length, lengthFromFreq: length, lengthMax: length * Math.exp(3.09 * 0.5 - 0.125), unitLength: length / beta, slugFraction: beta, volume: length * A * HLS, period: freq > 0 ? 1 / freq : Infinity, freqCorrelation, lengthCorrelation, basis: useF ? 'frequency' : 'length', film };
 }
 /**
  * Severe (riser-induced) slugging screening. Bøe criterion and the Pots number.
@@ -221,8 +276,10 @@ function mechanistic(p) {
     return { holdup, fric: fricTot, grav: rhoM * G * Math.sin(theta), acc: 0, regime: fp.pattern, tauW: st.tauWL, fricGas: fricG };
   }
   if (fp.pattern === 'slug' || fp.pattern === 'churn') {
+    // slug unit: wall friction of the slug body over the slug fraction β plus the wall forces of the film zone (liquid film and gas bubble) over 1 − β;
+    // the static head carries the unit holdup. The film is the equilibrium film of slugFilm(), so a film falling back in upward flow lowers the gradient.
     const u = slugUnit(p), rhoS = rhoL * u.holdupSlug + rhoG * (1 - u.holdupSlug), muS = muL * u.holdupSlug + muG * (1 - u.holdupSlug), f = frictionFactor((rhoS * vm * D) / muS, rough / D, fModel);
-    const rhoU = rhoL * u.holdup + rhoG * (1 - u.holdup), fric = ((f * rhoS * vm * vm) / (2 * D)) * u.slugFraction + ((0.02 * rhoG * vm * vm) / (2 * D)) * (1 - u.slugFraction);
+    const rhoU = rhoL * u.holdup + rhoG * (1 - u.holdup), b = u.film.beta, fric = ((f * rhoS * vm * vm) / (2 * D)) * b + u.film.wall * (1 - b);
     const grav = rhoU * G * Math.sin(theta), Ek = clamp((rhoU * vm * vsg) / Math.max(P, 1e4), 0, 0.6);
     return { holdup: u.holdup, fric, grav, acc: ((fric + grav) * Ek) / (1 - Ek), regime: fp.pattern, tauW: (f * rhoS * vm * vm) / 8, slug: u };
   }

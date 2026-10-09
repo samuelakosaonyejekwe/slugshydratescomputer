@@ -10,7 +10,7 @@ import { openSQLite } from './sqlite.js';
 import { parseDGN } from './fmt_dgn.js';
 import { parseE57 } from './fmt_e57.js';
 import { parseLAZ, isLAZ } from './fmt_laz.js';
-import { recognisePipes, angularExtent } from './fmt_brep.js';
+import { recognisePipes, angularExtent, nurbsSurfPoint } from './fmt_brep.js';
 import { parseSAT, parseSAB, isSAB } from './fmt_acis.js';
 import { parseXT, parseXB, xtKind } from './fmt_xt.js';
 import { parseDWG } from './fmt_dwg.js';
@@ -2314,17 +2314,53 @@ function patchFace(P, u0, du, v0, dv, sense, tri) {
   for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) { const a = g[j * (nu + 1) + i], b = g[j * (nu + 1) + i + 1], c = g[(j + 1) * (nu + 1) + i + 1], d = g[(j + 1) * (nu + 1) + i]; put(a, b, c); put(a, c, d); }
 }
 /**
+ * B-spline face: the surface is filled over the parametric rectangle spanned by its boundary (each boundary point is
+ * projected by a grid search refined by halving steps). Returns false when the boundary does not lie on the surface.
+ */
+function splineFace(f, tri) {
+  const s = f.surf.nurbs, U0 = s.knotsU[s.degU], U1 = s.knotsU[s.nU], V0 = s.knotsV[s.degV], V1 = s.knotsV[s.nV], pts = f.loops.flatMap((l) => l.pts);
+  let a = U0, b = U1, c = V0, d = V1;
+  if (pts.length) {
+    const G = 12, grid = [], step = Math.max(1, Math.ceil(pts.length / 24)), dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+    for (let j = 0; j <= G; j++) for (let i = 0; i <= G; i++) { const u = U0 + ((U1 - U0) * i) / G, v = V0 + ((V1 - V0) * j) / G; grid.push([u, v, nurbsSurfPoint(s, u, v)]); }
+    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity], worst = 0;
+    for (const q of pts) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], q[k]); hi[k] = Math.max(hi[k], q[k]); }
+    a = c = Infinity; b = d = -Infinity;
+    for (let n = 0; n < pts.length; n += step) {
+      const q = pts[n];
+      let best = Infinity, bu = U0, bv = V0, su = (U1 - U0) / G, sv = (V1 - V0) / G;
+      for (const g of grid) { const e = dist(g[2], q); if (e < best) { best = e; bu = g[0]; bv = g[1]; } }
+      for (let it = 0; it < 60 && (su > 1e-9 * (U1 - U0) || sv > 1e-9 * (V1 - V0)); it++) {
+        let moved = false;
+        for (const [du, dv] of [[su, 0], [-su, 0], [0, sv], [0, -sv]]) { const u = Math.min(U1, Math.max(U0, bu + du)), v = Math.min(V1, Math.max(V0, bv + dv)), e = dist(nurbsSurfPoint(s, u, v), q); if (e < best) { best = e; bu = u; bv = v; moved = true; } }
+        if (!moved) { su /= 2; sv /= 2; }
+      }
+      worst = Math.max(worst, best); a = Math.min(a, bu); b = Math.max(b, bu); c = Math.min(c, bv); d = Math.max(d, bv);
+    }
+    if (worst > 1e-3 * (dist(lo, hi) || 1)) return false;
+  }
+  if (!(b > a) || !(d > c)) return false;
+  // one strip per knot span inside the rectangle, refined for curved (degree > 1) directions
+  const cuts = (deg, knots, lo, hi) => { const ks = [lo, ...knots.filter((k, i) => k > lo && k < hi && k !== knots[i - 1]), hi], out = [], n = deg > 1 ? Math.max(2, Math.min(8, Math.ceil(96 / ks.length))) : 1; for (let i = 0; i + 1 < ks.length; i++) for (let j = 0; j < n; j++) out.push(ks[i] + ((ks[i + 1] - ks[i]) * j) / n); out.push(hi); return out.length > 400 ? out.filter((_, i) => i % Math.ceil(out.length / 400) === 0 || i === out.length - 1) : out; };
+  const us = cuts(s.degU, s.knotsU, a, b), vs = cuts(s.degV, s.knotsV, c, d), g = [];
+  for (const v of vs) for (const u of us) g.push(nurbsSurfPoint(s, u, v));
+  const nu = us.length, eq = (p, q) => p[0] === q[0] && p[1] === q[1] && p[2] === q[2], put = (p, q, r) => { if (eq(p, q) || eq(q, r) || eq(p, r)) return; for (const w of f.sense ? [p, q, r] : [p, r, q]) tri.push(w[0], w[1], w[2]); };
+  for (let j = 0; j + 1 < vs.length; j++) for (let i = 0; i + 1 < nu; i++) { const p = g[j * nu + i], q = g[j * nu + i + 1], r = g[(j + 1) * nu + i + 1], t = g[(j + 1) * nu + i]; put(p, q, r); put(p, r, t); }
+  return true;
+}
+/**
  * Neutral B-rep model -> Geometry. A model recognised as a pipe gives its centreline (3-D polyline) with g.pipe = { runs,
  * diameters, length }; any other model gives the tessellation of its analytic faces, or its wireframe when no face can be
  * tessellated. opts.prefer = 'centreline' | 'mesh' | 'wireframe' overrides the choice.
  */
 function brepGeom(m, opts) {
   const warnings = m.warnings.slice(), tri = [], pr = recognisePipes(m), left = {}, units = BREP_UNIT[m.unitScale], prefer = String(opts.prefer || '');
-  let done = 0;
+  let done = 0, nSpline = 0, spl = 0;
   for (const f of m.faces) {
     const s = f.surf, before = tri.length, pl = s.o ? { o: s.o, x: s.x, y: cross(s.z, s.x), z: s.z } : null, pts = f.loops.flatMap((l) => l.pts);
     let why = s.type === 'spline' ? 'free-form (spline)' : s.type;
-    if (s.type === 'plane') planarFace(f.loops.filter((l) => !l.single).map((l) => ({ pts: l.pts })), pl, f.sense, tri);
+    if (s.type === 'spline' && s.nurbs) { if (nSpline++ < 20000 && splineFace(f, tri)) spl++; else why = 'B-spline surface whose boundary could not be located'; }
+    else if (s.type === 'plane') planarFace(f.loops.filter((l) => !l.single).map((l) => ({ pts: l.pts })), pl, f.sense, tri);
     else if ((s.type === 'cylinder' || s.type === 'cone') && s.ratio === undefined) revolvedFace(f.loops, pl, s.r, s.tanA, f.sense, tri);
     else if (s.type === 'cylinder' || s.type === 'cone') why = 'elliptical ' + s.type;
     else if (s.type === 'torus') {
@@ -2356,7 +2392,7 @@ function brepGeom(m, opts) {
   }
   if (want === 'mesh') {
     if (nLeft) warnings.push(`${done} of ${m.faces.length} faces tessellated; ${nLeft} left out (${Object.entries(left).map(([k, v]) => `${v} × ${k}`).join(', ')}). Export STEP AP242 with tessellation or STL for a complete surface.`);
-    if (m.counts.surfaces.torus || m.counts.surfaces.sphere) warnings.push('Toroidal and spherical faces are filled over the parametric rectangle of their boundary (exact for elbows and untrimmed patches).');
+    if (m.counts.surfaces.torus || m.counts.surfaces.sphere || spl) warnings.push(`Toroidal, spherical${spl ? ' and B-spline' : ''} faces are filled over the parametric rectangle of their boundary (exact for elbows and untrimmed patches${spl ? `; ${spl} B-spline faces` : ''}).`);
     return Object.assign(meshGeom(tri, { warnings, stats: { ...stats, representation: 'tessellated faces' } }), pr.runs.length ? { pipe } : {});
   }
   if (want !== 'wireframe') fail('The model holds no face or edge geometry that can be shown.');
@@ -2365,14 +2401,14 @@ function brepGeom(m, opts) {
 }
 async function readSAT(ctx) {
   const u8 = await ctx.bytes();
-  if (isSAB(u8)) parseSAB();
-  if (ctx.ext === 'sab') fail('The .sab file does not start with an ACIS binary header. Save the model as text ACIS (.sat) or STEP.');
+  if (isSAB(u8)) return brepGeom(parseSAB(u8), ctx.opts);
+  if (ctx.ext === 'sab') fail('The .sab file does not start with an ACIS binary header ("ACIS BinaryFile" or "ASM BinaryFile").');
   return brepGeom(parseSAT(latin1.decode(u8)), ctx.opts);
 }
 
 async function readXT(ctx) {
   const u8 = await ctx.bytes(), kind = xtKind(u8);
-  if (kind === 'binary' || kind === 'neutral') parseXB();
+  if (kind === 'binary' || kind === 'neutral') return brepGeom(parseXB(u8), ctx.opts);
   if (!kind) fail('Not a Parasolid transmit file (the "**PARASOLID" keyword header is missing).');
   return brepGeom(parseXT(latin1.decode(u8)), ctx.opts);
 }
@@ -2380,20 +2416,47 @@ async function readXT(ctx) {
 // ---- AutoCAD DWG (fmt_dwg.js) -------------------------------------------------------------------------------------------
 const DWG_UNIT = { 1: 'in', 2: 'ft', 4: 'mm', 5: 'cm', 6: 'm', 7: 'km', 10: 'yd', 14: 'dm' };
 async function readDWG(ctx) {
-  const d = parseDWG(await ctx.bytes()), warnings = d.warnings, polys = [];
+  const d = parseDWG(await ctx.bytes(), { space: ctx.opts.space }), warnings = d.warnings, polys = [];
   for (const p of d.polylines) {
     if (!p.spline) { polys.push(p); continue; }
     const s = p.spline, smp = s.points.length ? nurbsCurve(s.degree, s.knots, s.points, s.weights, NaN, NaN, 8 * s.points.length) : null, pts = smp || (s.fit.length > 1 ? s.fit : s.points);
     if (pts.length > 1) polys.push({ x: pts.map((q) => q[0]), y: pts.map((q) => q[1]), ...(pts.some((q) => q[2] !== 0) ? { z: pts.map((q) => q[2]) } : {}), closed: !smp && s.closed, layer: p.layer, type: 'SPLINE' });
   }
-  const sk = Object.entries(d.skipped), unit = DWG_UNIT[d.insunits], stats = { version: d.version, release: `AutoCAD ${d.release}`, entities: d.counts, layers: d.layers.slice(0, 200), ...(unit ? { units: unit } : {}), ...(d.insunits !== null ? { insunits: d.insunits } : {}) };
+  const sk = Object.entries(d.skipped), unit = DWG_UNIT[d.insunits], labels = d.labels.slice(0, 5000);
+  const stats = { version: d.version, release: `AutoCAD ${d.release}`, entities: d.counts, layers: d.layers.slice(0, 200), ...(unit ? { units: unit } : {}), ...(d.insunits !== null ? { insunits: d.insunits } : {}), ...(d.labels.length ? { labels: d.labels.length } : {}), ...(d.paperSpace ? { paperSpaceEntities: d.paperSpace } : {}), ...(d.hidden ? { invisibleEntities: d.hidden } : {}) };
+  const offLayers = d.layerInfo.filter((l) => l.off || l.frozen).map((l) => l.name);
+  if (offLayers.length) { stats.layersOff = offLayers.slice(0, 200); warnings.push(`Layers switched off or frozen are still read: ${offLayers.slice(0, 8).join(', ')}${offLayers.length > 8 ? ' …' : ''}.`); }
   if (sk.length) warnings.push(`Entities that carry no line work were skipped: ${sk.slice(0, 12).map(([k, v]) => `${v} × ${k}`).join(', ')}.`);
-  if (d.insunits === null) warnings.push('The drawing unit ($INSUNITS) is not read for this DWG version; coordinates are returned as drawn.');
+  if (d.insunits === null) warnings.push(/^AC101[24]$/.test(d.version) ? 'R13 and R14 drawings carry no drawing unit ($INSUNITS came with AutoCAD 2000); coordinates are returned as drawn.' : 'The drawing unit ($INSUNITS) could not be read; coordinates are returned as drawn.');
   else if (!unit) warnings.push('The drawing is unitless ($INSUNITS = 0 or an unusual unit); coordinates are returned as drawn.');
-  if (!polys.length && !d.points.length && d.faces.length) return meshGeom(d.faces, { warnings, stats: { ...stats, faces3d: d.counts['3DFACE'] } });
-  if (d.faces.length) warnings.push(`${d.counts['3DFACE']} 3DFACE entities were ignored in favour of the line work.`);
-  if (!polys.length && !d.points.length) fail(`No LINE, POLYLINE, CIRCLE, ARC, ELLIPSE, SPLINE, POINT or 3DFACE entities were found in the model space of this AutoCAD ${d.release} drawing${sk.length ? ` (it holds ${sk.slice(0, 6).map(([k, v]) => `${v} × ${k}`).join(', ')})` : ''}.`);
-  return linesOrPoints(polys, d.points, { warnings, stats });
+  if (d.paperSpace && (ctx.opts.space || 'model') === 'model') warnings.push(`${d.paperSpace} paper-space entities (sheet layouts) were left out; pass opts.space = "paper" or "all" to read them.`);
+  if (d.hidden) warnings.push(`${d.hidden} invisible entities were left out.`);
+  // embedded ACIS bodies (3DSOLID, REGION, BODY): read through the SAT / SAB reader, tessellated in drawing coordinates
+  const solidTri = [], solidPolys = [];
+  let nSolid = 0, badSolid = 0, pipe = null;
+  for (const so of d.solids) {
+    try {
+      const m = so.format === 'sab' ? parseSAB(so.data) : parseSAT(so.data), g = brepGeom(m, { prefer: ctx.opts.prefer || 'mesh' });
+      if (g.kind === 'mesh') for (const v of g.triangles) solidTri.push(v); else for (const q of g.polylines) solidPolys.push({ ...q, layer: so.layer, type: so.type });
+      if (g.pipe && g.pipe.isPipe && !pipe) pipe = g.pipe;
+      nSolid++;
+    } catch (e) { if (!(e && e.user) && !(e instanceof RangeError) && !(e instanceof TypeError)) throw e; badSolid++; }
+    if (solidTri.length > L.triangles * 9) fail(`The solids of the drawing tessellate to too many triangles (limit ${L.triangles}).`);
+  }
+  if (nSolid) stats.solids = nSolid;
+  if (badSolid) warnings.push(`${badSolid} embedded ACIS bodies could not be read.`);
+  const wantSolids = String(ctx.opts.prefer || '') === 'solids' || polys.length + d.points.length / 3 < nSolid;   // a drawing of solids with a stray line or two is a 3-D model
+  let g;
+  if (solidTri.length && wantSolids) g = Object.assign(meshGeom(solidTri, { warnings, stats: { ...stats, representation: 'tessellated ACIS solids' } }), pipe ? { pipe } : {});
+  else if (!polys.length && !d.points.length && !solidPolys.length && d.faces.length) g = meshGeom(d.faces, { warnings, stats: { ...stats, faces3d: d.counts['3DFACE'] } });
+  else {
+    if (solidTri.length) warnings.push(`${nSolid} ACIS solids were read but left out in favour of the line work; pass opts.prefer = "solids" for their tessellation.`);
+    if (d.faces.length) warnings.push(`${d.counts['3DFACE']} 3DFACE entities were ignored in favour of the line work.`);
+    if (!polys.length && !d.points.length && !solidPolys.length) fail(`No LINE, POLYLINE, CIRCLE, ARC, ELLIPSE, SPLINE, POINT, 3DFACE or readable 3DSOLID entities were found in the ${ctx.opts.space === 'paper' ? 'paper' : 'model'} space of this AutoCAD ${d.release} drawing${sk.length ? ` (it holds ${sk.slice(0, 6).map(([k, v]) => `${v} × ${k}`).join(', ')})` : ''}${labels.length ? `; it carries ${d.labels.length} text labels` : ''}.`);
+    g = linesOrPoints(polys.length || d.points.length ? polys : solidPolys, d.points, { warnings, stats });
+  }
+  if (labels.length) g.labels = labels;
+  return g;
 }
 
 // ---- MicroStation DGN V7 (fmt_dgn.js) ------------------------------------------------------------------------------

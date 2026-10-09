@@ -1,0 +1,13 @@
+# Daily warm-up of the shared data cache of HydraSlug (see worker.js).
+#   deploy:  npx wrangler deploy --config functions-cron/wrangler.toml
+#   remove:  npx wrangler delete --config functions-cron/wrangler.toml
+name = "hydraslug-feed-warmer"
+main = "worker.js"
+compatibility_date = "2026-04-01"
+workers_dev = true
+
+[triggers]
+crons = ["17 5 * * *", "17 17 * * *"]   # 05:17 and 17:17 UTC, every day
+
+[vars]
+FEED_URL = "https://hydraslug.pages.dev/api/feed"

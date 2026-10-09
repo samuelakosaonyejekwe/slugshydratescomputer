@@ -4,7 +4,7 @@
 const VERSION = '__VERSION__';
 const SHELL = 'hydraslug-shell-' + VERSION, DATA = 'hydraslug-data-v1', TILES = 'hydraslug-tiles-v1';
 const FILES = __FILES__;
-const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org', 'raw.githubusercontent.com', 'api.eia.gov', 'sdmx.oecd.org', 'api.bls.gov', 'api.imf.org', 'ec.europa.eu', 'stats.bis.org', 'api.db.nomics.world'];
+const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org', 'raw.githubusercontent.com', 'api.eia.gov', 'sdmx.oecd.org', 'api.bls.gov', 'api.imf.org', 'ec.europa.eu', 'stats.bis.org', 'api.db.nomics.world', 'geo.vliz.be'];
 
 const tell = async (msg) => { for (const c of await self.clients.matchAll({ includeUncontrolled: true })) c.postMessage(msg); };
 
@@ -37,6 +37,7 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin === self.location.origin) {
+    if (url.pathname.startsWith('/api/')) return; // shared data feeds of the mirror: always from the network, never from the stored shell
     if (url.pathname.endsWith('/version.json')) { // always ask the network which build is current
       e.respondWith(fetch(req, { cache: 'no-store' }).catch(() => new Response(JSON.stringify({ version: VERSION }), { headers: { 'Content-Type': 'application/json' } })));
       return;

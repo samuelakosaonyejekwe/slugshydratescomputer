@@ -18,6 +18,7 @@ export const BASE = Object.freeze({
   // reservoir and well
   pRes: 300, tRes: 90, pi: 25, // bara, °C, productivity index Sm³/d/bar (stock-tank liquid)
   wellTVD: 2600, wellMD: 3400, tubingIdMm: 114.3, // below mudline
+  wells: 3, // producing wells sharing the case rate equally: the smallest count that holds it within a 70 bar drawdown with the chokes about 60 % open and subsea boosting (well-count study of the network suite)
   // steel: API 5L X65
   smys: 450, smts: 535, E: 207000, poisson: 0.3, alphaT: 1.17e-5, rhoSteel: 7850, corrosionAllowanceMm: 3, designPressure: 345, designTemp: 110, // MPa, MPa, MPa, -, 1/K, kg/m³, mm, bara, °C
   // topsides

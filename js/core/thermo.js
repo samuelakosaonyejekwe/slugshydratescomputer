@@ -2,7 +2,7 @@
 // equations of state (Peng–Robinson, Soave–Redlich–Kwong, Redlich–Kwong, van der Waals) with volume
 // translation, two-phase PT flash with tangent-plane stability, saturation points, phase envelope,
 // thermal and transport properties, standard-condition rates, tabulated properties for the flow solvers
-// and a screening hydrate curve with inhibitor/salt depression.
+// and a screening hydrate curve with inhibitor/salt depression (fitted to the hydrate model of the PVT suite, on its warm side).
 // Units at the interface: pressure bara, temperature °C, composition mol %, SI everywhere else.
 import { brent, clamp, linspace, logspace } from './num.js';
 import { density as rhoBrine, viscosity as muBrine, cp as cpBrine, conductivityThermal as kBrine, psat as psatWater } from './props.js';
@@ -363,12 +363,18 @@ export function waterContent(Pbar, Tc) {
 }
 
 // ---- hydrate screening curve ----------------------------------------------------------------------------
-/** Hydrate temperature depression (°C) by salt and thermodynamic inhibitor in the aqueous phase (Nielsen–Bucklin on the water mole fraction). */
+// Used by every suite until the PVT suite has published its hydrate curve; meant to lie on the warm (conservative) side of that model.
+// Depression: Nielsen–Bucklin form ΔT = −K·ln(x_w) on the water mole fraction (salt counted as two ions). K = 60 K instead of the original
+// 72 K (129.6 °F): against the van der Waals–Platteeuw model of the PVT suite (structure I and II gases, 30–100 bara) 72 K over-predicts
+// the depression by up to 2 K for 50 wt % MEG, 4.4 K for 50 wt % methanol and 0.2 K for sea water; with 60 K the screening value stays
+// below the model (and below the measured depressions behind it) from 0 to 60 wt % MEG, 0 to 50 wt % methanol and 0 to 25 wt % NaCl.
+const HYD_K = 60;
+/** Hydrate temperature depression (°C) by salt and thermodynamic inhibitor in the aqueous phase (Nielsen–Bucklin form on the water mole fraction, conservative constant). */
 export function hydrateDepression(aq = {}) {
   const S = clamp(aq.S || 0, 0, 260) / 1000, w = clamp((aq.inhWt || 0) / 100, 0, 0.95), mwI = (aq.inh || INHIBITORS.none).MW;
   // 1 kg of aqueous phase: inhibitor w, the remainder is brine of salinity S
   const mBr = 1 - w, nW = (mBr * (1 - S)) / 0.018015, nS = (2 * mBr * S) / 0.05844, nI = w / (mwI * 1e-3), xw = nW / (nW + nS + nI);
-  return -72 * Math.log(xw);
+  return -HYD_K * Math.log(xw);
 }
 /** Inhibitor mass fraction (wt % of the aqueous phase) that gives a required depression (°C) on top of the salt already present. */
 export function inhibitorFor(dT, inhId = 'MEG', S = 0) {
@@ -377,10 +383,17 @@ export function inhibitorFor(dT, inhId = 'MEG', S = 0) {
   const g = (w) => hydrateDepression({ S, inhWt: w, inh }) - dT;
   return g(94) < 0 ? 94 : brent(g, 0, 94, 1e-8);
 }
-/** Hydrate equilibrium temperature (°C) of a natural gas of specific gravity sg at P (bara) with fresh water (Motiee correlation). */
+// Gas-gravity correlation T0 = c0 + c1 L + c2 L² + c3 L³ + c4 g + c5 g L + c6 g² + c7 g L², L = ln P (bara), g = ln(gravity / 0.554): least-squares
+// fit to the hydrate model of the PVT suite (van der Waals–Platteeuw, Kihara cell potential, with its high-pressure allowance) for 110 fluids —
+// 91 natural gases of gravity 0.57–0.96, 3 condensates and 16 oils — at 5–700 bara, using the gravity of the gas present at the pressure,
+// then shifted 1.0 K warm. Residuals (correlation − model): gases +0.8 K on average (root-mean-square 1.5 K, −2.1 to +6.2 K, 74 % warm; the warm
+// extreme is CO2/N2-rich gas). It replaces the Motiee (1991) correlation, which lay 2.0 K cold on the same gases (−5.8 K at worst, 9 % warm) and
+// 1.3–2.5 K cold against measured lean natural gases. Above its maximum in gravity the curve is held, so it never falls for a richer gas.
+const HYD_GG = [-35.83395, 20.107312, -2.8607855, 0.19910187, 59.399221, -4.8383636, -50.566214, 0.10784743];
+/** Hydrate equilibrium temperature (°C) of a natural gas of specific gravity sg at P (bara) with fresh water (gas-gravity screening correlation). */
 export function hydrateT0(Pbar, sg = 0.65) {
-  const lp = Math.log10(clamp(Pbar, 1, 700) * 14.5038), g = clamp(sg, 0.554, 1);
-  return (-238.24469 + 78.99667 * lp - 5.352544 * lp * lp + 349.473877 * g - 150.854675 * g * g - 27.604065 * lp * g - 32) / 1.8;
+  const c = HYD_GG, L = Math.log(clamp(Pbar, 1, 700)), lin = c[4] + c[5] * L + c[7] * L * L, g = Math.min(Math.log(clamp(sg, 0.554, 1) / 0.554), Math.max(0, -lin / (2 * c[6])));
+  return c[0] + c[1] * L + c[2] * L * L + c[3] * L ** 3 + lin * g + c[6] * g * g;
 }
 /** Hydrate equilibrium temperature (°C) including salt and inhibitor. */
 export const hydrateT = (Pbar, sg, aq) => hydrateT0(Pbar, sg) - (aq ? hydrateDepression(aq) : 0);
@@ -429,6 +442,24 @@ export function lookup(t, Pbar, Tc) {
   return o;
 }
 
+/**
+ * Screening hydrate curve of a fluid from its property table (used until the PVT suite has published its curve): the gas-gravity correlation with
+ * the gravity of the gas actually present at the pressure (for an oil it is leaner than the stock-tank gas); above the highest pressure at which the
+ * fluid still has a gas phase at the hydrate temperature the curve continues with 0.015 K per bar, the slope of the PVT model for a liquid-filled line.
+ * Returns a function P (bara) -> fresh-water hydrate temperature (°C).
+ */
+export function hydrateScreening(table, gasSG = table.gasSG || 0.7) {
+  let scr = null;
+  return (P) => {
+    if (!scr) { scr = []; for (const p of table.P) { const o = lookup(table, p, hydrateT0(p, gasSG)); if (o.wG > 1e-4) scr.push([Math.log(p), clamp(o.mwG / MW_AIR, 0.554, Math.max(gasSG, 0.554))]); } }
+    if (!scr.length) return hydrateT0(P, gasSG);
+    const lp = Math.log(clamp(P, 1, 700)), top = scr[scr.length - 1], pTop = Math.exp(top[0]);
+    if (lp >= top[0]) return scr.length < table.P.length && pTop < 690 ? hydrateT0(pTop, top[1]) + 0.015 * (clamp(P, 1, 700) - pTop) : hydrateT0(P, top[1]);
+    let i = 0; while (i < scr.length - 2 && scr[i + 1][0] < lp) i++;
+    const u = clamp((lp - scr[i][0]) / (scr[i + 1][0] - scr[i][0] || 1), 0, 1);
+    return hydrateT0(P, scr[i][1] + u * (scr[i + 1][1] - scr[i][1]));
+  };
+}
 const tableCache = new Map();
 const specKey = (s) => JSON.stringify([s.comp, s.c7MW, s.c7SG, s.rateBasis, s.qOil, s.qGas, s.mdot, s.wc, s.qWater, s.salinity, s.inhibitor, s.inhWt, s.eos, s.nPseudo]);
 /**
@@ -447,7 +478,8 @@ export function fluidModel(ctx = {}, override = {}) {
   if (!table) { table = tableCache.get(key); if (!table) { table = buildTable(spec); if (tableCache.size > 6) tableCache.clear(); tableCache.set(key, table); } }
   const aq = aqueous(spec), rates = table.rates, gasSG = table.gasSG || 0.7, curve = ctx.outputs?.pvt?.hydrateCurve, useCurve = pub === table && curve && Array.isArray(curve.P) && curve.P.length > 3;
   const curveT = (P, arr) => { const lp = Math.log(clamp(P, curve.P[0], curve.P[curve.P.length - 1])); let i = 0; while (i < curve.P.length - 2 && Math.log(curve.P[i + 1]) < lp) i++; const a = Math.log(curve.P[i]), b = Math.log(curve.P[i + 1]); return arr[i] + ((arr[i + 1] - arr[i]) * (lp - a)) / (b - a || 1); };
-  const hT0 = (P) => (useCurve && curve.T0 ? curveT(P, curve.T0) : hydrateT0(P, gasSG)), dep = hydrateDepression(aq);
+  const screen = hydrateScreening(table, gasSG);
+  const hT0 = (P) => (useCurve && curve.T0 ? curveT(P, curve.T0) : screen(P)), dep = hydrateDepression(aq);
   const model = {
     spec, table, rates, aq, gasSG,
     at(P, T, mScale = 1) {

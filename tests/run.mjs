@@ -58,7 +58,7 @@ near(metrics([1, 2, 3], [1, 2, 3]).rmse, 0, 1e-12, 'metrics of perfect agreement
   near(fl.beta * fl.y[2] + (1 - fl.beta) * fl.x[2], f.z[2], 1e-9, 'methane material balance over the flash');
   near(frictionFactor(1e5, 1e-4), 0.01851, 2e-4, 'Colebrook friction factor at Re = 1e5, ε/D = 1e-4');
   near(frictionFactor(1000, 0), 0.064, 1e-12, 'laminar friction factor 64/Re');
-  near(hydrateT0(70, 0.6), 12.6, 1.5, 'hydrate temperature of a 0.6-gravity gas at 70 bara');
+  near(hydrateT0(70, 0.6), 15.5, 2, 'hydrate temperature of a 0.6-gravity gas at 70 bara (gas-gravity chart: about 15.5 °C)');
   near(slugVelocity(2, 0.254, 0).C0, 1.05, 1e-12, 'Bendiksen distribution coefficient, horizontal, low Froude number');
   const fm = fluidModel({}), r = marchSteady({ fm, profile: { x: BASE.profile.map((p) => p.x), z: BASE.profile.map((p) => p.z) }, id: BASE.idMm / 1000, U: BASE.U, tAmb: 4, tIn: BASE.tIn, pOut: BASE.pOut, n: 100 });
   ok(r.ok && r.pIn > 60 && r.pIn < 140, `reference tie-back inlet pressure is plausible (${r.ok ? r.pIn.toFixed(1) : r.reason} bara)`);

@@ -1,18 +1,25 @@
 // AutoCAD DWG reader, written against the Open Design Alliance "Open Design Specification for .dwg files".
 //
-// Containers: R13 / R14 / 2000 (AC1012, AC1014, AC1015: section locator, plain sections) and 2004 / 2010 / 2013 / 2018
+// Containers: R13 / R14 / 2000 (AC1012, AC1014, AC1015: section locator, plain sections), 2004 / 2010 / 2013 / 2018
 //         (AC1018, AC1024, AC1027, AC1032: XOR-masked file header, section page map, section map, LZ-compressed data
-//         pages). The 2007 container (AC1021: Reed-Solomon coded pages, its own compression) and releases before R13
-//         are recognised and rejected with the way out.
+//         pages) and 2007 (AC1021: file header, page map and section map as interleaved Reed-Solomon (255, 239) code
+//         words, data pages as (255, 251) code words, the 2007 compression with its permuted literal runs, 64-bit page
+//         records and UTF-16 section names). Releases before R13 are recognised and rejected with the way out.
 // Read:   the object map (handle → offset) and the bit-coded objects: LINE, POINT, CIRCLE, ARC, ELLIPSE, LWPOLYLINE
 //         (bulges as arcs, elevation, closed flag), POLYLINE_2D / _3D with their VERTEX chains, SPLINE (returned as its
 //         definition for the caller to evaluate), 3DFACE, INSERT and MINSERT of block definitions (scale, rotation,
-//         extrusion, rows and columns; nested, depth-capped), the LAYER table (entity → layer name), the object
-//         coordinate system of planar entities and, for 2000 drawings, the drawing unit $INSUNITS from the header
-//         variables. Only model space is delivered; invisible entities are left out.
-// Not read: text, dimensions, hatches, leaders, solids, regions and ACIS bodies, images, attributes, polyface and
-//         polygon meshes (counted in `skipped` where their type is known), line types, colours, paper space, the other
-//         header variables (so $INSUNITS of 2004 and later drawings is not known); checksums are not verified.
+//         extrusion, rows and columns; nested, depth-capped) with their ATTRIB values, TEXT and MTEXT as labels
+//         (insertion point in world coordinates, plain text: Latin-1 before 2007, UTF-16 from 2007 on, MTEXT format
+//         codes removed), the ACIS data of 3DSOLID, REGION and BODY entities (SAT text, de-obfuscated, up to 2000;
+//         binary SAB from 2004 on, for 2013 and later out of the data-store section), the LAYER table (names, off and
+//         frozen flags), the object coordinate system of planar entities and the drawing unit $INSUNITS from the header
+//         variables of 2000 and later drawings (R13 and R14 have no such variable).
+//         Model space is delivered by default (opts.space = 'paper' | 'all' for the sheet layouts); invisible entities
+//         are left out and counted; entities on layers that are off or frozen are delivered (layerInfo tells which).
+// Not read: dimensions, hatches, leaders, tables, images, polyface and polygon meshes, traces and 2-D solids (counted in
+//         `skipped` where their type is known), line types, colours, multi-line attributes of 2018 drawings, ACIS data
+//         moved to blob segments of the data store, the other header variables; checksums and the Reed-Solomon parity
+//         are not verified (a damaged page shows as a decoding error instead).
 // File content is untrusted: every offset is bounds-checked, decompressed sizes, object, vertex and nesting counts are
 // capped, and chains of linked entities are walked with a visit guard.
 
@@ -27,7 +34,7 @@ export function dwgVersion(u8) {
   const code = String.fromCharCode(...u8.subarray(0, 6));
   if (!/^(AC\d\.\d\d?|AC\d{4}|MC0\.0)/.test(code)) return null;
   const c = /^(AC\d{4}|MC0\.0)/.test(code) ? code.slice(0, 6).replace(/\0.*$/, '') : code.replace(/[^\x20-\x7e].*$/, '');
-  return { code: c, release: RELEASE[c] || 'unknown', readable: ['AC1012', 'AC1014', 'AC1015', 'AC1018', 'AC1024', 'AC1027', 'AC1032'].includes(c) };
+  return { code: c, release: RELEASE[c] || 'unknown', readable: ['AC1012', 'AC1014', 'AC1015', 'AC1018', 'AC1021', 'AC1024', 'AC1027', 'AC1032'].includes(c) };
 }
 
 /** Bit-stream reader over the file (most significant bit first; multi-byte raw values little-endian). */
@@ -122,6 +129,112 @@ function sections2004(u8, want) {
   }
   return out;
 }
+// DWG 2007 literal runs are stored in 32-byte groups of four 8-byte words in reverse order; a tail of 1 to 31 bytes is
+// permuted by a fixed pattern: per length the pieces [size, source offset …] in output order (2- and 3-byte pieces are
+// byte-reversed, a 16-byte piece is two swapped 8-byte words).
+const LIT7 = [[], [1, 0], [2, 0], [3, 0], [4, 0], [1, 4, 4, 0], [1, 5, 4, 1, 1, 0], [2, 5, 4, 1, 1, 0], [8, 0], [1, 8, 8, 0], [1, 9, 8, 1, 1, 0], [2, 9, 8, 1, 1, 0], [4, 8, 8, 0], [1, 12, 4, 8, 8, 0], [1, 13, 4, 9, 8, 1, 1, 0], [2, 13, 4, 9, 8, 1, 1, 0], [16, 0],
+  [8, 9, 1, 8, 8, 0], [1, 17, 16, 1, 1, 0], [3, 16, 16, 0], [4, 16, 16, 0], [1, 20, 4, 16, 16, 0], [2, 20, 4, 16, 16, 0], [3, 20, 4, 16, 16, 0], [8, 16, 16, 0], [8, 17, 1, 16, 16, 0], [1, 25, 8, 17, 1, 16, 16, 0], [2, 25, 8, 17, 1, 16, 16, 0], [4, 24, 8, 16, 16, 0], [1, 28, 4, 24, 8, 16, 16, 0], [2, 28, 4, 24, 8, 16, 16, 0], [1, 30, 4, 26, 8, 18, 16, 2, 2, 0]];
+/** DWG 2007 decompression: permuted literal runs and back references with four opcode classes. */
+function unLZ7(src, size) {
+  const out = new Uint8Array(size), n = src.length;
+  let p = 0, o = 0, len = 0, off = 0;
+  const rd = () => { if (p >= n) throw new RangeError('lz'); return src[p++]; };
+  const literal = (k) => {
+    if (p + k > n || o + k > size) throw new RangeError('lz');
+    for (; k >= 32; k -= 32, p += 32) for (let w = 0; w < 4; w++) for (let b = 0; b < 8; b++) out[o++] = src[p + 24 - 8 * w + b];
+    const t = LIT7[k];
+    for (let i = 0; i < t.length; i += 2) {
+      const s = t[i], a = p + t[i + 1];
+      if (s === 16) { for (let b = 0; b < 8; b++) out[o++] = src[a + 8 + b]; for (let b = 0; b < 8; b++) out[o++] = src[a + b]; }
+      else if (s === 2 || s === 3) for (let b = s - 1; b >= 0; b--) out[o++] = src[a + b];
+      else for (let b = 0; b < s; b++) out[o++] = src[a + b];
+    }
+    p += k;
+  };
+  let op = rd();
+  const instr = () => {
+    const hi = op >> 4;
+    if (hi === 0) { len = (op & 15) + 0x13; off = rd(); op = rd(); len += (op >> 3) & 0x10; off += ((op & 0x78) << 5) + 1; }
+    else if (hi === 1) { len = (op & 15) + 3; off = rd(); op = rd(); off += ((op & 0xf8) << 5) + 1; }
+    else if (hi === 2) {
+      off = rd(); off |= rd() << 8; len = op & 7;
+      if (!(op & 8)) { op = rd(); len += op & 0xf8; } else { off++; len += rd() << 3; op = rd(); len += ((op & 0xf8) << 8) + 0x100; }
+    } else { len = hi; off = op & 15; op = rd(); off += ((op & 0xf8) << 1) + 1; }
+  };
+  if ((op & 0xf0) === 0x20) { p += 2; len = rd() & 7; if (!len) throw new RangeError('lz'); }
+  while (p < n) {
+    if (!len) { len = op + 8; if (len === 0x17) { let k = rd(); len += k; if (k === 0xff) do { k = rd(); k |= rd() << 8; len += k; } while (k === 0xffff); } }
+    literal(len); len = 0;
+    if (p >= n) break;
+    op = rd(); instr();
+    for (;;) {
+      if (off > o || o + len > size) throw new RangeError('lz');
+      for (let k = 0; k < len; k++, o++) out[o] = out[o - off];
+      len = op & 7;
+      if (len || p >= n) break;
+      op = rd();
+      if (!(op >> 4)) break;
+      if (op >> 4 === 15) op &= 15;
+      instr();
+    }
+  }
+  return out;
+}
+/** Data bytes of `blocks` interleaved Reed-Solomon (255, k) code words; the parity bytes are dropped, not used for repair. */
+function deRS(src, blocks, k) {
+  if (blocks * k > src.length) throw new RangeError('rs');
+  const out = new Uint8Array(blocks * k);
+  for (let i = 0; i < blocks; i++) for (let j = 0; j < k; j++) out[i * k + j] = src[j * blocks + i];
+  return out;
+}
+/** Logical sections of a 2007-layout file (AC1021): name → bytes, for the names asked for. */
+function sections2007(u8, want) {
+  const N = u8.length, bad = (w) => fail(`The DWG file is truncated or corrupt (${w}).`);
+  if (N < 0x480) bad('file header');
+  const pe = deRS(u8.subarray(0x80, 0x80 + 0x3d8), 3, 239), clen = new DataView(pe.buffer).getInt32(24, true);
+  if (clen > 685 || clen < -685) bad('file header');
+  const hdr = clen > 0 ? unLZ7(pe.subarray(32, 32 + clen), 0x110) : pe.slice(32, 32 + 0x110), hv = new DataView(hdr.buffer, hdr.byteOffset, 0x110), H = (i) => Number(hv.getBigInt64(8 * i, true));
+  const sysPage = (at, comp, unc, rep) => {
+    if (!(comp > 0 && unc > 0 && comp < 64e6 && unc < 64e6 && rep > 0 && rep < 1e3)) bad('system page');
+    const blocks = Math.ceil((((comp + 7) & ~7) * rep) / 239), size = (blocks * 255 + 7) & ~7;
+    if (!(at >= 0x480 && at + size <= N)) bad('system page');
+    const d = deRS(u8.subarray(at, at + size), blocks, 239);
+    return comp < unc ? unLZ7(d.subarray(0, comp), unc) : d.subarray(0, unc);
+  };
+  // header fields: 3 page-map repeat count, 7 offset, 10 / 11 packed and unpacked size; 22, 24, 25, 27 the same for the section map
+  const pm = sysPage(0x480 + H(7), H(10), H(11), H(3)), pmv = new DataView(pm.buffer, pm.byteOffset, pm.byteLength), pages = new Map();
+  for (let p = 0, addr = 0x480; p + 16 <= pm.length && pages.size < 1e6; p += 16) { const size = Number(pmv.getBigInt64(p, true)), id = Number(pmv.getBigInt64(p + 8, true)); if (!(size > 0 && addr + size <= N + 0x400)) break; if (id > 0) pages.set(id, [addr, size]); addr += size; }
+  const sp = pages.get(H(24));
+  if (!sp) bad('section map');
+  const sm = sysPage(sp[0], H(22), H(25), H(27)), sv = new DataView(sm.buffer, sm.byteOffset, sm.byteLength), R = (p) => Number(sv.getBigInt64(p, true)), out = {};
+  for (let p = 0, g = 0; p + 64 <= sm.length && g < 1000; g++) {
+    const size = R(p), maxPage = R(p + 8), encrypted = R(p + 16), nameLen = R(p + 32), encoded = R(p + 48), np = R(p + 56);
+    p += 64;
+    if (!(nameLen >= 0 && nameLen <= 256 && p + nameLen <= sm.length)) break;
+    let name = '';
+    for (let k = 0; k + 1 < nameLen; k += 2) { const c = sv.getUint16(p + k, true); if (c) name += String.fromCharCode(c); }
+    p += nameLen + (nameLen & 1);
+    if (!(np >= 0 && np <= 1e6 && p + 56 * np <= sm.length)) break;
+    if (want.includes(name)) {
+      if (!(size >= 0 && size <= 512e6) || encrypted === 1) fail('A section of the DWG file is too large or encrypted.');
+      const buf = new Uint8Array(size);
+      for (let q = 0; q < np; q++) {
+        const e = p + 56 * q, start = R(e), unc = R(e + 24), comp = R(e + 32), pg = pages.get(R(e + 16));
+        if (!pg || !(start >= 0 && start <= size) || !(comp > 0 && comp <= pg[1]) || !(unc >= comp && unc <= 16e6) || pg[0] + pg[1] > N) bad('data page');
+        const raw = u8.subarray(pg[0], pg[0] + pg[1]), d = encoded === 4 ? deRS(raw, Math.ceil(((comp + 7) & ~7) / 251), 251) : raw, page = comp < unc ? unLZ7(d.subarray(0, comp), unc) : d;
+        buf.set(page.subarray(0, Math.min(unc, size - start)), start);
+      }
+      out[name] = buf;
+    }
+    p += 56 * np;
+  }
+  return out;
+}
+// Header variables in file order up to $INSUNITS: [first version, last version, codes] with d BD, s BS, l BL, b B, r RC, t text,
+// h handle, H handle kept in the data stream, 3 3BD, 2 2RD, c colour, q BLL (versions as the number in "AC10nn").
+const HEADER_VARS = [[27, 99, 'q'], [0, 99, 'dddd'], [0, 18, 'tttt'], [0, 99, 'll'], [0, 14, 's'], [0, 15, 'h'], [0, 99, 'bb'], [0, 14, 'b'], [0, 99, 'bbbbbbb'], [0, 14, 'b'], [18, 99, 'b'], [0, 99, 'bbbb'], [0, 14, 'bb'], [0, 99, 'bb'], [0, 14, 'b'], [0, 99, 'bbb'], [0, 14, 'b'], [0, 99, 'bbs'], [0, 14, 's'], [0, 99, 'sssss'], [0, 14, 's'], [0, 99, 's'], [0, 14, 's'], [0, 99, 's'], [0, 14, 's'], [18, 99, 'lll'],
+  [0, 99, 'sssssssssssssssssssddddddddddddddddddddd'], [0, 18, 't'], [0, 99, 'llll'], [18, 99, 'lll'], [0, 99, 'llllcHhhh'], [21, 99, 'h'], [0, 99, 'hh'], [15, 99, 'd'], [0, 99, '33322d333h'], [15, 99, 'hsh333333'], [0, 99, '33322d333h'], [15, 99, 'hsh333333'], [15, 18, 'tt'], [0, 14, 'bbbbbbbbbbbrrbbrrrbrrrrssssssh'], [0, 99, 'ddddddddd'], [21, 99, 'ddsc'], [15, 99, 'bbbbbbsss'], [21, 99, 's'],
+  [0, 99, 'dddddddd'], [0, 14, 'ttttt'], [15, 99, 'dbsbbbb'], [0, 99, 'ccc'], [15, 99, 'sssssssssssbbssssbs'], [21, 99, 'b'], [24, 99, 'bdd'], [15, 99, 'hhhhh'], [21, 99, 'hhh'], [15, 99, 'ss'], [0, 99, 'hhhhhhhhh'], [0, 15, 'h'], [0, 99, 'hhh'], [15, 99, 'ss'], [15, 18, 'tt'], [15, 99, 'hhh'], [18, 99, 'hh'], [21, 99, 'h'], [27, 99, 'h'], [15, 99, 'l']];
 const ref = (h, base) => (h.code === 6 ? base + 1 : h.code === 8 ? base - 1 : h.code === 10 ? base + h.v : h.code === 12 ? base - h.v : h.v);
 /** Axes of the object coordinate system of extrusion direction n (the "arbitrary axis algorithm"). */
 function ocs(n) {
@@ -140,26 +253,72 @@ function bulgePts(a, b, bulge) {
   return out;
 }
 
+/** MTEXT content without its inline formatting codes. */
+function plainMText(t) {
+  return t.replace(/\\U\+([0-9A-Fa-f]{4})/g, (m, h) => String.fromCharCode(parseInt(h, 16))).replace(/\\S([^;]*);/g, (m, a) => a.replace(/[\^#]/g, '/')).replace(/\\[ACFHQTWfp][^;\\]*;/g, '').replace(/\\P/g, ' ').replace(/\\~/g, ' ').replace(/\\[LlOoKkNX]/g, '')
+    .replace(/\\([\\{}])/g, '\u0001$1').replace(/[{}]/g, (c, i, all) => (all[i - 1] === '\u0001' ? c : '')).replace(/\u0001/g, '').replace(/\s+/g, ' ').trim();
+}
+/** End of the binary ACIS stream starting at `from`: just behind its "End-of-ACIS-data" / "End-of-ASM-data" record, or 0. */
+function sabEnd(u8, from) {
+  for (let i = from + 16, n = Math.min(u8.length, from + 64e6) - 11; i < n; i++) {
+    if (u8[i] !== 0x0e || u8[i + 1] !== 3 || u8[i + 2] !== 69 || u8[i + 3] !== 110 || u8[i + 4] !== 100 || u8[i + 5] !== 0x0e || u8[i + 6] !== 2 || u8[i + 7] !== 111 || u8[i + 8] !== 102) continue;
+    const k = u8[i + 10];   // "ACIS" or "ASM", then "data"
+    if (u8[i + 9] === 0x0e && (k === 3 || k === 4) && u8[i + 11 + k] === 0x0d && u8[i + 12 + k] === 4 && i + 17 + k <= u8.length) return i + 17 + k;
+  }
+  return 0;
+}
+
 /**
- * Parse a DWG file. opts: { maxEntities = 500000, maxVertices = 5e6, maxInsertDepth = 8 }. Returns
- * { version: 'AC1015', release: '2000', insunits: $INSUNITS code (0 none, 1 in, 2 ft, 4 mm, 5 cm, 6 m …; 2000 drawings only) or null,
+ * Binary ACIS streams of the data-store section of 2013 and later drawings: entity handle → bytes. The segment index
+ * locates the "_data_" segments; each holds 20-byte record entries (size, 1, handle, offset) and, from 16 × its data
+ * alignment on, the records: a length word and the stream. Records moved out to blob segments are not followed.
+ */
+function dataStore(ds) {
+  const out = new Map();
+  if (!ds || ds.length < 0x80) return out;
+  const dv = new DataView(ds.buffer, ds.byteOffset, ds.length), N = ds.length, idx = dv.getUint32(24, true), n = Math.min(dv.getUint32(32, true), 4096);
+  if (dv.getUint32(0, true) !== 0x6472616a || idx + 48 + 12 * n > N) return out;
+  for (let k = 0; k < n; k++) {
+    const seg = dv.getUint32(idx + 48 + 12 * k, true), size = dv.getUint32(idx + 56 + 12 * k, true);
+    if (!seg || seg + 48 > N || seg + size > N || dv.getUint16(seg, true) !== 0xd5ac || String.fromCharCode(...ds.subarray(seg + 2, seg + 8)) !== '_data_') continue;
+    const data = seg + 16 * dv.getUint32(seg + 36, true);
+    for (let e = seg + 48; e + 20 <= data && data < seg + size; e += 20) {
+      const at = data + dv.getUint32(e + 16, true), handle = dv.getUint32(e + 8, true) + dv.getUint32(e + 12, true) * 4294967296;
+      if (dv.getUint32(e, true) !== 20 || at + 20 > seg + size) continue;
+      const len = dv.getUint32(at, true);
+      if (len > 16 && at + 4 + len <= seg + size && /^(ACIS|ASM) BinaryFile/.test(String.fromCharCode(...ds.subarray(at + 4, at + 19)))) out.set(handle, ds.subarray(at + 4, at + 4 + len));
+    }
+  }
+  return out;
+}
+
+/**
+ * Parse a DWG file. opts: { maxEntities = 500000, maxVertices = 5e6, maxInsertDepth = 8, space = 'model' | 'paper' | 'all' }.
+ * Returns
+ * { version: 'AC1015', release: '2000', insunits: $INSUNITS code (0 none, 1 in, 2 ft, 4 mm, 5 cm, 6 m …) or null (R13 / R14),
  *   polylines: [{ x, y, z? (only when some z ≠ 0), closed, layer, type }]   world coordinates, curves flattened (48 segments
  *     per full turn); a SPLINE comes as { spline: { degree, knots, points, weights, fit, closed }, layer, type: 'SPLINE' }
  *     for the caller to evaluate,
- *   points: flat x, y, z, faces: flat triangles (3DFACE), counts: { TYPE: n } (entities emitted, block contents included),
- *   layers: string[], skipped: { TYPE: n }, warnings: string[] }
+ *   points: flat x, y, z, faces: flat triangles (3DFACE),
+ *   labels: [{ x, y, z, text, layer, kind: 'TEXT' | 'MTEXT' | 'ATTRIB' }],
+ *   solids: [{ type: '3DSOLID' | 'REGION' | 'BODY', format: 'sat' (data: string) | 'sab' (data: Uint8Array), layer, handle }]
+ *     (top-level entities of the chosen space; those inside blocks are counted in `skipped`),
+ *   counts: { TYPE: n } (entities emitted, block contents included), layers: string[], layerInfo: [{ name, off, frozen }],
+ *   paperSpace: number of paper-space entities, hidden: invisible entities left out, skipped: { TYPE: n }, warnings: string[] }
  */
 export function parseDWG(u8, opts = {}) {
   const ver = dwgVersion(u8);
   if (!ver) fail('Not a DWG file (the "AC10xx" version signature is missing).');
   const dxf = 'Save the drawing as ASCII DXF, which is read: in AutoCAD use SAVEAS and choose DXF, or convert it with the free ODA File Converter (output "ASCII DXF").';
-  if (!ver.readable) fail(ver.code === 'AC1021' ? `This is an AutoCAD 2007 drawing (AC1021): its pages are Reed-Solomon coded and compressed in a layout of their own, which is not read (R13, R14, 2000, 2004, 2010, 2013 and 2018 drawings are). ${dxf}` : `This is an AutoCAD ${ver.release} drawing (${ver.code}), a layout older than R13 that is not read. ${dxf}`);
+  if (!ver.readable) fail(`This is an AutoCAD ${ver.release} drawing (${ver.code}), a layout older than R13 that is not read. ${dxf}`);
   const V = +ver.code.slice(4), r2000 = V >= 15, r2004 = V >= 18, r2007 = V >= 21, r2010 = V >= 24, r2013 = V >= 27;
-  let file = u8, mapBytes = null;
+  const maint = u8[11], space = ['paper', 'all'].includes(opts.space) ? opts.space : 'model';
+  let file = u8, mapBytes = null, headBytes = null, dsBytes = null;
   if (r2004) {
     let secs;
-    try { secs = sections2004(u8, ['AcDb:Handles', 'AcDb:AcDbObjects']); } catch (e) { if (e instanceof RangeError) fail('The DWG file is truncated or corrupt (compressed section).'); throw e; }
-    file = secs['AcDb:AcDbObjects']; mapBytes = secs['AcDb:Handles'];
+    const names = ['AcDb:Handles', 'AcDb:AcDbObjects', 'AcDb:Header', 'AcDb:AcDsPrototype_1b'];
+    try { secs = V === 21 ? sections2007(u8, names) : sections2004(u8, names); } catch (e) { if (e instanceof RangeError) fail('The DWG file is truncated or corrupt (compressed section).'); throw e; }
+    file = secs['AcDb:AcDbObjects']; mapBytes = secs['AcDb:Handles']; headBytes = secs['AcDb:Header'] || null; dsBytes = secs['AcDb:AcDsPrototype_1b'] || null;
     if (!file || !mapBytes) fail('The DWG file is truncated or corrupt (object sections are missing).');
     u8 = file;
   }
@@ -182,13 +341,17 @@ export function parseDWG(u8, opts = {}) {
       while (b.p + 40 < b.end && classes.length < 4096) { const num = b.bs(); b.bs(); b.t(); b.t(); const name = b.t(); b.b(); const id = b.bs(); classes[num - 500] = { name, entity: id === 0x1f2 }; }
     } catch (e) { if (!(e instanceof RangeError)) throw e; }
   }
-  // R2000 header variables up to $INSUNITS: d BD, s BS, l BL, b B, t text, h handle, 3 3BD, 2 2RD (the list of the ODA specification)
+  // header variables up to $INSUNITS (it exists since 2000): the variable list of the ODA specification with its version
+  // ranges; from 2007 on, texts and handles live in streams of their own and are not part of this bit stream
   let insunits = null;
-  if (V === 15 && sec[0] && sec[0][0] + 20 < N) {
+  if (!r2004 && sec[0] && sec[0][0] + 20 < N) headBytes = u8.subarray(sec[0][0], Math.min(N, sec[0][0] + 20 + dv.getUint32(sec[0][0] + 16, true)));
+  if (r2000 && headBytes && headBytes.length > 28) {
     try {
-      const hb = new Bits(u8, (sec[0][0] + 20) * 8, Math.min(N, sec[0][0] + 20 + dv.getUint32(sec[0][0] + 16, true)) * 8), first = hb.bd();
-      const seq = 'dddttttllhbbbbbbbbbbbbbbbbbbbbsssssssssssssssssssssssssssdddddddddddddddddddddtllllllllshhhhhhd33322d333hhsh33333333322d333hhsh333333ttdddddddddbbbbbbsssdddddddddbsbbbbssssssssssssssbbssssbshhhhhsshhhhhhhhhhhhhsstthhhl';
-      for (const c of seq) { if (c === 'd') hb.bd(); else if (c === 's') hb.bs(); else if (c === 'l') hb.bl(); else if (c === 'b') hb.b(); else if (c === 't') hb.t(); else if (c === 'h') hb.h(); else if (c === '3') hb.p3(); else { hb.rd(); hb.rd(); } }
+      const hb = new Bits(headBytes, (20 + (V >= 27 || (V === 24 && maint > 3) ? 4 : 0) + (r2007 ? 4 : 0)) * 8, headBytes.length * 8);
+      const cmc = () => { hb.bs(); if (r2004) { hb.bl(); const f = hb.rc(); if (!r2007) { if (f & 1) hb.t(); if (f & 2) hb.t(); } } };
+      const step = { d: () => hb.bd(), s: () => hb.bs(), l: () => hb.bl(), b: () => hb.b(), r: () => hb.rc(), t: () => r2007 || hb.t(), h: () => r2007 || hb.h(), H: () => hb.h(), 3: () => hb.p3(), 2: () => { hb.rd(); hb.rd(); }, c: cmc, q: () => { for (let k = (hb.bb() << 1) | hb.b(); k > 0; k--) hb.rc(); } };
+      let first = null;
+      for (const [lo, hi, seq] of HEADER_VARS) if (V >= lo && V <= hi) for (const c of seq) { const v = step[c](); if (first === null && c === 'd') first = v; }
       const v = hb.bs();
       if (first === 412148564080 && v >= 0 && v <= 24) insunits = v;
     } catch (e) { if (!(e instanceof RangeError)) throw e; }
@@ -213,7 +376,7 @@ export function parseDWG(u8, opts = {}) {
     p = se + 2;
   }
   if (!map.size) bad('object map is empty');
-  const warnings = [], skipped = {}, counts = {}, layerName = new Map(), blocks = new Map(), ents = new Map(), byOwner = new Map(), model = [];
+  const warnings = [], skipped = {}, counts = {}, layerName = new Map(), layerInfo = [], blocks = new Map(), ents = new Map(), byOwner = new Map(), model = [], paper = [];
   let nDecoded = 0, nBad = 0;
   /** Decode the object at a file offset: common data, the supported entity bodies, then the handle stream. */
   const decode = (off) => {
@@ -242,7 +405,7 @@ export function parseDWG(u8, opts = {}) {
       if (!r2000) bitsize = b.rl();
       mode = b.bb(); nreact = b.bl();
       if (!r2000) ltByLayer = !!b.b();
-      if (r2004) { xdicMissing = !!b.b(); if (r2013) b.b(); const cf = b.bs(); if (cf & 0x2000) b.bl(); if (cf & 0x8000) b.bl(); colorRef = !!(cf & 0x4000); }
+      if (r2004) { xdicMissing = !!b.b(); if (r2013) o.ds = b.b(); const cf = b.bs(); if (cf & 0x8000 && !(cf & 0x4000)) b.bl(); if (cf & 0x2000) b.bl(); colorRef = !!(cf & 0x4000); }   // true colour inline unless it comes from a colour book
       else { nolinks = !!b.b(); b.bs(); }
       b.bd();
       if (r2000) { ltf = b.bb(); psf = b.bb(); }
@@ -310,7 +473,32 @@ export function parseDWG(u8, opts = {}) {
       if (r2004) owned = b.bl();
       o.base = b.p3(); T();
       if (r2000) { o.ninsert = 0; for (let g = 0; g < 1e6 && b.rc(); g++) o.ninsert++; T(); const ps = b.bl(); if (ps > size) throw new RangeError('preview'); }
-    } else if (nm === 'LAYER') o.lname = T();
+    } else if (nm === 'LAYER') {
+      o.lname = T();
+      if (r2007) b.bs(); else { b.b(); b.bs(); b.b(); }
+      if (r2000) { const f = b.bs(); o.frozen = !!(f & 1); o.off = !!(f & 2); } else { o.frozen = !!b.b(); o.off = !!b.b(); }
+    } else if (nm === 'TEXT' || nm === 'ATTRIB') {
+      if (r2000) { const df = b.rc(), z = df & 1 ? 0 : b.rd(), x = b.rd(), y = b.rd(); if (!(df & 2)) { b.dd(x); b.dd(y); } o.n = be(); bt(); if (!(df & 4)) b.rd(); if (!(df & 8)) b.rd(); b.rd(); if (!(df & 16)) b.rd(); o.at = [x, y, z]; }
+      else { const z = b.bd(); o.at = [b.rd(), b.rd(), z]; b.rd(); b.rd(); o.n = b.p3(); b.bd(); b.bd(); b.bd(); b.bd(); b.bd(); }
+      o.text = T();
+    } else if (nm === 'MTEXT') { o.at = b.p3(); b.p3(); b.p3(); b.bd(); if (r2007) b.bd(); b.bd(); b.bs(); b.bs(); b.bd(); b.bd(); o.text = plainMText(T()); }
+    else if (nm === '3DSOLID' || nm === 'REGION' || nm === 'BODY') {
+      // ACIS data: version 1 is SAT text in blocks with every character above 32 stored as 159 - c; version 2 is binary SAB
+      if (!b.b()) {
+        b.b();
+        const av = b.bs();
+        if (av === 1) {
+          let txt = '';
+          for (let g = 0; g < 1e5; g++) { const n = b.bl(); if (!n) break; if (n > size || txt.length + n > 64e6) throw new RangeError('acis'); for (let k = 0; k < n; k++) { const c = b.rc(); txt += String.fromCharCode(c > 32 ? 159 - c : c); } }
+          if (txt) o.acis = { format: 'sat', data: txt };
+        } else if (av === 2 && !o.ds) {
+          const n = Math.max(0, Math.min(b.end, bitsize ? start + bitsize : b.end) - b.p) >> 3, raw = new Uint8Array(n);
+          for (let k = 0; k < n; k++) raw[k] = b.rc();
+          const e = sabEnd(raw, 0);
+          if (e) o.acis = { format: 'sab', data: raw.subarray(0, e) };
+        }
+      }
+    }
     if (owned > maxVertices) throw new RangeError('owned objects');
     // the handle stream follows the data, at the bit position given by the object size
     if (!(bitsize > 0 && bitsize <= size * 8)) return o;
@@ -325,7 +513,7 @@ export function parseDWG(u8, opts = {}) {
         if (r2000) { o.layer = H(); if (ltf === 3) hs.h(); if (matf === 3) hs.h(); if (psf === 3) hs.h(); for (let k = 0; k < vsf; k++) hs.h(); }
         if (o.poly && r2004) { o.owned = []; for (let k = 0; k < owned; k++) o.owned.push(H()); }
         else if (o.poly) { o.first = H(); o.last = H(); }
-        else if (nm === 'INSERT' || nm === 'MINSERT') o.block = H();
+        else if (nm === 'INSERT' || nm === 'MINSERT') { o.block = H(); if (o.attribs) { if (r2004) { o.owned = []; for (let k = 0; k < owned; k++) o.owned.push(H()); } else { o.first = H(); o.last = H(); } } }
       } else if (nm === 'BLOCK_HEADER') {
         hs.h();
         for (let k = 0; k < nreact; k++) hs.h();
@@ -340,17 +528,18 @@ export function parseDWG(u8, opts = {}) {
     try { o = decode(off); } catch (e) { if (!(e instanceof RangeError)) throw e; nBad++; }
     if (!o) continue;
     if (++nDecoded > 4e6) break;
-    if (o.name === 'LAYER') layerName.set(o.handle || handle, o.lname);
+    if (o.name === 'LAYER') { layerName.set(o.handle || handle, o.lname); layerInfo.push({ name: o.lname, off: !!o.off, frozen: !!o.frozen }); }
     else if (o.name === 'BLOCK_HEADER') blocks.set(o.handle || handle, o);
     else if (o.entity) {
       ents.set(o.handle, o);
       if (o.mode === 2) model.push(o);
+      else if (o.mode === 1) paper.push(o);
       else if (o.mode === 0 && o.owner !== undefined) { const l = byOwner.get(o.owner); if (l) l.push(o); else byOwner.set(o.owner, [o]); }
     }
   }
   // geometry
-  const polylines = [], points = [], faces = [];
-  let nVert = 0, nEnt = 0, cut = false;
+  const polylines = [], points = [], faces = [], labels = [], solids = [];
+  let nVert = 0, nEnt = 0, cut = false, hidden = 0, store = null;
   const ident = (p) => p;
   const emit = (pts, closed, o, T, type) => {
     if (pts.length < 2) return;
@@ -403,13 +592,29 @@ export function parseDWG(u8, opts = {}) {
       for (let r = 0; r < Math.min(o.rows || 1, 1000); r++) for (let k = 0; k < Math.min(o.cols || 1, 1000); k++) {
         const ox = k * (o.dx || 0), oy = r * (o.dy || 0);
         const T2 = (q) => { const u = (q[0] - base[0]) * o.scale[0], v = (q[1] - base[1]) * o.scale[1], w = (q[2] - base[2]) * o.scale[2]; return T(toWcs(ax, [o.ins[0] + (u + ox) * c - (v + oy) * s, o.ins[1] + (u + ox) * s + (v + oy) * c, o.ins[2] + w])); };
-        for (const e of list) if (!e.invisible) draw(e, T2, depth + 1, inner);
+        for (const e of list) if (!e.invisible) draw(e, T2, depth + 1, inner); else hidden++;
       }
-    } else if (!['VERTEX_2D', 'VERTEX_3D', 'VERTEX_MESH', 'VERTEX_PFACE', 'VERTEX_PFACE_FACE', 'SEQEND', 'BLOCK', 'ENDBLK', 'ATTRIB', 'VIEWPORT'].includes(nm)) skipped[nm] = (skipped[nm] || 0) + 1;
+      // attribute values travel with the reference, in the coordinates of the space it sits in
+      const att = o.owned ? o.owned.map((h) => ents.get(h)) : [];
+      if (!o.owned && o.attribs) for (let h = o.first, g = 0; h !== undefined && g < 1e4; g++) { const a = ents.get(h); if (!a) break; att.push(a); if (h === o.last) break; h = a.next; }
+      for (const a of att) if (a && a.name === 'ATTRIB' && !a.invisible) draw(a, T, depth + 1, inner);
+    } else if (nm === 'TEXT' || nm === 'MTEXT' || nm === 'ATTRIB') {
+      count(nm);
+      const q = T(nm === 'MTEXT' ? o.at : toWcs(ocs(o.n), o.at)), text = (o.text || '').replace(/\\U\+([0-9A-Fa-f]{4})/g, (m, h) => String.fromCharCode(parseInt(h, 16))).slice(0, 2000);
+      if (text && labels.length < 2e5) labels.push({ x: q[0], y: q[1], z: q[2], text, layer: layerName.get(o.layer) || '', kind: nm });
+    } else if (nm === '3DSOLID' || nm === 'REGION' || nm === 'BODY') {
+      let a = o.acis;
+      if (!a && o.ds) { if (!store) store = dataStore(dsBytes); const d = store.get(o.handle); if (d) a = { format: 'sab', data: d }; }   // 2013 and later
+      if (a && depth === 0 && solids.length < 5000) { count(nm); solids.push({ type: nm, ...a, layer: layerName.get(o.layer) || '', handle: o.handle }); }
+      else skipped[nm] = (skipped[nm] || 0) + 1;
+    } else if (!['VERTEX_2D', 'VERTEX_3D', 'VERTEX_MESH', 'VERTEX_PFACE', 'VERTEX_PFACE_FACE', 'SEQEND', 'BLOCK', 'ENDBLK', 'VIEWPORT'].includes(nm)) skipped[nm] = (skipped[nm] || 0) + 1;
   };
-  for (const o of model) if (!o.invisible) draw(o, ident, 0, new Set());
+  // paper space: the active layout's entities (mode 1) and the contents of the other layout blocks
+  const layouts = [...blocks.values()].filter((b) => /^\*PAPER_SPACE/i.test(b.bname || '')), frame = (e) => ['BLOCK', 'ENDBLK', 'VIEWPORT'].includes(e.name), inLayouts = layouts.flatMap((b) => byOwner.get(b.handle) || []).filter((e) => !frame(e));
+  const nPaper = paper.filter((e) => !frame(e)).length + inLayouts.length, top = [...(space !== 'paper' ? model : []), ...(space !== 'model' ? [...paper, ...inLayouts] : [])];
+  for (const o of top) if (!o.invisible) draw(o, ident, 0, new Set()); else hidden++;
   if (cut) warnings.push('The drawing holds more entities than can be shown; the remaining ones were not read.');
   if (nBad) warnings.push(`${nBad} objects could not be decoded and were skipped.`);
-  if (!model.length) warnings.push('No model-space entities were found in the drawing.');
-  return { version: ver.code, release: ver.release, insunits, polylines, points, faces, counts, layers: [...new Set(layerName.values())].filter(Boolean), skipped, warnings };
+  if (!model.length && space === 'model') warnings.push(`No model-space entities were found in the drawing${nPaper ? ` (${nPaper} sit in paper space: pass opts.space = "paper" or "all")` : ''}.`);
+  return { version: ver.code, release: ver.release, insunits, polylines, points, faces, labels, solids, counts, layers: [...new Set(layerName.values())].filter(Boolean), layerInfo, paperSpace: nPaper, hidden, skipped, warnings };
 }

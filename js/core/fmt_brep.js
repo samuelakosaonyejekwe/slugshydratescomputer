@@ -153,3 +153,62 @@ export function recognisePipes(model, opts = {}) {
   for (const r of runs) { delete r.t0; delete r.x; delete r.y; }
   return { runs, centrelines, diameters: main ? main.radii.map((r) => rnd(2 * r)) : [], isPipe, length: main ? main.length : 0 };
 }
+
+// ---- Rational B-splines (shared by the readers and the tessellator) ------------------------------------------------------
+/** Rational B-spline curve point by de Boor's algorithm: full knot vector (cps.length + deg + 1 values), w may be null. */
+export function nurbsPoint(deg, knots, cps, w, u) {
+  const n = cps.length - 1;
+  let k = deg;
+  if (u >= knots[n + 1]) k = n; else while (k < n && u >= knots[k + 1]) k++;
+  while (k > deg && knots[k] === knots[k + 1]) k--;
+  const d = [];
+  for (let j = 0; j <= deg; j++) { const i = j + k - deg, wi = w ? w[i] : 1, c = cps[i]; d.push([c[0] * wi, c[1] * wi, c[2] * wi, wi]); }
+  for (let r = 1; r <= deg; r++) for (let j = deg; j >= r; j--) {
+    const i = j + k - deg, den = knots[i + deg - r + 1] - knots[i], a = den > 0 ? (u - knots[i]) / den : 0;
+    for (let c = 0; c < 4; c++) d[j][c] = (1 - a) * d[j - 1][c] + a * d[j][c];
+  }
+  const h = d[deg][3] || 1;
+  return [d[deg][0] / h, d[deg][1] / h, d[deg][2] / h];
+}
+/** True when { deg, knots, n control points, w } is a consistent B-spline definition. */
+export const nurbsValid = (deg, knots, n, w) => Number.isInteger(deg) && deg >= 1 && deg <= 25 && n > deg && knots.length === n + deg + 1 && knots.every((k, i) => Number.isFinite(k) && (!i || k >= knots[i - 1])) && knots[n] > knots[deg] && (!w || (w.length === n && w.every((x) => x > 0)));
+/** Sampled B-spline curve between u0 and u1 (defaults: the whole knot range), or null when the definition is inconsistent. */
+export function nurbsCurve(deg, knots, cps, w, u0, u1, nSeg) {
+  if (!nurbsValid(deg, knots, cps.length, w) || cps.some((c) => !c || c.length < 3 || !c.every(Number.isFinite))) return null;
+  const a = Math.max(knots[deg], Number.isFinite(u0) ? u0 : -Infinity), b = Math.min(knots[cps.length], Number.isFinite(u1) ? u1 : Infinity);
+  if (!(b > a)) return null;
+  const n = Math.min(2000, Math.max(8, nSeg | 0)), out = [];
+  for (let i = 0; i <= n; i++) out.push(nurbsPoint(deg, knots, cps, w, i === n ? b : a + ((b - a) * i) / n));
+  return out;
+}
+/**
+ * Point of a tensor-product rational B-spline surface
+ *   s = { degU, degV, nU, nV, knotsU (nU + degU + 1 values), knotsV (nV + degV + 1), cps: [[x, y, z] …] with the control
+ *         point (i, j) at index j * nU + i (u runs fastest), w: weights in the same order or null }
+ * u and v are clamped to the knot range.
+ */
+export function nurbsSurfPoint(s, u, v) {
+  const [ku, Nu] = basisAt(s.degU, s.knotsU, s.nU, u), [kv, Nv] = basisAt(s.degV, s.knotsV, s.nV, v);
+  let x = 0, y = 0, z = 0, h = 0;
+  for (let b = 0; b <= s.degV; b++) for (let a = 0; a <= s.degU; a++) {
+    const i = (kv - s.degV + b) * s.nU + ku - s.degU + a, c = s.cps[i], f = Nu[a] * Nv[b] * (s.w ? s.w[i] : 1);
+    x += f * c[0]; y += f * c[1]; z += f * c[2]; h += f;
+  }
+  return h ? [x / h, y / h, z / h] : [x, y, z];
+}
+/** Knot span k and the deg + 1 basis values that do not vanish at u (clamped to the knot range), n control points. */
+function basisAt(deg, knots, n, u) {
+  u = Math.min(knots[n], Math.max(knots[deg], u));
+  let k = deg;
+  if (u >= knots[n]) { k = n - 1; while (k > deg && knots[k] === knots[k + 1]) k--; } else { let hi = n; while (hi - k > 1) { const m = (k + hi) >> 1; if (u >= knots[m]) k = m; else hi = m; } }
+  const N = [1], L = [], R = [];
+  for (let j = 1; j <= deg; j++) {
+    L[j] = u - knots[k + 1 - j]; R[j] = knots[k + j] - u;
+    let saved = 0;
+    for (let r = 0; r < j; r++) { const den = R[r + 1] + L[j - r], t = den ? N[r] / den : 0; N[r] = saved + R[r + 1] * t; saved = L[j - r] * t; }
+    N[j] = saved;
+  }
+  return [k, N];
+}
+/** True when s is a consistent surface definition for nurbsSurfPoint. */
+export const nurbsSurfValid = (s) => !!s && s.nU * s.nV === s.cps.length && s.cps.length <= 4e5 && nurbsValid(s.degU, s.knotsU, s.nU, null) && nurbsValid(s.degV, s.knotsV, s.nV, null) && (!s.w || (s.w.length === s.cps.length && s.w.every((x) => x > 0))) && s.cps.every((c) => c && c.length >= 3 && c.every(Number.isFinite));

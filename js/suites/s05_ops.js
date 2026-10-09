@@ -3,12 +3,13 @@
 // chemical injection, heating, riser-slugging control (PID / MPC / Kalman), operating logic (scheduler, alarms,
 // state machine), operating envelope and optimisation, surrogate / residual correction and historical replay.
 // SI inside the engines; bara, °C, h and mm at the interfaces.
-import { clamp, linspace, interp1, brent, tridiag, solveLinear, rk45, nelderMead, lstsq, rng, metrics, mean, sum, isNum, fmt } from '../core/num.js';
-import { fluidModel, inhibitorFor, hydrateDepression, INHIBITORS, R, VM_STD, makeFluid, phaseProps } from '../core/thermo.js';
+import { clamp, linspace, interp1, brent, tridiag, solveLinear, rk45, nelderMead, levenbergMarquardt, lstsq, rng, metrics, mean, sum, isNum, fmt } from '../core/num.js';
+import { fluidModel, inhibitorFor, hydrateDepression, INHIBITORS, R, VM_STD, makeFluid, phaseProps, flashPT, COMPONENTS, EOS } from '../core/thermo.js';
 import { G, uValue, hInside, hOutside, frictionFactor, marchSteady } from '../core/pipe.js';
 import { flowPicture, caseLine, ambientAt } from '../core/caseflow.js';
 import { BASE } from '../data/basecase.js';
 import * as NET from './s02_net.js';
+import { cpaWater, activityBinary } from './s01_pvt.js';
 import { REF } from '../data/ref/ops.js';
 
 const KEL = 273.15, HOUR = 3600, DAY = 86400;
@@ -268,6 +269,139 @@ export function blowdown(o) {
   return { ...out, dt, tEnd, tMark, minT, minTw, minTdown: minTd, peak, discharged: disc, flashed, unreleased: held, theta: thetaLast, liquidOut: mL0 - mL, mass: { initial: m0 + mL0, final: m + mL }, pFinal: P };
 }
 
+// ---- real-gas properties in (T, molar volume) form ------------------------------------------------------------
+/** Components that the kernel table does not carry (gas-phase use only). Hydrogen: critical constants, acentric factor and ideal-gas cp fit (150–400 K) from CoolProp; volume shift and transport factors fitted to its reference values (see PROVENANCE). */
+export const EXTRA_GASES = Object.freeze({
+  H2: { id: 'H2', name: 'Hydrogen', Tc: 33.145, Pc: 12.964, w: -0.219, MW: 2.01588, Vc: 64.48, par: 34, cp: [12.7869, 0.128901, -3.45671e-4, 3.15182e-7], s: -0.36, muF: 1.14, kF: 1.08 },
+});
+/**
+ * Gas-phase property model on the kernel cubic equation of state, explicit in temperature and molar volume.
+ * comp: { id: mol % } with kernel component ids and those of EXTRA_GASES, or { fluid (kernel EOS fluid), x (mole fractions) }. Returns { M (kg/mol), f (kernel-shaped fluid), x,
+ *   at(T, vm) -> { P (Pa), dPdT, dPdv, cv, cp (J/mol/K), h, u (J/mol), ks (isentropic exponent −(v/P)(∂P/∂v)_s), c (m/s) },
+ *   vm(P, T) (m³/mol, gas root), film(P, T) -> { rho, mu, k, cp (J/kg/K), beta (1/K) }, flux(T, vm, pBack) -> { G (kg/s/m²), choked, Pt } }.
+ */
+export function realGas(comp) {
+  let f, xIn = null;
+  const ids = comp.fluid ? [] : Object.keys(comp).filter((k) => +comp[k] > 0), kernel = ids.every((k) => COMPONENTS[k]);
+  if (comp.fluid) { f = comp.fluid; xIn = comp.x || f.z; }
+  else if (kernel) f = makeFluid({ comp, eos: 'PR' }, { eos: 'PR' });
+  else { const e = EOS.PR, tot = sum(ids.map((k) => +comp[k])), comps = ids.map((k) => { const c = COMPONENTS[k] || EXTRA_GASES[k]; if (!c) throw new Error(`Unknown gas component ${k}.`); const b = (e.ob * R * c.Tc) / (c.Pc * 1e5); return { ...c, z: +comp[k] / tot, ac: (e.oa * (R * c.Tc) ** 2) / (c.Pc * 1e5), b, m: e.m(c.w), c: c.s * b }; }); f = { comps, n: comps.length, z: comps.map((c) => c.z), kij: comps.map(() => comps.map(() => 0)), eos: e, eosId: 'PR', opts: {}, MW: sum(comps.map((c) => c.z * c.MW)) }; }
+  const x = xIn || f.z, n = f.n, M = sum(f.comps.map((c, i) => x[i] * c.MW)) * 1e-3, b = sum(f.comps.map((c, i) => x[i] * c.b)), cs = sum(f.comps.map((c, i) => x[i] * c.c)), S2 = Math.SQRT2;
+  const muF = sum(f.comps.map((c, i) => x[i] * (c.muF || 1))), kF = sum(f.comps.map((c, i) => x[i] * (c.kF || 1)));
+  // a(T) = Σ Σ x_i x_j (1 − k_ij) s_i s_j with s_i = p_i − q_i √T, so a = A0 − 2 A1 √T + A2 T in closed form; the ideal-gas heat capacity is one cubic
+  let A0 = 0, A1 = 0, A2 = 0; const cpc = [0, 0, 0, 0];
+  for (let i = 0; i < n; i++) { const ci = f.comps[i], ri = Math.sqrt(ci.ac), pi = ri * (1 + ci.m), qi = (ri * ci.m) / Math.sqrt(ci.Tc); for (let k = 0; k < 4; k++) cpc[k] += x[i] * ci.cp[k]; for (let j = 0; j < n; j++) { const cj = f.comps[j], rj = Math.sqrt(cj.ac), w = x[i] * x[j] * (1 - f.kij[i][j]); A0 += w * pi * rj * (1 + cj.m); A1 += (w * pi * rj * cj.m) / Math.sqrt(cj.Tc); A2 += (w * qi * rj * cj.m) / Math.sqrt(cj.Tc); } }
+  const cpIg = (T) => cpc[0] + T * (cpc[1] + T * (cpc[2] + T * cpc[3])), hIg = (T) => T * (cpc[0] + T * (cpc[1] / 2 + T * (cpc[2] / 3 + (T * cpc[3]) / 4)));
+  const at = (T, vm) => {
+    const rt = Math.sqrt(T), a = A0 - 2 * A1 * rt + A2 * T, a1 = -A1 / rt + A2, a2 = A1 / (2 * T * rt), v = vm + cs, q = v * v + 2 * b * v - b * b, P = (R * T) / (v - b) - a / q, dPdT = R / (v - b) - a1 / q, dPdv = (-R * T) / (v - b) ** 2 + (2 * a * (v + b)) / (q * q);
+    const L = Math.log((v + (1 + S2) * b) / (v + (1 - S2) * b)) / (2 * S2 * b), cv = cpIg(T) - R + T * a2 * L, cp = cv - (T * dPdT * dPdT) / dPdv, u = hIg(T) - R * T + (T * a1 - a) * L, ks = (-(vm / P) * (cp / cv)) * dPdv;
+    return { P, dPdT, dPdv, cv, cp, u, h: u + P * vm, ks, c: Math.sqrt(Math.max((ks * P * vm) / M, 0)) };
+  };
+  const vmOf = (P, T) => { let v = (R * T) / P; for (let k = 0; k < 40; k++) { const s = at(T, v), dv = (P - s.P) / s.dPdv; v = Math.max(v + clamp(dv, -0.5 * v, 2 * v), 1.05 * b - cs); if (Math.abs(dv) < 1e-12 * v) break; } return v; };
+  const film = (P, T) => { const vm = vmOf(P, T), s = at(T, vm), p = phaseProps(f, x, P / 1e5, T - KEL, 'vapour', { thermal: false }), mu = p.mu * muF, cp = s.cp / M; return { rho: M / vm, mu, k: mu * (cp + (1.25 * R) / M) * kF, cp, beta: -s.dPdT / (s.dPdv * vm) }; };
+  /** Mass flux of an isentropic nozzle from the stagnation state (T, vm) to pBack: the maximum of ρu along the isentrope (choked) or its value at pBack. */
+  const flux = (T0, v0, pBack) => {
+    const s0 = at(T0, v0); if (!(s0.P > pBack)) return { G: 0, choked: false, Pt: s0.P };
+    let T = T0, v = v0, s = s0, Gp = 0, Gpp = 0, vp = v0, Pp = s0.P; const r = 1.05;
+    for (let k = 0; k < 400; k++) {
+      const vn = v * r, k1 = (-T * s.dPdT) / s.cv, Tm = T + 0.5 * (vn - v) * k1, sm = at(Tm, 0.5 * (v + vn)), Tn = T + (vn - v) * ((-Tm * sm.dPdT) / sm.cv), sn = at(Tn, vn), Gn = Math.sqrt(Math.max(2 * (s0.h - sn.h) * M, 0)) / vn;
+      if (sn.P <= pBack) { const fr = (Pp - pBack) / (Pp - sn.P), Gb = Gp + fr * (Gn - Gp); return Gn < Gp ? { G: Gp, choked: true, Pt: Pp } : { G: Gb, choked: false, Pt: pBack }; }
+      if (Gn < Gp) { // passed the maximum: parabola through the last three points (equal steps in ln v)
+        const den = Gpp - 2 * Gp + Gn, d = den < 0 ? (0.5 * (Gpp - Gn)) / den : 0; return { G: Gp - 0.25 * (Gpp - Gn) * d, choked: true, Pt: Pp };
+      }
+      Gpp = Gp; Gp = Gn; vp = v; Pp = sn.P; T = Tn; v = vn; s = sn;
+    }
+    return { G: Gp, choked: true, Pt: Pp };
+  };
+  /** Yellow Book (CPR 14E eq. 2.22) orifice flux with the real density and the ideal-gas heat-capacity ratio, as used in HydDown. */
+  const fluxIdealK = (T0, v0, pBack) => {
+    const P = at(T0, v0).P; if (!(P > pBack)) return { G: 0, choked: false, Pt: P };
+    const k = cpIg(T0) / (cpIg(T0) - R), rc = ((k + 1) / 2) ** (k / (k - 1)), r = pBack / P, fc = P / pBack > rc ? 1 : (2 / (k - 1)) * ((k + 1) / 2) ** ((k + 1) / (k - 1)) * r ** (2 / k) * (1 - r ** ((k - 1) / k));
+    return { G: Math.sqrt(fc * (M / v0) * P * k * (2 / (k + 1)) ** ((k + 1) / (k - 1))), choked: fc === 1, Pt: Math.max(pBack, P / rc) };
+  };
+  return { M, f, x, b, at, vm: vmOf, film, flux, fluxIdealK, cpIg };
+}
+/** Natural-convection Nusselt number against the Rayleigh number (vertical plates and cylinders; Geankoplis Table 4.7-1 as used in HydDown). */
+export const nuNatural = (Ra) => (Ra >= 1e9 ? 0.13 * Ra ** 0.333 : Ra > 1e4 ? 0.59 * Ra ** 0.25 : 1.36 * Math.max(Ra, 1e-12) ** 0.2);
+/** Inner film coefficient (W/m²K) of a gas inventory by natural convection: properties at the film temperature, length Lc. */
+export function filmNatural(gas, P, Tgas, Twall, Lc) {
+  const p = gas.film(P, 0.5 * (Tgas + Twall)), nu = p.mu / p.rho, Ra = ((G * Math.abs(p.beta) * Math.abs(Twall - Tgas) * Lc ** 3) / (nu * nu)) * ((p.cp * p.mu) / p.k);
+  return { h: (nuNatural(Ra) * p.k) / Lc, Ra };
+}
+/**
+ * Blowdown of a gas inventory with heat transfer from its container (the standard vessel-depressurisation formulation):
+ * mass balance, real-gas energy balance m cv dT/dt = Q − (w_out − w_in) T (∂P/∂T)_v v + w_in (h_in − h), isentropic real-gas nozzle,
+ * natural-convection inner film (Nu–Ra), transient one-dimensional conduction through the wall layers, outer film to the ambient and an
+ * optional liquid zone (lumped liquid in contact with its own wetted wall column and with the gas across the interface).
+ * o: { gas (realGas) | comp, V (m³ gas volume), P0 (Pa), T0 (K), pBack, area (m²), cd,
+ *      Lc (m, characteristic length of the film: height of a vertical vessel, diameter of a horizontal one or of a pipe),
+ *      aIn (m² inner surface seen by the gas), ri (m inner radius; the wall is treated as a cylinder of that radius scaled to aIn),
+ *      layers: [{ t, k, rho, cp }] bore outwards, nw (cells through the wall), wallC (J/K total heat capacity; scales the layers when given),
+ *      hOut (W/m²K on the outer surface), tAmb (K), Tw0 (K), hIn ('calc' | number | 0 = adiabatic), isothermal (bool),
+ *      liquid: { C (J/K), T0, aWet (m² wetted wall), aInt (m² gas–liquid interface), hWet (W/m²K liquid–wall), hInt ('calc' | number) },
+ *      source(P, Tliq) -> kg of gas released per Pa of pressure fall (solution gas; taken from the liquid with `latent` J/kg),
+ *      nozzle: 'isentrope' (default) | 'ideal-k' (Yellow Book relation with the ideal-gas heat-capacity ratio), init: 'uniform' | 'steady' (wall profile),
+ *      dt (s) | n (steps to pEnd), tEnd, pEnd, pMark, jt (K/Pa) }
+ * Returns { t[], P[], T[], Tw[] (inner wall surface), Twm[] (mean wall), Two[] (outer surface), Tl[], h[], mdot[], m[], tEnd, tMark, minT, minTw, minTdown, peak, discharged, flashed,
+ *   mass: { initial, final }, energy: { gas0, gas, wall0, wall, liquid0, liquid, out (enthalpy discharged), amb (heat from the ambient), flashIn } }.
+ */
+export function vesselBlowdown(o) {
+  const q = { cd: 0.85, nw: 8, hOut: 5, tAmb: 288, hIn: 'calc', latent: 3e5, jt: 0, maxFactor: 8, n: 400, ...o }, gas = q.gas || realGas(q.comp), M = gas.M;
+  if (!(q.V > 0 && q.P0 > 0 && q.T0 > 0 && q.area > 0)) throw new Error('Blowdown needs a positive gas volume, pressure, temperature and orifice area.');
+  const fluxOf = q.nozzle === 'ideal-k' ? gas.fluxIdealK : gas.flux, pEnd = Math.max(q.pEnd ?? q.pBack * 1.05, q.pBack * 1.0005), Tw0 = q.Tw0 ?? q.T0, hasWall = q.aIn > 0 && Array.isArray(q.layers) && q.layers.length > 0 && !q.isothermal, liq = hasWall && q.liquid && q.liquid.C > 0 ? q.liquid : null;
+  // wall columns: cylindrical cells per unit length × equivalent length (dry and, with a liquid zone, wetted)
+  const column = (area) => {
+    const Le = area / (2 * Math.PI * q.ri), cells = []; let r = q.ri; const tot = sum(q.layers.map((l) => l.t));
+    for (const l of q.layers) { const nc = Math.max(1, Math.round((q.nw * l.t) / tot)), dr = l.t / nc; for (let i = 0; i < nc; i++) { cells.push({ rw: r, re: r + dr, rc: Math.sqrt(0.5 * (r * r + (r + dr) ** 2)), k: l.k, C: l.rho * l.cp * Math.PI * ((r + dr) ** 2 - r * r) * Le }); r += dr; } }
+    const N = cells.length, Gc = []; for (let i = 0; i < N - 1; i++) Gc.push((2 * Math.PI * Le) / (Math.log(cells[i].re / cells[i].rc) / cells[i].k + Math.log(cells[i + 1].rc / cells[i].re) / cells[i + 1].k));
+    return { N, C: cells.map((c) => c.C), Gc, rIn: Math.log(cells[0].rc / q.ri) / (2 * Math.PI * cells[0].k * Le), rOut: Math.log(r / cells[N - 1].rc) / (2 * Math.PI * cells[N - 1].k * Le) + 1 / (q.hOut > 0 ? q.hOut * 2 * Math.PI * r * Le : 1e-300), aOut: 2 * Math.PI * r * Le, area };
+  };
+  const dry = hasWall ? column(q.aIn) : null, wet = liq ? column(liq.aWet) : null;
+  if (hasWall && q.wallC > 0) { const f = q.wallC / (sum(dry.C) + (wet ? sum(wet.C) : 0)); dry.C = dry.C.map((c) => c * f); if (wet) wet.C = wet.C.map((c) => c * f); }
+  // initial wall temperatures: uniform, or (init: 'steady') the steady conduction profile between the inner temperature and the ambient
+  const initCol = (col, Ti) => { if (q.init !== 'steady') return new Array(col.N).fill(Ti); const out = []; let Rc = col.rIn; const Rt = col.rIn + sum(col.Gc.map((g) => 1 / g)) + col.rOut; for (let i = 0; i < col.N; i++) { out.push(Ti - ((Ti - q.tAmb) * Rc) / Rt); if (i < col.N - 1) Rc += 1 / col.Gc[i]; } return out; };
+  let vm = gas.vm(q.P0, q.T0), nMol = q.V / vm, m = nMol * M, T = q.T0, Tl = liq ? liq.T0 ?? q.T0 : q.T0, Td = hasWall ? initCol(dry, Tw0) : [], Tww = wet ? initCol(wet, liq.Tw0 ?? liq.T0 ?? Tw0) : [];
+  const st0 = gas.at(T, vm), w0 = q.cd * q.area * fluxOf(T, vm, q.pBack).G, tau0 = m / Math.max(w0, 1e-12), dt = q.dt ?? (1.7 * tau0 * Math.log(q.P0 / pEnd) + 0.2 * tau0) / q.n, nMax = q.tEnd ? Math.ceil(q.tEnd / dt) : q.n * q.maxFactor;
+  const surfIn = (col, Tc, Tfl, h) => (h > 0 ? (Tc[0] / col.rIn + Tfl * h * col.area) / (1 / col.rIn + h * col.area) : Tc[0]), surfOut = (col, Tc) => { const gk = 1 / (col.rOut - (q.hOut > 0 ? 1 / (q.hOut * col.aOut) : 0)), gf = q.hOut > 0 ? q.hOut * col.aOut : 0; return (Tc[col.N - 1] * gk + q.tAmb * gf) / (gk + gf); };
+  const eWall = () => (hasWall ? sum(dry.C.map((c, i) => c * Td[i])) + (wet ? sum(wet.C.map((c, i) => c * Tww[i])) : 0) : 0);
+  const out = { t: [0], P: [st0.P], T: [T], Tw: [Tw0], Twm: [Tw0], Two: [Tw0], Tl: [Tl], h: [0], mdot: [w0], m: [m] }, m0 = m, E = { gas0: (m / M) * st0.u, wall0: eWall(), liquid0: liq ? liq.C * Tl : 0, out: 0, amb: 0, flashIn: 0 };
+  let wCur = w0, P = st0.P, time = 0, disc = 0, flashed = 0, tEnd = null, tMark = null, minT = T, minTw = Tw0, minTd = T - q.jt * (P - q.pBack), peak = w0, hLast = 0;
+  for (let k = 0; k < nMax && tEnd === null; k++) {
+    const s = gas.at(T, vm), w = wCur, TsDry = hasWall ? surfIn(dry, Td, T, hLast) : T;
+    const hIn = !hasWall || q.hIn === 0 ? 0 : q.hIn === 'calc' ? filmNatural(gas, P, T, TsDry, q.Lc).h : +q.hIn, hInt = liq ? (liq.hInt === 'calc' || liq.hInt === undefined ? (Math.abs(Tl - T) > 1e-6 ? filmNatural(gas, P, T, Tl, q.Lc).h : 0) : +liq.hInt) : 0;
+    const FP = q.source ? Math.max(0, q.source(P, liq ? Tl : T)) * P : 0, fl = (w * FP) / (m + FP), // liberation follows the pressure fall, d ln P/dt ≈ −(w − fl)/m
+      Cg = Math.max((m / M) * s.cv, 1e-9), work = ((w - fl) / M) * T * s.dPdT * vm, hinTerm = fl > 0 ? (fl / M) * s.cp * ((liq ? Tl : T) - T) : 0;
+    let Tn = T, Tln = Tl;
+    if (q.isothermal) Tn = T;
+    else if (!hasWall) Tn = T + (dt * (hinTerm - work)) / Cg;
+    else {
+      // one implicit chain: [ambient] – wetted wall (outside → inside) – liquid – gas – dry wall (inside → outside) – [ambient]
+      const nodes = [], cap = [], cond = []; // cond[i] between node i and i + 1
+      if (wet) { for (let i = wet.N - 1; i >= 0; i--) { nodes.push(Tww[i]); cap.push(wet.C[i]); cond.push(i > 0 ? wet.Gc[i - 1] : 1 / (wet.rIn + 1 / Math.max((liq.hWet ?? 150) * wet.area, 1e-12))); } nodes.push(Tl); cap.push(liq.C); cond.push(hInt * (liq.aInt || 0)); }
+      const ig = nodes.length; nodes.push(T); cap.push(Cg); cond.push(hIn > 0 ? 1 / (dry.rIn + 1 / (hIn * dry.area)) : 0);
+      for (let i = 0; i < dry.N; i++) { nodes.push(Td[i]); cap.push(dry.C[i]); if (i < dry.N - 1) cond.push(dry.Gc[i]); }
+      const nn = nodes.length, a = new Array(nn).fill(0), b = new Array(nn), c = new Array(nn).fill(0), d = new Array(nn), gL = wet ? 1 / wet.rOut : 0, gR = 1 / dry.rOut;
+      for (let i = 0; i < nn; i++) { const gl = i > 0 ? cond[i - 1] : gL, gr = i < nn - 1 ? cond[i] : gR; a[i] = i > 0 ? -gl : 0; c[i] = i < nn - 1 ? -gr : 0; b[i] = cap[i] / dt + gl + gr; d[i] = (cap[i] / dt) * nodes[i] + (i === 0 && wet ? gL * q.tAmb : 0) + (i === nn - 1 ? gR * q.tAmb : 0); }
+      if (!wet) b[0] = cap[0] / dt + cond[0];
+      d[ig] += hinTerm - work; if (liq) d[ig - 1] -= fl * q.latent;
+      const sol = tridiag(a, b, c, d);
+      E.amb += dt * (gR * (q.tAmb - sol[nn - 1]) + (wet ? gL * (q.tAmb - sol[0]) : 0));
+      if (wet) { for (let i = 0; i < wet.N; i++) Tww[i] = sol[wet.N - 1 - i]; Tln = sol[ig - 1]; }
+      Tn = sol[ig]; for (let i = 0; i < dry.N; i++) Td[i] = sol[ig + 1 + i];
+    }
+    const mN = Math.max(m - dt * (w - fl), 1e-12), Pold = P;
+    E.out += dt * w * (s.h / M); E.flashIn += dt * fl * ((s.h + s.cp * ((liq ? Tl : T) - T)) / M);
+    disc += dt * w; flashed += dt * fl; time += dt; m = mN; T = Math.max(Tn, 20); Tl = Tln; vm = (q.V * M) / m; P = gas.at(T, vm).P; hLast = hIn;
+    const TsIn = hasWall ? surfIn(dry, Td, T, hIn) : T, wNow = q.cd * q.area * fluxOf(T, vm, q.pBack).G; wCur = wNow;
+    out.t.push(time); out.P.push(P); out.T.push(T); out.Tw.push(TsIn); out.Twm.push(hasWall ? sum(dry.C.map((cc, i) => cc * Td[i])) / sum(dry.C) : T); out.Two.push(hasWall ? surfOut(dry, Td) : T); out.Tl.push(Tl); out.h.push(hIn); out.mdot.push(wNow); out.m.push(m);
+    minT = Math.min(minT, T); if (hasWall) minTw = Math.min(minTw, TsIn, wet ? Tww[0] : Infinity); minTd = Math.min(minTd, T - q.jt * Math.max(P - q.pBack, 0)); peak = Math.max(peak, wNow);
+    if (q.pMark && tMark === null && P <= q.pMark) tMark = time - (dt * (q.pMark - P)) / (Pold - P || 1e-300);
+    if (P <= pEnd) tEnd = time - (dt * (pEnd - P)) / (Pold - P || 1e-300);
+  }
+  const sE = gas.at(T, vm);
+  return { ...out, dt, tEnd, tMark, minT, minTw, minTdown: minTd, peak, discharged: disc, flashed, mass: { initial: m0, final: m }, pFinal: P, energy: { ...E, gas: (m / M) * sE.u, wall: eWall(), liquid: liq ? liq.C * Tl : 0 }, gas };
+}
+
 // ---- pigging --------------------------------------------------------------------------------------------------------
 /**
  * Quasi-steady pig run along a line. o: { s[] (m, arc length at the nodes), z[], vm[] (mixture velocity behind the pig, m/s), holdup[], vsl[], rhoM[] (also the density of the fluid passing the bypass unless rhoBypass[] is given),
@@ -330,13 +464,32 @@ export function inhibitorFront(o) {
   }
   return { ...out, tProtect, transit, dtau };
 }
-const PSAT_ETOH = (T) => 10 ** (8.20417 - 1642.89 / (T + 230.3)) * 133.322; // Antoine, mmHg and °C (not checked against a source: see PROVENANCE)
+// Antoine vapour pressures (Pa) of the alcohols: NIST Chemistry WebBook, log10(P/bar) = A − B/(T/K + C); ethanol 273–352 K, methanol 288–357 K
+const PSAT_ETOH = (Tc) => 1e5 * 10 ** (5.37229 - 1670.409 / (Tc + KEL - 40.191)), PSAT_MEOH = (Tc) => 1e5 * 10 ** (5.20409 - 1581.341 / (Tc + KEL - 33.5));
+/** Activity coefficient of ethanol in water by the van Laar equation (A12 = 2.05, A21 = 1.0, fitted to four points of the atmospheric boiling-point table of aqueous ethanol; x = ethanol mole fraction). */
+export const gammaEthanol = (x) => Math.exp(2.05 / (1 + (2.05 * x) / (1.0 * Math.max(1 - x, 1e-9))) ** 2);
+const K_MEOH = new Map(); let C1_FLUID = null;
+/**
+ * Methanol vapour–aqueous K-value y/x at P (bara), T (°C) for an aqueous phase of wt % methanol: gas–aqueous equilibrium by the
+ * cubic-plus-association model of the fluid suite (gas: { f (kernel EOS fluid), y (dry-gas mole fractions) }, default methane).
+ * When that model has no solution the modified Raoult law is used (NRTL activity coefficient, NIST Antoine vapour pressure).
+ * Returns { K, method: 'CPA' | 'Raoult' }.
+ */
+export function methanolK(Pbar, Tc, wt = 25, gas = null) {
+  const w = clamp(wt, 0.5, 95), x = w / 32.042 / (w / 32.042 + (100 - w) / 18.015), key = `${Pbar.toFixed(2)}|${Tc.toFixed(2)}|${w.toFixed(2)}|${gas ? gas.y.map((v) => v.toFixed(4)).join(',') + gas.f.comps.map((c) => c.id).join('') : 'C1'}`;
+  if (K_MEOH.has(key)) return K_MEOH.get(key);
+  let out = null;
+  try { if (!gas && !C1_FLUID) C1_FLUID = makeFluid({ comp: { C1: 100 } }); const g = gas || { f: C1_FLUID, y: [1] }, r = cpaWater(g.f, g.y, Pbar, Tc, { inhId: 'MeOH', inhWt: w }); if (r.ok && r.yInh > 0 && r.yInh < 0.5) out = { K: r.yInh / x, method: 'CPA' }; } catch { out = null; }
+  if (!out) out = { K: (activityBinary('NRTL', 'MeOH', x, Tc + KEL).g1 * PSAT_MEOH(Tc)) / (Pbar * 1e5), method: 'Raoult' };
+  if (K_MEOH.size > 400) K_MEOH.clear(); K_MEOH.set(key, out);
+  return out;
+}
 /**
  * Thermodynamic-inhibitor requirement with phase-partitioning losses. o: { dT (°C depression needed), inh ('MeOH' | 'MEG' | …), S (g/kg salinity),
  *   mWater (kg/s free water), lean (wt % purity of the injected chemical), P (bara), T (°C where the phases separate), qGasStd (Sm³/d), mOil (kg/s), rhoOil (kg/m³),
- *   eff (fraction of the injected chemical that reaches the aqueous phase before partitioning; injection efficiency) }
- * Partitioning: methanol to the gas by the K-value correlation methanolK (within its fitted range), 0.4 kg per m³ of liquid hydrocarbon;
- * glycols: gas loss neglected, 3.5 L per million Sm³ of gas to the hydrocarbon liquid; ethanol: modified Raoult's law (activity coefficient 1.6).
+ *   eff (fraction of the injected chemical that reaches the aqueous phase before partitioning; injection efficiency), gas: { f, y } (dry gas for the methanol partitioning) }
+ * Partitioning: methanol to the gas by methanolK (cubic-plus-association), 0.4 kg per m³ of liquid hydrocarbon;
+ * glycols: gas loss neglected, 3.5 L per million Sm³ of gas to the hydrocarbon liquid; ethanol: modified Raoult's law (van Laar activity coefficient, NIST vapour pressure).
  * Returns { wt (wt % in the aqueous phase), mAq (kg/s inhibitor in the water), lossGas, lossOil (kg/s), mTotal (kg/s pure), qInject (m³/d of the lean chemical), rich (kg/s aqueous phase returned) }.
  */
 export function inhibitorDose(o) {
@@ -345,79 +498,115 @@ export function inhibitorDose(o) {
   // water brought in by a lean (regenerated) chemical dilutes it: m_inh = w (mW + m_lean (1 − lean) + m_inh)
   const mAq = (w * q.mWater) / Math.max(1 - w / lean, 0.02), xAq = mAq / inh.MW / (mAq / inh.MW + (q.mWater + (mAq * (1 - lean)) / lean) / 18.015);
   const alcohol = q.inh === 'MeOH' || q.inh === 'EtOH', gasMol = q.qGasStd / DAY / VM_STD;
-  const y = q.inh === 'MeOH' ? Math.min(methanolK(clamp(q.P, 6.9, 345), clamp(q.T, -23, 38)) * xAq, 0.2) : q.inh === 'EtOH' ? Math.min((1.6 * xAq * PSAT_ETOH(q.T)) / (q.P * 1e5), 0.2) : 0, lossGas = (y * gasMol * inh.MW) / 1000;
+  const y = q.inh === 'MeOH' ? Math.min(methanolK(clamp(q.P, 1, 600), clamp(q.T, -40, 80), wt, q.gas || null).K * xAq, 0.2) : q.inh === 'EtOH' ? Math.min((gammaEthanol(xAq) * xAq * PSAT_ETOH(q.T)) / (q.P * 1e5), 0.2) : 0, lossGas = (y * gasMol * inh.MW) / 1000;
   const lossOil = alcohol ? (0.4 * q.mOil) / Math.max(q.rhoOil, 1) : 3.5e-9 * (q.qGasStd / DAY) * inh.rho, eff = clamp(q.eff, 0.05, 1), mTotal = (mAq + lossGas + lossOil) / eff;
   return { wt, mAq, lossGas, lossOil, mTotal, y, qInject: ((mTotal / lean) / (lean * inh.rho + (1 - lean) * 1000)) * DAY, rich: q.mWater + mAq / lean, attainable: wt < 93.9 && w / lean < 0.98 };
 }
 
 // ---- riser slugging: low-order four-state model ------------------------------------------------------------
 /**
- * Four-state pipeline–riser model (gas and liquid mass in the feed pipeline and in the riser) with a low-point
- * orifice pair and a topside choke.
- * p: { D, Lp (feed length), Vp (feed volume), Lr (riser height), Vr (riser + topside volume), theta (rad, feed inclination at the low point),
- *      rhoL, mwG (kg/mol), Z, Tp, Tr (K), muL, wG, wL (kg/s inflow), Ps (Pa separator), Cv (choke), kH, kL, kG (optional), aLp (feed liquid fraction), rough,
- *      Dr (riser diameter when it differs from D), Lh (horizontal length between riser top and choke, added to the riser friction length), Kpc (valve constant in m², overrides Cv),
- *      chokeExp (valve characteristic f(z) = z^chokeExp; 1 = linear), fric: 'haaland' | 'dkm' (0.0056 + 0.5 Re^-0.32, as in the published model) }
- * Structure after Jahanshahi & Skogestad (2011): level at the low point h = kH hc ᾱL + (mL − ρL V ᾱL) sinθ / (A (1 − ᾱL) ρL), hc = D/cosθ, gas area A (1 − h/hc)²,
- * orifice equations for gas and liquid at the low point, top liquid fraction 2 ᾱLr − AL/A, valve w = Kpc f(z) √(ρt (Prt − Ps)).
- * Returns { p, alg(y, z, wG, wL, Ps), f(z)(t, y), steady(z, wG, wL), linearise(z), poles(z), critical() }.
+ * Four-state pipeline–riser model of Jahanshahi & Skogestad (gas and liquid mass in the feed pipeline and in the riser, a low-point
+ * orifice pair and a topside choke), with the algebra of the model files posted with their 2014 paper:
+ *   level at the low point h = max(kH hc ᾱ + (mLp − ρL Vp ᾱ) sinθ / (A (1 − ᾱ) ρL), 0), hc = D/cosθ, gas area A (1 − h/hc)²;
+ *   pipeline friction ½ λp ρL Usl² Lp/D with λp = 0.0056 + 0.5 Re^-0.32 (mixture Reynolds number at the present gas density),
+ *   riser friction ½ λr ρm Um² (Lr + Lh)/Dr with the Haaland factor at the present riser state; orifice equations for gas and liquid;
+ *   liquid fraction at the riser top αt = 2 ᾱr − αb limited to 0 … ᾱr with αb = max(AL/A, ᾱr); valve w = Kpc f(z) √(ρt (Prt − Ps − dPv)).
+ * p: { D, Lp (feed length), Vp (feed volume), Vb (extra gas volume upstream, e.g. a buffer tank), Lr (riser height), Vr (riser + topside volume),
+ *      theta (rad), rhoL, mwG (kg/mol), Z, Tp, Tr (K), muL, muG, wG, wL (kg/s inflow), Ps (Pa), Cv (choke) | Kpc (valve constant, m²), dPv (Pa, valve offset),
+ *      kH, kL, kG (optional: derived from the nominal state), aLp (mean feed liquid fraction), rough, Dr, Lh, chokeExp (f(z) = z^chokeExp),
+ *      fric: 'published' (default: the pair above) | 'haaland' (both sections) }
+ * Returns { p, alg(y, z, wG, wL, Ps), f(z)(t, y), steady(z, wG, wL), linearise(z), poles(z), growth(z), critical() }.
  * y = [mGp, mLp, mGr, mLr] (kg), z = choke opening 0–1.
  */
 export function slugModel(p) {
-  const o = { D: 0.254, Lp: 5000, Lr: 300, theta: 0.02, rhoL: 800, mwG: 0.02, Z: 0.9, Tp: 320, Tr: 310, muL: 2e-3, wG: 1, wL: 20, Ps: 25e5, Cv: 400, kH: 0.7, kL: 0.3, aLp: 0.4, rough: 4.5e-5, chokeExp: 1, Lh: 0, fric: 'haaland', ...p };
+  const o = { D: 0.254, Lp: 5000, Lr: 300, theta: 0.02, rhoL: 800, mwG: 0.02, Z: 0.9, Tp: 320, Tr: 310, muL: 2e-3, muG: 1.4e-5, wG: 1, wL: 20, Ps: 25e5, Cv: 400, kH: 0.7, kL: 0.3, aLp: 0.4, rough: 4.5e-5, chokeExp: 1, Lh: 0, Vb: 0, dPv: 0, fric: 'published', ...p };
+  if (o.fric === 'dkm') o.fric = 'published';
   const r = o.D / 2, A = Math.PI * r * r, Dr = o.Dr || o.D, Ar = (Math.PI * Dr * Dr) / 4, th = Math.max(Math.abs(o.theta), 1e-3), hc = (2 * r) / Math.cos(th), sinT = Math.sin(th);
   o.Vp = o.Vp || A * o.Lp; o.Vr = o.Vr || Ar * (o.Lh > 0 ? o.Lr + o.Lh : o.Lr * 1.15);
-  const RTp = (o.Z * R * o.Tp) / o.mwG, RTr = (o.Z * R * o.Tr) / o.mwG, aL = clamp(o.aLp, 0.05, 0.9), hbar = o.kH * hc * aL, Kc = o.Kpc > 0 ? o.Kpc : 2.403e-5 * o.Cv, fz = o.chokeExp === 1 ? (z) => z : (z) => Math.max(z, 0) ** o.chokeExp;
-  const dmdh = (A * (1 - aL) * o.rhoL) / sinT, lamOf = (u, rho, D) => { const Re = Math.max((rho * u * D) / o.muL, 100); return o.fric === 'dkm' ? 0.0056 + 0.5 * Re ** -0.32 : frictionFactor(Re, o.rough / D, 'haaland'); };
+  const RTp = (o.Z * R * o.Tp) / o.mwG, RTr = (o.Z * R * o.Tr) / o.mwG, aL = clamp(o.aLp, 0.02, 0.98), hbar = o.kH * hc * aL, Kc = o.Kpc > 0 ? o.Kpc : 2.403e-5 * o.Cv, fz = o.chokeExp === 1 ? (z) => z : (z) => Math.max(z, 0) ** o.chokeExp;
+  const dmdh = (A * (1 - aL) * o.rhoL) / sinT, visP = aL * o.muL + (1 - aL) * o.muG, haal = (Re, D) => { const t = -1.8 * Math.log10((o.rough / D / 3.7) ** 1.11 + 6.9 / Math.max(Re, 10)); return 1 / (t * t); };
   const areas = (h) => { const hh = clamp(h, 0, hc), AG = A * ((hc - hh) / hc) ** 2; return [AG, A - AG]; };
-  // friction factors are frozen at the nominal superficial velocities (weak function of the state, large saving in the Jacobians)
-  const rhoGref = (1.6 * o.Ps) / RTr, u0 = o.wL / (A * o.rhoL), um0 = o.wL / (Ar * o.rhoL) + o.wG / (rhoGref * Ar), lamP = lamOf(u0, o.rhoL, o.D), lamR = lamOf(um0, 0.5 * o.rhoL, Dr);
-  const fricP = (wL) => { const u = wL / (A * o.rhoL); return (aL * lamP * o.rhoL * u * u * o.Lp) / (2 * o.D); };
-  const fricR = (wG, wL, rhoM, aLr) => { const um = wL / (Ar * o.rhoL) + wG / (rhoGref * Ar); return (aLr * lamR * rhoM * um * um * (o.Lr + o.Lh)) / (2 * Dr); };
+  const fricP = (wG, wL, rhoG) => { const usl = wL / (A * o.rhoL), Re = Math.max(((aL * o.rhoL + (1 - aL) * rhoG) * (usl + wG / (A * rhoG)) * o.D) / visP, 10); return (0.5 * (o.fric === 'haaland' ? haal(Re, o.D) : 0.0056 + 0.5 * Re ** -0.32) * o.rhoL * usl * usl * o.Lp) / o.D; };
+  const fricR = (wG, wL, rhoM, aLr, rhoG) => { const um = wL / (o.rhoL * Ar) + wG / (rhoG * Ar), Re = (rhoM * um * Dr) / (aLr * o.muL + (1 - aLr) * o.muG); return (0.5 * haal(Re, Dr) * rhoM * um * um * (o.Lr + o.Lh)) / Dr; };
   if (!(o.kG > 0)) { // low-point gas coefficient from the nominal state: gas and liquid pass side by side at the mean level
     const [AG, AL] = areas(hbar), dPL = (o.wL / (o.kL * AL)) ** 2 / o.rhoL, dPG = Math.max(dPL - o.rhoL * G * hbar, 0.25 * dPL), rhoG = o.rhoGnom || 60;
     o.kG = o.wG / (AG * Math.sqrt(rhoG * dPG));
   }
   const alg = (y, z, wGin = o.wG, wLin = o.wL, Ps = o.Ps) => {
-    const mGp = Math.max(y[0], 1e-6), mLp = y[1], mGr = Math.max(y[2], 1e-6), mLr = Math.max(y[3], 0);
-    const rhoGp = mGp / Math.max(o.Vp - mLp / o.rhoL, 0.02 * o.Vp), Pp = rhoGp * RTp, h = hbar + (mLp - o.rhoL * o.Vp * aL) / dmdh;
-    const VGr = Math.max(o.Vr - mLr / o.rhoL, 0.01 * o.Vr), rhoGr = mGr / VGr, aLr = clamp(mLr / (o.Vr * o.rhoL), 0, 1), rhoM = (mGr + mLr) / o.Vr;
-    const Prt = rhoGr * RTr + 2e8 * Math.max(mLr / (o.Vr * o.rhoL) - 0.985, 0), Prb = Prt + rhoM * G * o.Lr + fricR(wGin, wLin, rhoM, aLr), [AG, AL] = areas(h);
-    const dPG = Pp - fricP(wLin) - Prb, wGlp = dPG > 0 ? o.kG * AG * Math.sqrt(rhoGp * dPG) : 0;
-    const dPL = dPG + o.rhoL * G * clamp(h, 0, 4 * hc), wLlp = dPL > 0 ? o.kL * AL * Math.sqrt(o.rhoL * dPL) : 0;
-    const aLt = clamp(2 * aLr - AL / A, 0, 1), rhoT = aLt * o.rhoL + (1 - aLt) * rhoGr, xL = (aLt * o.rhoL) / Math.max(rhoT, 1e-9), dPc = Prt - Ps, w = dPc > 0 ? Kc * fz(z) * Math.sqrt(rhoT * dPc) : 0;
+    const mGp = Math.max(y[0], 1e-9), mLp = y[1], mGr = Math.max(y[2], 1e-9), mLr = Math.max(y[3], 0);
+    const rhoGp = mGp / Math.max(o.Vp + o.Vb - mLp / o.rhoL, 1e-4 * o.Vp), Pp = rhoGp * RTp, h = Math.max(hbar + (mLp - o.rhoL * o.Vp * aL) / dmdh, 0);
+    const rhoGr = mGr / Math.max(o.Vr - mLr / o.rhoL, 1e-5 * o.Vr), aLr = mLr / (o.Vr * o.rhoL), rhoM = (mGr + mLr) / o.Vr;
+    const Prt = Math.max(rhoGr * RTr, Ps), Prb = Prt + rhoM * G * o.Lr + fricR(wGin, wLin, rhoM, aLr, rhoGr), [AG, AL] = areas(h);
+    const dPG = Pp - fricP(wGin, wLin, rhoGp) - Prb, wGlp = dPG > 0 ? o.kG * AG * Math.sqrt(rhoGp * dPG) : 0;
+    const dPL = dPG + o.rhoL * G * h, wLlp = dPL > 0 ? o.kL * AL * Math.sqrt(o.rhoL * dPL) : 0;
+    const aLb = Math.max(AL / A, aLr), aLt = clamp(2 * aLr - aLb, 0, Math.min(aLr, 1)), rhoT = aLt * o.rhoL + (1 - aLt) * rhoGr, xL = (aLt * o.rhoL) / Math.max(rhoT, 1e-9), dPc = Prt - Ps - o.dPv, w = dPc > 0 ? Kc * fz(z) * Math.sqrt(rhoT * dPc) : 0;
     return { Pp, Prt, Prb, h: h / hc, aLr, aLt, rhoT, w, wGout: (1 - xL) * w, wLout: xL * w, wGlp, wLlp, d: [wGin - wGlp, wLin - wLlp, wGlp - (1 - xL) * w, wLlp - xL * w] };
   };
-  /** Equilibrium for a choke opening (exists for every opening: the level and the top pressure are found by 1-D root finding). */
+  /** Equilibrium for a choke opening (the top pressure from the valve equation, then the low-point level, both by 1-D root finding). */
   const steady = (z, wG = o.wG, wL = o.wL, Ps = o.Ps) => {
     const w = wG + wL, xL = wL / w, top = (Prt) => { const rg = Prt / RTr, aLt = (xL * rg) / (o.rhoL - xL * (o.rhoL - rg)); return { rg, aLt, rhoT: aLt * o.rhoL + (1 - aLt) * rg }; };
-    const gT = (Prt) => Kc * fz(z) * Math.sqrt(top(Prt).rhoT * (Prt - Ps)) - w;
-    let hi = Ps * 1.0001 + 10; while (gT(hi) < 0 && hi < 1e13) hi = Ps + (hi - Ps) * 2;
-    const Prt = brent(gT, Ps, hi, 1e-10), t = top(Prt);
+    const lo = Ps + o.dPv, gT = (Prt) => Kc * fz(z) * Math.sqrt(top(Prt).rhoT * (Prt - lo)) - w;
+    let hi = lo * 1.0001 + 10; while (gT(hi) < 0 && hi < 1e13) hi = lo + (hi - lo) * 2;
+    const Prt = brent(gT, lo, hi, 1e-10), t = top(Prt);
     const at = (h) => {
-      const [AG, AL] = areas(h), aLr = clamp(0.5 * (t.aLt + AL / A), 0, 0.99), rhoM = aLr * o.rhoL + (1 - aLr) * t.rg, Prb = Prt + rhoM * G * o.Lr + fricR(wG, wL, rhoM, aLr);
-      const dPG = (wL / (o.kL * AL)) ** 2 / o.rhoL - o.rhoL * G * h, Pp = Prb + fricP(wL) + dPG;
-      return { AG, aLr, Prb, dPG, Pp, res: dPG > 0 ? o.kG * AG * Math.sqrt((Pp / RTp) * dPG) - wG : -wG };
+      const [AG, AL] = areas(h), aLb = AL / A, aLr = aLb >= t.aLt ? 0.5 * (t.aLt + aLb) : t.aLt, mLr = aLr * o.Vr * o.rhoL, mGr = t.rg * (o.Vr - mLr / o.rhoL), rhoM = (mGr + mLr) / o.Vr, Prb = Prt + rhoM * G * o.Lr + fricR(wG, wL, rhoM, aLr, t.rg);
+      const dPL = (wL / (o.kL * AL)) ** 2 / o.rhoL; let Pp = Prb + dPL - o.rhoL * G * h, Fp = 0;
+      for (let k = 0; k < 25; k++) { Fp = fricP(wG, wL, Math.max(Pp, 1) / RTp); const Pn = Prb + Fp + dPL - o.rhoL * G * h; if (Math.abs(Pn - Pp) < 1e-11 * Math.abs(Pn)) { Pp = Pn; break; } Pp = Pn; }
+      const dPG = Pp - Fp - Prb;
+      return { AG, aLr, mGr, mLr, Prb, dPG, Pp, res: dPG > 0 && Pp > 0 ? o.kG * AG * Math.sqrt((Pp / RTp) * dPG) - wG : -wG };
     };
-    const h = brent((x) => at(x).res, 1e-4 * hc, (1 - 1e-7) * hc, 1e-13), e = at(h), mLp = o.rhoL * o.Vp * aL + (h - hbar) * dmdh, mLr = e.aLr * o.Vr * o.rhoL;
-    return { y: [(e.Pp / RTp) * (o.Vp - mLp / o.rhoL), mLp, t.rg * (o.Vr - mLr / o.rhoL), mLr], Pp: e.Pp, Prt, Prb: e.Prb, h: h / hc, aLr: e.aLr };
+    const h = brent((x) => at(x).res, 1e-6 * hc, (1 - 1e-9) * hc, 1e-15), e = at(h), mLp = o.rhoL * o.Vp * aL + (h - hbar) * dmdh;
+    return { y: [(e.Pp / RTp) * (o.Vp + o.Vb - mLp / o.rhoL), mLp, e.mGr, e.mLr], Pp: e.Pp, Prt, Prb: e.Prb, h: h / hc, aLr: e.aLr };
   };
   /** Jacobians at the equilibrium of opening z: dx/dt = A x + B u (u = opening), outputs [Pp, Prt] in Pa. */
   const linearise = (z) => {
     const s = steady(z), n = 4, Aj = zeros(n, n), C = zeros(2, n), out = (y, u) => { const a = alg(y, u); return [a.d, [a.Pp, a.Prt]]; };
-    for (let j = 0; j < n; j++) { const e = Math.abs(s.y[j]) * 1e-6 + 1e-7, yp = s.y.slice(), ym = s.y.slice(); yp[j] += e; ym[j] -= e; const [dp, op] = out(yp, z), [dm, om] = out(ym, z); for (let i = 0; i < n; i++) Aj[i][j] = (dp[i] - dm[i]) / (2 * e); for (let i = 0; i < 2; i++) C[i][j] = (op[i] - om[i]) / (2 * e); }
-    const e = 1e-5, [dp, op] = out(s.y, z + e), [dm, om] = out(s.y, z - e);
+    for (let j = 0; j < n; j++) { const e = Math.abs(s.y[j]) * 1e-6 + 1e-9, yp = s.y.slice(), ym = s.y.slice(); yp[j] += e; ym[j] -= e; const [dp, op] = out(yp, z), [dm, om] = out(ym, z); for (let i = 0; i < n; i++) Aj[i][j] = (dp[i] - dm[i]) / (2 * e); for (let i = 0; i < 2; i++) C[i][j] = (op[i] - om[i]) / (2 * e); }
+    const e = Math.min(1e-5, 0.01 * z), [dp, op] = out(s.y, z + e), [dm, om] = out(s.y, z - e);
     return { A: Aj, B: dp.map((v, i) => [(v - dm[i]) / (2 * e)]), C, D: op.map((v, i) => (v - om[i]) / (2 * e)), ys: s.y, steady: s, z };
   };
   const poles = (z) => eig(linearise(z).A), growth = (z) => Math.max(...poles(z).map((e) => e[0]));
+  /** Oscillation period (s) of the least damped complex pole pair at opening z, or null. */
+  const period = (z) => { const pl = poles(z).filter((e) => Math.abs(e[1]) > 1e-12).sort((a, b) => b[0] - a[0])[0]; return pl ? (2 * Math.PI) / Math.abs(pl[1]) : null; };
   /** Smallest opening at which the equilibrium loses stability (Hopf point), or null when stable up to fully open. */
   const critical = (zLo = 0.02, zHi = 1, n = 13) => {
     const zs = Array.from({ length: n }, (_, i) => zLo * (zHi / zLo) ** (i / (n - 1))), g = zs.map(growth), k = g.findIndex((v) => v > 0);
     if (k < 0) return null;
     if (k === 0) return zLo;
-    return brent(growth, zs[k - 1], zs[k], 1e-4);
+    return brent(growth, zs[k - 1], zs[k], 1e-5);
   };
-  return { p: o, alg, f: (z) => (t, y) => alg(y, typeof z === 'function' ? z(t) : z).d, steady, linearise, poles, growth, critical, hc, A, dmdh, Kc, fz, zFloor: clamp(((o.wG + o.wL) / (Kc * Math.sqrt(o.rhoL * 300e5))) ** (1 / o.chokeExp), 0.02, 0.9) }; // zFloor: opening below which the choke alone would take more than about 300 bar
+  return { p: o, alg, f: (z) => (t, y) => alg(y, typeof z === 'function' ? z(t) : z).d, steady, linearise, poles, growth, period, critical, hc, A, dmdh, Kc, fz, zFloor: clamp(((o.wG + o.wL) / (Kc * Math.sqrt(o.rhoL * 300e5))) ** (1 / o.chokeExp), 0.02, 0.9) }; // zFloor: opening below which the choke alone would take more than about 300 bar
+}
+/**
+ * Parameters of the four-state riser model from data, after the procedure of the posted model files: the valve constant from one stable
+ * steady point (opening z0 with its measured top pressure), the two low-point orifice coefficients from the steady orifice equations at
+ * that point with the level at its nominal value (inlet and top pressure reproduced exactly), and then the level factor kH and the
+ * correction factors cG, cL on the orifice coefficients tuned so that the model loses stability at the measured critical opening with
+ * the measured period while the steady inlet pressure at z0 is kept.
+ * geo: slugModel parameters without kH, kG, kL, Kpc, aLp; data: { z0, Pin0, Prt0 (Pa), zCrit, period (s, optional) };
+ * opt: { kH (start, 0.7), tune: subset of ['kH', 'cG', 'cL'] (default all three with a period, else kH and cL) }.
+ * Returns { p (complete parameter set), kH, kG, kL, Kpc, cG, cL, aLp, check: { Pin0 (model), zCrit, period }, iterations }.
+ */
+export function fitSlugModel(geo, data, opt = {}) {
+  const g = { muG: 1.4e-5, Z: 1, dPv: 0, Vb: 0, chokeExp: 1, ...geo }, w = g.wG + g.wL, RTp = (g.Z * R * g.Tp) / g.mwG, RTr = (g.Z * R * g.Tr) / g.mwG;
+  const rgT = data.Prt0 / RTr, xL = g.wL / w, aLt = (xL * rgT) / (g.rhoL - xL * (g.rhoL - rgT)), rhoT = aLt * g.rhoL + (1 - aLt) * rgT, Kpc = w / (data.z0 ** g.chokeExp * Math.sqrt(rhoT * (data.Prt0 - g.Ps - g.dPv)));
+  const rg1 = data.Pin0 / RTp, aLp = (g.wL * rg1) / (g.wL * rg1 + g.wG * g.rhoL);
+  const build = (kH, cG, cL) => { // nominal coefficients by the relations of the posted parameter file (no-slip riser density at the mean of base and top pressure)
+    const m0 = slugModel({ ...g, kH, kG: 1, kL: 1, Kpc, aLp }), o = m0.p, Dr = o.Dr || o.D, Ar = (Math.PI * Dr * Dr) / 4, h = kH * m0.hc * aLp, AG = m0.A * (1 - h / m0.hc) ** 2, AL = m0.A - AG, usl = g.wL / (m0.A * g.rhoL);
+    const Re1 = ((aLp * g.rhoL + (1 - aLp) * rg1) * (usl + g.wG / (m0.A * rg1)) * o.D) / (aLp * o.muL + (1 - aLp) * o.muG), Fp = (0.5 * aLp * (0.0056 + 0.5 * Re1 ** -0.32) * g.rhoL * usl * usl * o.Lp) / o.D;
+    const rg2 = (0.5 * (data.Pin0 + g.rhoL * G * h - Fp + data.Prt0)) / RTr, a2 = (rg2 * g.wL) / (rg2 * g.wL + g.rhoL * g.wG), rm = rg2 * (1 - a2) + g.rhoL * a2, um = g.wL / (g.rhoL * Ar) + g.wG / (rg2 * Ar), Re2 = (rm * um * Dr) / (a2 * o.muL + (1 - a2) * o.muG), t = -1.8 * Math.log10((o.rough / Dr / 3.7) ** 1.11 + 6.9 / Re2);
+    const Prb = data.Prt0 + rm * G * o.Lr + (0.5 * rm * um * um * (o.Lr + o.Lh)) / (t * t * Dr), dPG = data.Pin0 - Fp - Prb;
+    if (!(dPG > 0)) return null;
+    return slugModel({ ...g, kH, kG: (cG * g.wG) / (AG * Math.sqrt(rg1 * dPG)), kL: (cL * g.wL) / (AL * Math.sqrt(g.rhoL * (dPG + g.rhoL * G * h))), Kpc, aLp });
+  };
+  const tune = opt.tune || (data.period > 0 ? ['kH', 'cG', 'cL'] : ['kH', 'cL']), x0 = { kH: opt.kH ?? 0.7, cG: 1, cL: 1 }, unpack = (x) => { const q = { ...x0 }; tune.forEach((k, i) => { q[k] = k === 'kH' ? clamp(x[i], 0.05, 1.6) : Math.exp(clamp(x[i], -2.5, 2.5)); }); return q; };
+  const res = (x) => {
+    const q = unpack(x), m = build(q.kH, q.cG, q.cL); if (!m) return [10, 10, 10];
+    try { const s = m.steady(data.z0), gr = m.growth(data.zCrit), T = m.period(data.zCrit), wRef = data.period > 0 ? (2 * Math.PI) / data.period : Math.abs(gr) + 1e-3; return [(100 * (s.Pp - data.Pin0)) / data.Pin0, gr / wRef, data.period > 0 ? (T === null ? 1 : T / data.period - 1) : 0]; } catch { return [10, 10, 10]; }
+  };
+  const fit = levenbergMarquardt(res, tune.map((k) => (k === 'kH' ? x0.kH : 0)), { maxIter: opt.maxIter ?? 40 }), q = unpack(fit.p), m = build(q.kH, q.cG, q.cL);
+  if (!m) throw new Error('The steady point leaves no pressure difference across the low point: check the inlet and top pressures.');
+  return { model: m, p: m.p, kH: q.kH, cG: q.cG, cL: q.cL, kG: m.p.kG, kL: m.p.kL, Kpc, aLp, check: { Pin0: m.steady(data.z0).Pp, growth: m.growth(data.zCrit), period: m.period(data.zCrit) }, residual: res(fit.p) };
 }
 
 // ---- PID, FOPDT identification and tuning rules -----------------------------------------------------------------
@@ -1296,16 +1485,8 @@ export function chemicalInventory(o) {
   }
   return { ...out, autonomy: q.use > 0 ? q.level0 / q.use : Infinity, tReorder: tRe, deliveries, minLevel: minL, runOut, used, delivered, short };
 }
-/**
- * Methanol vapour–aqueous K-value y/x (Moshfeghian's Wilson-type correlation fitted to data for −23…38 °C and 7…345 bar):
- * K = exp[5.37 (1 + ω*) (1 − 1/T*)] / P*, P* = P[psia]/35, T* = T[°R]/615, ω* = 2.95 − 0.02607 P* + 8.92828e-5 P*² − 0.851257/T*.
- */
-export function methanolK(Pbar, Tc) {
-  const Ps = (Pbar * 14.5038) / 35, Ts = ((Tc + KEL) * 1.8) / 615, w = 2.95 - 0.02607 * Ps + 8.92828e-5 * Ps * Ps - 0.851257 / Ts;
-  return Math.exp(5.37 * (1 + w) * (1 - 1 / Ts)) / Ps;
-}
-
 // ---- suite-level assembly -------------------------------------------------------------------------------------------
+const logspaceLocal = (a, b, n) => Array.from({ length: n }, (_, i) => a * (b / a) ** (i / (n - 1)));
 const STEEL = { k: 45, rho: 7850, cp: 470 };
 const INH_OPTS = ['MeOH', 'MEG', 'EtOH', 'DEG', 'TEG'];
 /** Resample a flow picture to n cells of equal arc length. */
@@ -1337,7 +1518,7 @@ function slugParams(st, fm, line, v, rate, base) {
   const avg = (key, idx) => mean(idx.map((i) => st[key][i])), Pp = avg('P', iF), Tp = avg('T', iF), Tr = iR.length ? avg('T', iR) : Tp, k0 = iF[iF.length - 1], pr = fm.at(st.P[k0], st.T[k0], rate), pf = fm.at(Pp, Tp, rate);
   // feed inclination: mean downward slope over the last fifth of the flowline (never flatter than 0.1°)
   const j0 = iF[Math.floor(0.8 * iF.length)], slope = Math.abs(st.z[k0] - st.z[j0]) / Math.max(st.s[k0] - st.s[j0], 1), zTop = st.z[st.n - 1] + 0.5 * st.dz[st.n - 1], zRb = interp1(st.S, st.zNodes, sRb);
-  return { D: Math.sqrt((4 * st.A) / Math.PI), Lp: sRb, Vp: st.A * sRb, Lr: Math.max(zTop - zRb, 5), Vr: st.A * (st.L - sRb + Math.max(v.topsideLen, 5)), theta: Math.max(slope, 1.75e-3), rhoL: pr.rhoL, mwG: pf.mwG / 1000, Z: pf.zG, Tp: Tp + KEL, Tr: Tr + KEL, muL: pr.muL,
+  return { D: Math.sqrt((4 * st.A) / Math.PI), Lp: sRb, Vp: st.A * sRb, Lr: Math.max(zTop - zRb, 5), Vr: st.A * (st.L - sRb + Math.max(v.topsideLen, 5)), theta: Math.max(slope, 1.75e-3), rhoL: pr.rhoL, mwG: pf.mwG / 1000, Z: pf.zG, Tp: Tp + KEL, Tr: Tr + KEL, muL: pr.muL, muG: isNum(pf.muG) && pf.muG > 0 ? pf.muG : 1.4e-5,
     wG: Math.max(pr.mG, 1e-3), wL: Math.max(pr.mO + pr.mW, 1e-3), Ps: v.sepP * 1e5, Cv: v.chokeCv, chokeExp: clamp(v.chokeExp, 0.3, 4), kH: v.kH, kL: v.kL, aLp: clamp(avg('holdup', iF), 0.08, 0.85), rhoGnom: pf.rhoG, rough: line.roughness, ...(base ? { kG: base.kG } : {}) };
 }
 /** Replay of an operating log through the quasi-steady surrogate with a first-order thermal lag; optional ridge residual correction. */
@@ -1438,16 +1619,37 @@ async function run(v0, ctx = {}) {
 
   // ---------- envelope scan (steady solutions over rate) — also feeds the ramp-up, pigging and optimisation ----------
   progress(0.22, 'Rate scan');
-  const scan = { q: [], pIn: [], tArr: [], margin: [], eros: [], qLiq: [], inv: [], vMean: [], zCrit: [], dpChoke: [], pReq: [], res: [] };
+  const scan = { q: [], pIn: [], tArr: [], margin: [], eros: [], qLiq: [], inv: [], vMean: [], zCrit: [], dpChoke: [], pReq: [], res: [], g1: [], ctlOk: [], dpCtl: [], zLift: [], g1Lift: [] };
+  const loopDead = v.deadTime + v.actDead, liftGas = v.liftType === 'gaslift' ? Math.max(v.liftGas, 0) : 0, boostDp = v.liftType === 'boost' ? Math.max(v.liftDp, 0) : 0;
+  // tie to the flow suite: when its minimum stable rate is linked, the level factor and the low-point liquid coefficient are tuned so that the
+  // riser model loses stability at that rate with the choke fully open (the bifurcation point of the higher-fidelity model)
+  let slugFit = null;
+  { const qT = num(v.turndown, 0);
+    if (v.slugFitFlow && qT > 0.05 && qT < 3) { try {
+      const rT = solve(qT), sT = buildStations(rT, Math.min(nSt, 30), A); sT.xNodes = rT.x; sT.zNodes = rT.z; const pkT = slugParams(sT, fm, line, v, qT), gOf = (kH, kL) => slugModel({ ...pkT, kH, kL }).growth(1);
+      for (const kH of [...new Set([v.kH, 0.55, 0.4, 0.3])].filter((x) => x <= v.kH + 1e-9)) {
+        const ks = logspaceLocal(0.01, Math.max(v.kL, 0.02), 9), gs = ks.map((k) => { try { return gOf(kH, k); } catch { return NaN; } }); let hit = -1; for (let i = ks.length - 1; i > 0; i--) if (gs[i] > 0 && gs[i - 1] < 0) { hit = i; break; }
+        if (gs[ks.length - 1] <= 0) { slugFit = { kH, kL: ks[ks.length - 1], rate: qT, changed: kH !== v.kH }; break; } // already consistent
+        if (hit > 0) { const kL = brent((k) => gOf(kH, k), ks[hit - 1], ks[hit], 1e-5); slugFit = { kH, kL, rate: qT, changed: true }; break; }
+      }
+      if (slugFit && slugFit.changed) { v.kH = slugFit.kH; v.kL = slugFit.kL; } else if (!slugFit) warnings.push({ level: 'info', msg: `The riser model could not be tuned to the flow suite's minimum stable rate (${(100 * qT).toFixed(0)} %): its own stability limit is used for the control study.` });
+    } catch { slugFit = null; } } }
   const sm0 = slugModel(slugParams(st, fm, line, v, rate)), Kc = 2.403e-5 * v.chokeCv, qEnv = linspace(v.qLoPct / 100, v.qHiPct / 100, nEnv), qPig = v.pigRatePct / 100;
   { const k = qEnv.reduce((b, q, i) => (Math.abs(q - qPig) < Math.abs(qEnv[b] - qPig) ? i : b), 0); if (k > 0 && k < nEnv - 1 && qPig > qEnv[k - 1] && qPig < qEnv[k + 1]) qEnv[k] = qPig; } // the pigging rate becomes one of the scan points
   for (let k = 0; k < nEnv; k++) {
     let r; try { r = solve(qEnv[k]); } catch { continue; }
     const n = r.P.length, s2 = buildStations(r, Math.min(nSt, 30), A); s2.xNodes = r.x; s2.zNodes = r.z;
-    let zc = null, dpc = 0;
-    try { const smk = slugModel(slugParams(s2, fm, line, v, qEnv[k], sm0.p)); zc = smk.critical(smk.zFloor, 1, 9); const zUse = zc === null ? 1 : Math.min(1, v.slugControl ? 2 * zc : 0.9 * zc), eq = smk.steady(zUse); dpc = (eq.Prt - smk.p.Ps) / 1e5; } catch { zc = null; }
+    let zc = null, dpc = 0, g1 = -1, ctlOk = true, dpCtl = 0, zL = null, g1L = -1;
+    try {
+      const pk = slugParams(s2, fm, line, v, qEnv[k], sm0.p), smk = slugModel(pk); zc = smk.critical(smk.zFloor, 1, 9); g1 = zc === null ? Math.min(smk.growth(1), -1e-12) : Math.max(smk.growth(1), 1e-12);
+      const zUse = zc === null ? 1 : Math.min(1, v.slugControl ? 2 * zc : 0.9 * zc), eq = smk.steady(zUse); dpc = (eq.Prt - smk.p.Ps) / 1e5;
+      // active control: is the equilibrium at twice the critical opening stabilised by a PI loop on the inlet pressure (linearised model, loop dead time included)?
+      if (zc !== null) { const zC = Math.min(1, 2 * zc); dpCtl = (smk.steady(zC).Prt - smk.p.Ps) / 1e5; ctlOk = zC <= zc || tuneByPoles(smk.linearise(zC), { tis: [1800, 5400], theta: loopDead + dtCtl, n: 9 }).decay > 0; }
+      // riser-base gas lift: the same line with the lift gas added to the gas inflow
+      if (liftGas > 0) { const sml = slugModel({ ...pk, wG: pk.wG + liftGas }); zL = sml.critical(sml.zFloor, 1, 9); g1L = zL === null ? Math.min(sml.growth(1), -1e-12) : Math.max(sml.growth(1), 1e-12); }
+    } catch { zc = null; }
     scan.q.push(qEnv[k]); scan.pIn.push(r.pIn); scan.tArr.push(r.tOut); scan.margin.push(-Math.max(...r.subcooling)); scan.eros.push(Math.max(...r.vm.map((x, i) => x / (122 / Math.sqrt(Math.max(r.rhoM[i], 1))))));
-    scan.qLiq.push(r.qL[n - 1] * 3600); scan.inv.push(r.liquidInventory * volScale); scan.vMean.push(r.length / r.residence); scan.zCrit.push(zc === null ? 1 : zc); scan.dpChoke.push(dpc); scan.pReq.push(r.pIn + dpc); scan.res.push(r);
+    scan.qLiq.push(r.qL[n - 1] * 3600); scan.inv.push(r.liquidInventory * volScale); scan.vMean.push(r.length / r.residence); scan.zCrit.push(zc === null ? 1 : zc); scan.dpChoke.push(dpc); scan.pReq.push(r.pIn + dpc); scan.res.push(r); scan.g1.push(g1); scan.ctlOk.push(ctlOk); scan.dpCtl.push(dpCtl); scan.zLift.push(zL === null ? 1 : zL); scan.g1Lift.push(g1L);
     if (k % 3 === 2) await tick();
   }
   need(scan.q.length >= 3, 'Fewer than three rates of the scan have a steady solution; widen the scan range or check the case data.');
@@ -1482,7 +1684,7 @@ async function run(v0, ctx = {}) {
   // step test at a stable opening → first-order-plus-dead-time model → tuning rules
   const zId = Math.max(zCrit === null ? 0.5 * zTarget : 0.6 * zCrit, sm0.zFloor), eqId = sm0.steady(zId), decay = Math.max(-sm0.growth(zId), 1e-5), tId = clamp(6 / decay, 0.5 * HOUR, 16 * HOUR), dz = 0.1 * zId;
   const stepRun = integrateStiff(sm0.f(zId + dz), eqId.y, 0, tId, { rtol: 1e-4, atol: 1e-3, hInit: 5, hMax: tId / 150, maxSteps: 4000 });
-  const loopDead = v.deadTime + v.actDead, stepY = stepRun.y.map((y) => sm0.alg(y, zId + dz).Pp / 1e5), fo = identifyFOPDT(stepRun.t, stepY, dz), foUse = { K: fo.K, tau: Math.max(fo.tau, 1), theta: Math.max(fo.theta, loopDead, dtCtl) };
+  const stepY = stepRun.y.map((y) => sm0.alg(y, zId + dz).Pp / 1e5), fo = identifyFOPDT(stepRun.t, stepY, dz), foUse = { K: fo.K, tau: Math.max(fo.tau, 1), theta: Math.max(fo.theta, loopDead, dtCtl) };
   const rules = tuningRules(foUse, v.tauCFactor === 1 ? undefined : v.tauCFactor * foUse.theta), gainRatio = kStat !== 0 ? fo.K / kStat : 1, pole = tuneByPoles(lin, { tis: v.ctlMode === 'P' ? [0] : [1800, 5400, 14400], theta: loopDead + dtCtl });
   // robust PI: largest integral gain with the sensitivity peak below the limit for every model of the uncertainty set (gain and dead time)
   const gU = clamp(v.robGainPct, 0, 90) / 100, dU = clamp(v.robDelayPct, 0, 300) / 100, fopdt = (K, th) => ({ k: K, lags: [foUse.tau], delay: th }), robSet = [fopdt(foUse.K, foUse.theta), fopdt(foUse.K * (1 + gU), foUse.theta * (1 + dU)), fopdt(foUse.K * (1 - gU), foUse.theta * (1 + dU)), fopdt(foUse.K * (1 + gU), foUse.theta)];
@@ -1555,10 +1757,16 @@ async function run(v0, ctx = {}) {
   const mLiqLine = so.liquidVol * volScale * so.rhoL, steelMass = STEEL.rho * Math.PI * ((id / 2 + wt) ** 2 - (id / 2) ** 2) * L, hBar = clamp(so.liquidVol / (A * L), 0, 0.95), mHcLine = mLiqLine * (1 - gB.wcut) + so.gasMass * volScale;
   const flashRate = (P, T) => { const pb = P / 1e5; if (pb < 1.2) return 0; return (mHcLine * Math.max(0, fm.at(pb * 0.97, T - KEL).wG - fm.at(pb, T - KEL).wG)) / (0.03 * P); };
   const twoPhase = v.bdMode === 'hem' || v.bdMode === 'hrm', relaxing = v.bdMode === 'hrm';
-  const bdCfg = { V: Math.max(so.gasVol * volScale, 1e-3), P0: pB * 1e5, T0: TgB + KEL, pBack: v.pBack * 1e5, area: (Math.PI * ((v.orificeMm / 1000) ** 2 + (bothEnds ? (v.orifice2Mm / 1000) ** 2 : 0))) / 4, cd: v.cdBlow, relax: relaxing ? (v.bdRelax > 0 ? v.bdRelax : 'dz') : 0, liqVol: so.liquidVol * volScale, k: v.kGas, mw: gB.mwG / 1000, Z: Zf, mode: 'wall', wallC: steelMass * STEEL.cp + mLiqLine * gB.cpL, wallUA: v.hGasWall * Math.PI * id * L * (1 - hBar), extUA: wall.uFlow * Math.PI * id * L, tAmb: mean(st.s.map((_, i) => tAmbOf(i))) + KEL, Tw0: TgB + KEL, pEnd: pEndB * 1e5, pMark: Math.max(pSafe - headBd, v.pBack * 1.02) * 1e5, n: ntBlow, jt: Math.max(gB.jtG, 0), flash: v.bdFlash || relaxing ? flashRate : null,
-    hem: twoPhase ? { mLiq: mLiqLine, rhoL: so.rhoL, frac: clamp(v.bdLiquidFrac / 100, 0, 0.9) } : null };
+  // gas of the line at the start of the blowdown (vapour of the case fluid at that state) on the kernel equation of state; stratified geometry of the settled liquid
   need(pB > v.pBack * 1.02, `The line pressure when the blowdown valve opens (${pB.toFixed(1)} bara) is not above the flare back-pressure (${v.pBack} bara).`);
-  const bd = blowdown(bdCfg), bdReached = bd.tEnd !== null, blowdownTime = (bd.tEnd ?? bd.t[bd.t.length - 1]) / HOUR, bdMinT = bd.minT - KEL, bdMinTw = bd.minTw - KEL, bdMinTd = bd.minTdown - KEL, bdEndP = bd.pFinal / 1e5, seabedPAfter = bdEndP + headBd;
+  const fK = makeFluid(fm.spec), flB = flashPT(fK, pB, TgB), gasB = realGas({ fluid: fK, x: flB.phase !== 'liquid' && Array.isArray(flB.y) ? flB.y : fK.z }), thW = hBar > 1e-4 ? brent((x) => x - Math.sin(x) - 2 * Math.PI * hBar, 0, 2 * Math.PI, 1e-10) : 0, wetFrac = thW / (2 * Math.PI), chord = id * Math.sin(thW / 2), aPipe = Math.PI * id * L * volScale;
+  const hGW = v.hGasWall > 0 ? v.hGasWall : filmNatural(gasB, pB * 1e5, TgB + KEL - 10, TgB + KEL, id).h, tAmbBd = mean(st.s.map((_, i) => tAmbOf(i))) + KEL;
+  const bdCfg = { V: Math.max(so.gasVol * volScale, 1e-3), P0: pB * 1e5, T0: TgB + KEL, pBack: v.pBack * 1e5, area: (Math.PI * ((v.orificeMm / 1000) ** 2 + (bothEnds ? (v.orifice2Mm / 1000) ** 2 : 0))) / 4, cd: v.cdBlow, relax: relaxing ? (v.bdRelax > 0 ? v.bdRelax : 'dz') : 0, liqVol: so.liquidVol * volScale, k: v.kGas, mw: gB.mwG / 1000, Z: Zf, mode: 'wall', wallC: steelMass * STEEL.cp + mLiqLine * gB.cpL, wallUA: hGW * aPipe * (1 - wetFrac), extUA: wall.uFlow * Math.PI * id * L, tAmb: tAmbBd, Tw0: TgB + KEL, pEnd: pEndB * 1e5, pMark: Math.max(pSafe - headBd, v.pBack * 1.02) * 1e5, n: ntBlow, jt: Math.max(gB.jtG, 0), flash: v.bdFlash || relaxing ? flashRate : null,
+    hem: twoPhase ? { mLiq: mLiqLine, rhoL: so.rhoL, frac: clamp(v.bdLiquidFrac / 100, 0, 0.9) } : null };
+  // gas-only discharge: real-gas energy balance with natural-convection film, conduction through wall and coatings and the settled liquid as its own zone;
+  // two-phase discharge keeps the lumped model (ω-method, optional relaxation)
+  const bd = twoPhase ? blowdown(bdCfg) : { unreleased: 0, theta: 0, liquidOut: 0, ...vesselBlowdown({ gas: gasB, V: bdCfg.V, P0: bdCfg.P0, T0: bdCfg.T0, pBack: bdCfg.pBack, area: bdCfg.area, cd: v.cdBlow, Lc: id, aIn: Math.max(aPipe * (1 - wetFrac), 1e-6), ri: id / 2, layers: wall.layers.map((l) => ({ t: l.t, k: l.k, rho: l.rho, cp: l.cp })), nw: 8, hOut: buried ? 1e4 : hSea, tAmb: tAmbBd, init: 'steady', hIn: v.hGasWall > 0 ? v.hGasWall : 'calc',
+    liquid: mLiqLine > 0 && wetFrac > 1e-3 ? { C: mLiqLine * gB.cpL, T0: TgB + KEL, aWet: aPipe * wetFrac, aInt: chord * L * volScale, hWet: v.hInShut } : null, source: v.bdFlash ? flashRate : null, n: ntBlow, pEnd: bdCfg.pEnd, pMark: bdCfg.pMark, jt: bdCfg.jt }) }, bdReached = bd.tEnd !== null, blowdownTime = (bd.tEnd ?? bd.t[bd.t.length - 1]) / HOUR, bdMinT = bd.minT - KEL, bdMinTw = bd.minTw - KEL, bdMinTd = bd.minTdown - KEL, bdEndP = bd.pFinal / 1e5, seabedPAfter = bdEndP + headBd;
   const safeBd = pSafe - headBd > v.pBack * 1.02 && (!bdReached || seabedPAfter <= pSafe * 1.001 || v.pBlowEnd <= 0), safeTopOnly = pSafe - headTop > v.pBack * 1.02, peakStd = (bd.peak / (gB.mwG / 1000)) * VM_STD * DAY / 1e6; // million Sm³/d
   await tick();
 
@@ -1605,7 +1813,16 @@ async function run(v0, ctx = {}) {
   const inhibitedSteady = v.dosingBasis !== 'shutdown' && doseWt > 0, waxByPig = !!v.waxByPigging && pigIv > 0, cons = [
     { key: 'margin', name: 'hydrate margin', type: 'min', limit: inhibitedSteady ? -1e3 : v.hydMargin, unit: '°C' }, { key: 'tArr', name: 'arrival temperature above WAT', type: 'min', limit: waxByPig ? -1e3 : v.wat + v.watMargin, unit: '°C' },
     { key: 'eros', name: 'erosional velocity', type: 'max', limit: 1, unit: '–' }, { key: 'pReq', name: 'inlet pressure (incl. slug-stabilising choke Δp)', type: 'max', limit: v.pAvail, unit: 'bara' }, { key: 'qLiq', name: 'separator liquid capacity', type: 'max', limit: v.qDrainM3h, unit: 'm³/h' }];
-  const turndown = num(v.turndown, 0); if (turndown > 0) { scan.qSelf = scan.q.slice(); cons.push({ key: 'qSelf', name: 'minimum stable rate (flow suite)', type: 'min', limit: turndown, unit: '–' }); }
+  // minimum stable rate of the riser: without control (fully open choke), with the choke loop (twice the critical opening, pressure permitting) and with riser-base gas lift or boosting
+  const nSc = scan.q.length, kOp = scan.q.reduce((bst, q, i) => (q <= rate + 1e-9 ? i : bst), 0), lowest = (ok) => { if (!ok(kOp)) return { q: null, k: -1, floor: false }; let k = kOp; while (k > 0 && ok(k - 1)) k--; return { q: scan.q[k], k, floor: k === 0 }; };
+  const cross = (arr, k) => (k > 0 && arr[k] < 0 && arr[k - 1] > 0 ? scan.q[k] - ((scan.q[k] - scan.q[k - 1]) * arr[k]) / (arr[k] - arr[k - 1]) : scan.q[Math.max(k, 0)]);
+  const stabUn = lowest((k) => scan.g1[k] < 0), qMinOwn = stabUn.q === null ? null : cross(scan.g1, stabUn.k), turndown = num(v.turndown, 0), qMinUncontrolled = turndown > 0 ? turndown : qMinOwn;
+  const pAvailCtl = v.pAvail + boostDp, okCtl = (k) => scan.g1[k] < 0 || (scan.ctlOk[k] && scan.pIn[k] + scan.dpCtl[k] <= pAvailCtl), stabCtl = lowest(okCtl), stabNoBoost = lowest((k) => scan.g1[k] < 0 || (scan.ctlOk[k] && scan.pIn[k] + scan.dpCtl[k] <= v.pAvail));
+  const stabLift = liftGas > 0 ? lowest((k) => scan.g1Lift[k] < 0) : { q: null, k: -1, floor: false }, qMinLift = stabLift.q === null ? null : cross(scan.g1Lift, stabLift.k), ctlAvail = !!v.slugControl && !sensorFailed;
+  const qMinControlled = ctlAvail ? stabCtl.q : null, ctlBackP = ctlAvail && stabCtl.k >= 0 ? scan.dpCtl[stabCtl.k] : null, ctlBackOp = unstable ? Math.max(0, (eqT.Prt - sm0.p.Ps) / 1e5) : 0, prodIx = Math.max(num(v.prodIndex, 0), 0);
+  const lossOf = (dp) => (prodIx > 0 && fm.rates.qOilStd > 0 ? clamp((prodIx * dp) / (fm.rates.qOilStd * Math.max(rate, 1e-9)), 0, 1) : null), qMinStable = qMinControlled ?? (liftGas > 0 && qMinLift !== null ? qMinLift : qMinUncontrolled);
+  if (qMinStable !== null && qMinStable > 0) { scan.qSelf = scan.q.slice(); cons.push({ key: 'qSelf', name: qMinControlled !== null ? 'minimum stable rate with the choke loop' : liftGas > 0 && qMinLift !== null ? 'minimum stable rate with gas lift' : turndown > 0 ? 'minimum stable rate (flow suite, no control)' : 'minimum stable rate (riser model, no control)', type: 'min', limit: qMinStable, unit: '–' }); }
+  const stabMethod = `Uncontrolled: ${turndown > 0 ? `transient screening of the flow suite (${(100 * turndown).toFixed(0)} % of the case rate); the four-state riser model gives ${qMinOwn === null ? 'no stable rate at a fully open choke in the scan' : (100 * qMinOwn).toFixed(0) + ' %'}` : 'lowest rate at which the four-state riser model is open-loop stable with the choke fully open'}. Controlled: lowest scanned rate at which a PI loop from the inlet pressure to the topside choke stabilises the linearised riser model at twice the critical opening (loop dead time ${(loopDead + dtCtl).toFixed(0)} s) with the inlet pressure including the choke inside the ${pAvailCtl.toFixed(0)} bara available${boostDp > 0 ? ` (${boostDp} bar of boosting included)` : ''}.${liftGas > 0 ? ` Gas lift: the same open-loop criterion with ${liftGas} kg/s of lift gas added at the riser base.` : ''}`;
   const env = operatingEnvelope(scan, cons, clamp(rate, qLo, qHi));
   if (waxByPig) env.text.push(`wax managed by pigging every ${pigIv} d (arrival may fall below the WAT)`);
   if (inhibitedSteady) env.text.push('hydrate margin provided by continuous inhibition');
@@ -1778,7 +1995,7 @@ async function run(v0, ctx = {}) {
   plots.push({ type: 'line', title: 'Warm-up after restart', xlabel: 'Time since restart (h)', ylabel: 'Temperature (°C)', series: [{ name: 'Arrival temperature', x: thin(tW), y: thin(warm.Tout) }, { name: 'Smallest margin to hydrate temperature + margin', x: thin(tW), y: thin(warm.Tmin), dash: true }], hlines: [{ y: 0, label: 'hydrate-safe' }], vlines: [{ x: restartTime, label: 'steady' }, ...(tSafe !== null ? [{ x: tSafe, label: 'hydrate-safe' }] : [])] });
   plots.push({ type: 'line', title: 'Liquid surge during ramp-up', xlabel: 'Time since restart (h)', ylabel: 'm³/h · m³', series: [{ name: 'Liquid arriving (m³/h)', x: thin(ramp.t.map((t) => t / HOUR)), y: thin(ramp.qOut.map((q) => q * 3600)) }, { name: 'Volume above drain capacity (m³)', x: thin(ramp.t.map((t) => t / HOUR)), y: thin(ramp.V) }, { name: 'Rate (% of case)', x: thin(ramp.t.map((t) => t / HOUR)), y: thin(ramp.q.map((q) => 100 * q)), dash: true }, { name: 'Liquid inventory in the line (m³ / 10)', x: thin(ramp.t.map((t) => t / HOUR)), y: thin(ramp.inventory.map((x) => x / 10)), dash: true }], hlines: [{ y: v.qDrainM3h, label: 'drain capacity' }, { y: surgeAllow, label: 'surge allowance' }] });
   plots.push({ type: 'line', title: 'Blowdown: pressure and flare rate', xlabel: 'Time since the valve opened (h)', ylabel: 'bara · kg/s', series: [{ name: 'Line pressure (bara)', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.P.map((p) => p / 1e5)) }, { name: 'Flare rate (kg/s)', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.mdot) }], hlines: [{ y: Math.max(pSafe - headBd, 0), label: 'hydrate-safe at the top' }] });
-  plots.push({ type: 'line', title: 'Blowdown: temperatures', xlabel: 'Time since the valve opened (h)', ylabel: 'Temperature (°C)', series: [{ name: 'Gas in the line', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.T.map((T) => T - KEL)) }, { name: 'Wall and liquid', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.Tw.map((T) => T - KEL)) }, { name: 'Downstream of the valve (Joule–Thomson)', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.T.map((T, i) => T - KEL - bdCfg.jt * Math.max(bd.P[i] - bdCfg.pBack, 0))), dash: true }], hlines: [{ y: v.tMinDesign, label: 'minimum design temperature' }] });
+  plots.push({ type: 'line', title: 'Blowdown: temperatures', xlabel: 'Time since the valve opened (h)', ylabel: 'Temperature (°C)', series: [{ name: 'Gas in the line', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.T.map((T) => T - KEL)) }, { name: twoPhase ? 'Wall and liquid' : 'Inner wall surface (dry part)', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.Tw.map((T) => T - KEL)) }, ...(bd.Tl ? [{ name: 'Settled liquid', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.Tl.map((T) => T - KEL)) }] : []), { name: 'Downstream of the valve (Joule–Thomson)', x: thin(bd.t.map((t) => t / HOUR)), y: thin(bd.T.map((T, i) => T - KEL - bdCfg.jt * Math.max(bd.P[i] - bdCfg.pBack, 0))), dash: true }], hlines: [{ y: v.tMinDesign, label: 'minimum design temperature' }] });
   plots.push({ type: 'line', title: 'Pig position and liquid pushed ahead', xlabel: 'Time since launch (h)', ylabel: 'km · m³', series: [{ name: 'Pig position (km)', x: thin(pig.t.map((t) => t / HOUR)), y: thin(pig.x.map(km)) }, { name: 'Liquid collected ahead (m³)', x: thin(pig.t.map((t) => t / HOUR)), y: thin(pig.slug) }], hlines: [{ y: catVol, label: 'slug-catcher volume' }], vlines: pig.tFront !== null ? [{ x: pig.tFront / HOUR, label: 'slug front arrives' }] : [] });
   if (waxMax > 0) plots.push({ type: 'line', title: 'Wax inventory in the line between pig runs', xlabel: 'Time (d)', ylabel: 'Deposit volume (m³)', zeroY: true, series: [{ name: 'Wax in the line', x: waxSeries.t, y: waxSeries.v }], note: `Deposit grows to ${v.waxThk} mm over the pigging interval on the length below the WAT; each run removes ${v.pigEff} %.` });
   if (pigVsRate.length > 1) plots.push({ type: 'line', title: 'Pig velocity and receiver surge against rate', xlabel: 'Rate (% of case)', ylabel: 'm/s · m³', series: [{ name: 'Mean pig velocity (m/s)', x: pigVsRate.map((p) => 100 * p.q), y: pigVsRate.map((p) => p.v), mode: 'both' }, { name: 'Surge above drain capacity (m³ / 10)', x: pigVsRate.map((p) => 100 * p.q), y: pigVsRate.map((p) => (p.surge * volScale) / 10), mode: 'both' }], hlines: [{ y: 5, label: 'upper pig velocity guide (5 m/s)' }] });
@@ -1831,6 +2048,13 @@ async function run(v0, ctx = {}) {
     ...(zCrit !== null ? [['Manual at 90 % of the critical opening (stable)', rd(90 * zCrit, 1), rd(sm0.steady(Math.max(0.9 * zCrit, sm0.zFloor)).Pp / 1e5, 1), 0, rd(clamp(v.levelSp, 10, 90), 0), 0]] : []),
     ...(nm ? [['Nonlinear MPC (state feedback, riser model only)', rd(100 * mean(nm.z.slice(-10)), 1), rd(mean(nm.pIn.slice(-10)), 1), rd(nm.amp, 2), '—', '—']] : [])],
     note: `Surge capacity ${catVol.toFixed(0)} m³ (${v.catcherAuto && catReq > v.slugCatcherVol ? 'sized by the design from ' + v.slugCatcherVol.toFixed(1) + ' m³ entered' : 'as entered'}; requirement ${catReq.toFixed(0)} m³ for a design surge of ${designSurge.toFixed(1)} m³ with ${(100 * usable).toFixed(0)} % usable). Loop-shaping check of the applied controller on the linearised riser with ${(loopDead + 0.5 * dtCtl).toFixed(0)} s dead time: Ms = ${loopLin.ms.toFixed(2)}, Mt = ${loopLin.mt.toFixed(2)}${linStable ? '' : ' (closed loop not stable: the peaks are not meaningful)'}; an open-loop unstable riser cannot reach the Ms of 1.2–2 usual for stable processes.${rob ? ` Robust PI on the step-test model: Kc ${(100 * rob.kc).toFixed(2)} %/bar, Ti ${rob.ti.toFixed(0)} s, worst-case Ms ${rob.worst.toFixed(2)} over gain ±${v.robGainPct} % and dead time +${v.robDelayPct} %.` : ''}${schedule ? ' Gain scheduling on the choke opening is active.' : ''}` });
+  tables.push({ title: 'Minimum stable rate and what each way of reaching it costs', columns: ['Way of operating', 'Minimum stable rate (% of case)', 'Cost in production terms', 'Basis'], rows: [
+    ['No active control, choke fully open', qMinUncontrolled === null ? `not stable at the operating rate (${(100 * rate).toFixed(0)} %)` : rd(100 * qMinUncontrolled, 0), 'none', turndown > 0 ? 'flow suite (transient screening)' : 'four-state riser model, open loop'],
+    ['Four-state riser model, open loop (for comparison)', qMinOwn === null ? `not stable at the operating rate (${(100 * rate).toFixed(0)} %)` : rd(100 * qMinOwn, 0), 'none', 'largest real part of the poles at 100 % opening'],
+    ['Active choke control (inlet pressure → choke)', qMinControlled === null ? (ctlAvail ? 'loop does not stabilise the operating rate' : 'not available') : `${stabCtl.floor ? '≤ ' : ''}${(100 * qMinControlled).toFixed(0)}`, ctlBackP === null ? '—' : `${ctlBackP.toFixed(1)} bar of back-pressure at that rate, ${ctlBackOp.toFixed(1)} bar at the operating rate${lossOf(ctlBackOp) === null ? '' : ` (up to ${(100 * lossOf(ctlBackOp)).toFixed(1)} % of the oil rate if the wells have no spare drawdown)`}`, `PI loop at twice the critical opening; inlet pressure with choke ≤ ${pAvailCtl.toFixed(0)} bara${stabCtl.floor ? '; limit is the scan floor' : ''}`],
+    ...(boostDp > 0 ? [['Active choke control without the boosting', stabNoBoost.q === null ? 'not stable at the operating rate' : `${stabNoBoost.floor ? '≤ ' : ''}${(100 * stabNoBoost.q).toFixed(0)}`, `boosting adds ${boostDp} bar${v.liftPower > 0 ? ` for ${v.liftPower.toFixed(0)} kW` : ''}`, 'same criterion with the pressure available without boosting']] : []),
+    ...(liftGas > 0 ? [['Riser-base gas lift, choke fully open', qMinLift === null ? 'not stable at the operating rate' : `${stabLift.floor ? '≤ ' : ''}${(100 * qMinLift).toFixed(0)}`, `${liftGas} kg/s of lift gas${v.liftPower > 0 ? `, ${v.liftPower.toFixed(0)} kW of compression` : ''}`, 'four-state riser model, open loop, lift gas added to the gas inflow']] : [])],
+    note: 'The uncontrolled value is what the flow suite reports as its minimum stable rate when it has been run; the controlled value is the one the operating window uses when active slug control is available. Rates are the scan points of the operating envelope: refine the scan to resolve the limits more finely.' });
   tables.push({ title: 'Rotating equipment: operating points, limits and control tests', columns: ['Item', 'Value', 'Limit', 'Unit', 'Status'], rows: [
     ['Compressor design flow / head', `${compQd.toFixed(3)} m³/s / ${(compHd / 1000).toFixed(1)} kJ/kg`, '—', '', compTbl.filter((r) => r.q > 0 && r.h > 0).length >= 3 ? 'map as entered' : compCurve.map && typeof NET.compressorMap === 'function' ? 'map from the network suite generator' : 'built-in fan-law map'],
     ['Compressor suction / discharge', `${v.sepP.toFixed(1)} bara, ${tSuc.toFixed(0)} °C → ${comp.design.pd.toFixed(1)} bara, ${comp.design.Td.toFixed(0)} °C`, '—', '', cooled ? `suction cooler ${coolerDuty.toFixed(0)} kW` : 'no suction cooler'],
@@ -1874,6 +2098,7 @@ async function run(v0, ctx = {}) {
   kpis.push({ label: 'Critical choke opening', value: zCrit === null ? 'stable' : rd(100 * zCrit, 1), unit: '%', status: stt(!unstable, slugSuppressed), help: 'Opening above which the riser limit cycle (severe slugging) starts in open loop.' });
   kpis.push({ label: 'Slugging amplitude under control', value: rd(pidRun.ampClosed, 2), unit: 'bar', status: stt(slugSuppressed, false), help: `Open loop at the same opening: ${pidRun.ampOpen.toFixed(1)} bar peak to peak.` });
   kpis.push({ label: 'Operating window', value: env.feasible ? `${(100 * env.qMin).toFixed(0)}–${(100 * env.qMax).toFixed(0)}` : 'none', unit: '% of case rate', status: stt(env.feasible && rate >= env.qMin && rate <= env.qMax, env.feasible) });
+  kpis.push({ label: 'Minimum stable rate (no control / choke loop)', value: `${qMinUncontrolled === null ? '> ' + (100 * rate).toFixed(0) : (100 * qMinUncontrolled).toFixed(0)} / ${qMinControlled === null ? '—' : (stabCtl.floor ? '≤ ' : '') + (100 * qMinControlled).toFixed(0)}`, unit: '% of case rate', status: stt(qMinStable !== null && qMinStable <= rate, qMinUncontrolled !== null || qMinControlled !== null), help: `${stabMethod}${ctlBackP !== null ? ` The choke costs ${ctlBackP.toFixed(1)} bar of back-pressure at the controlled minimum and ${ctlBackOp.toFixed(1)} bar at the operating rate.` : ''}` });
   kpis.push({ label: 'Uptime', value: rd(100 * uptime, 2), unit: '%', status: stt(uptime >= 0.95, uptime >= 0.9) });
   kpis.push({ label: 'Deferred production', value: rd(deferredVolume, 0), unit: 'Sm³/y', status: 'ok' });
 
@@ -1945,7 +2170,9 @@ async function run(v0, ctx = {}) {
     cooldownTime: rd(cooldownTime, 3), noTouchTime: rd(noTouch, 3), maxShutdown: rd(maxShutdown, 3), coldSpotX: rd(coldSpotX, 1), restartPressure: rd(restartPressure, 2), restartTime: rd(restartTime, 3),
     blowdownTime: rd(blowdownTime, 4), blowdownMinT: rd(Math.min(bdMinT, bdMinTd), 2), blowdownEndP: rd(bdEndP, 3), pigTransit: pigTransit === null ? null : rd(pigTransit, 3), pigSurge: rd(pigSurge, 2), pigDp: rd(pig.dpPig / 1e5, 3),
     inhibitorDose: rd(doseWt, 2), inhibitorRate: rd(inhibitorRate, 3), inhibitorCostPerDay: rd(inhCostDay, 0), heatingPower: rd(heatingPower, 1), uptime: rd(uptime, 5), deferredVolume: rd(deferredVolume, 0),
-    envelope: { qMin: env.feasible ? rd(env.qMin, 3) : null, qMax: env.feasible ? rd(env.qMax, 3) : null, limits: env.text.slice() }, controller: { kc: rd(100 * sel.kc, 4), ti: rd(sel.ti, 1), td: rd(sel.td, 2), mode: v.ctlMode, rule: sel.rule, unit: '% opening per bar, s, s' },
+    envelope: { qMin: env.feasible ? rd(env.qMin, 3) : null, qMax: env.feasible ? rd(env.qMax, 3) : null, limits: env.text.slice(),
+      qMinUncontrolled: qMinUncontrolled === null ? null : rd(qMinUncontrolled, 3), qMinControlled: qMinControlled === null ? null : rd(qMinControlled, 3), qMinGasLift: qMinLift === null ? null : rd(qMinLift, 3), qMinRiserModel: qMinOwn === null ? null : rd(qMinOwn, 3), qMinAtScanFloor: !!(qMinControlled !== null && stabCtl.floor), method: stabMethod,
+      cost: { chokeBackPressure: ctlBackP === null ? null : rd(ctlBackP, 2), chokeBackPressureAtOperatingRate: rd(ctlBackOp, 2), rateLossAtMinimum: ctlBackP === null ? null : (lossOf(ctlBackP) === null ? null : rd(lossOf(ctlBackP), 4)), rateLossAtOperatingRate: lossOf(ctlBackOp) === null ? null : rd(lossOf(ctlBackOp), 4), liftGas: liftGas > 0 ? rd(liftGas, 3) : null, liftPower: v.liftType !== 'none' && v.liftPower > 0 ? rd(v.liftPower, 1) : null, boostDp: boostDp > 0 ? rd(boostDp, 1) : null, unit: 'bar, fraction of the oil rate, kg/s, kW' } }, controller: { kc: rd(100 * sel.kc, 4), ti: rd(sel.ti, 1), td: rd(sel.td, 2), mode: v.ctlMode, rule: sel.rule, unit: '% opening per bar, s, s' },
     chokeOpening: rd(chokeOut, 1), slugSuppressed: !!slugSuppressed, alarms, eventsPerYear: { shutdowns: rd(shutdownsYr, 2), pigRuns: rd(pigRuns, 1), blowdowns: rd(blowdownsYr, 2) },
     // additional values
     cooldownReached: !neverCools, coldSpotT12: rd(cold12, 3), lumpedColdT12: rd(lumpedCold, 3), settleOutPressure: rd(so.pSettle, 2), watTime: tWat[iCold] === null ? null : rd(tWat[iCold], 2), hydrateSafeRestart: tSafe === null ? null : rd(tSafe, 2), rampTime: rampReq === null ? null : rd(rampReq, 2), rampSurge: rd(ramp.vMax, 2),
@@ -2043,7 +2270,7 @@ const INPUTS = [
     { key: 'bdRelax', label: 'Relaxation time of the gas liberation (0 = Downar-Zapolski correlation)', unit: 's', value: 0, min: 0, max: 1e5, showIf: (v) => v.bdMode === 'hrm' },
     { key: 'bdFlash', label: 'Include gas liberated from the oil', type: 'bool', value: true },
     { key: 'kGas', label: 'Isentropic exponent of the gas', unit: '–', value: 1.28, min: 1.05, max: 1.67 },
-    { key: 'hGasWall', label: 'Gas-to-wall film coefficient', unit: 'W/m²K', value: 25, min: 0, max: 1000 },
+    { key: 'hGasWall', label: 'Gas-to-wall film coefficient (0 = natural-convection correlation)', unit: 'W/m²K', value: 0, min: 0, max: 1000, help: 'With 0 the inner film follows Nu = 0.13 Ra^⅓ (0.59 Ra^¼ below Ra = 10⁹) on the bore, evaluated at the film temperature at every step.' },
     { key: 'tMinDesign', label: 'Minimum design metal temperature', unit: '°C', value: -29, min: -196, max: 20 },
   ] },
   { group: 'Pigging', tab: 'inputs', fields: [
@@ -2099,6 +2326,11 @@ const INPUTS = [
     { key: 'chokePct', label: 'Operating choke opening (0 = twice the critical opening)', unit: '%', value: 0, min: 0, max: 100 },
     { key: 'slugControl', label: 'Active slug control available', type: 'bool', value: true, help: 'Used in the envelope: with control the choke may run at twice the critical opening, without it at 90 % of it.' },
     sel('ctlMode', 'Controller', 'PI', ['P', 'PI', 'PID']),
+    sel('liftType', 'Riser-base gas lift or boosting (network suite)', 'none', [['none', 'None'], ['gaslift', 'Gas lift'], ['boost', 'Boosting']], 'Used for the minimum stable rate: lift gas is added to the gas inflow of the riser model; boosting adds its pressure rise to the pressure available for the stabilising choke.'),
+    { key: 'liftGas', label: 'Lift gas rate', unit: 'kg/s', value: 0, min: 0, max: 500, showIf: (v) => v.liftType === 'gaslift' },
+    { key: 'liftDp', label: 'Boosting pressure rise', unit: 'bar', value: 0, min: 0, max: 400, showIf: (v) => v.liftType === 'boost' },
+    { key: 'liftPower', label: 'Lift or boosting power', unit: 'kW', value: 0, min: 0, max: 1e6, showIf: (v) => v.liftType !== 'none' },
+    { key: 'prodIndex', label: 'Productivity index at the flowline inlet (0 = unknown)', unit: 'Sm³/d/bar', value: 0, min: 0, max: 1e6, help: 'Turns the back-pressure of the stabilising choke into a production loss (upper bound: wells with no spare drawdown).' },
     { key: 'ctlAuto', label: 'Slug controller in automatic', type: 'bool', value: true, help: 'Off: the choke is held in manual at 90 % of the critical opening (stable without feedback).' },
     sel('tuning', 'Tuning', 'auto', [['auto', 'Closed-loop pole search on the linearised model'], ['simc', 'SIMC from the step test (gain-scheduled)'], ['zn', 'Ziegler–Nichols from the step test (gain-scheduled)'], ['robust', 'Robust multi-model PI: sensitivity peak below the limit for the whole uncertainty set'], ['rls', 'Self-tuning: recursive least squares model + SIMC'], ['manual', 'Manual']]),
     sel('adaptive', 'Adaptive element', 'schedule', [['schedule', 'Gain scheduling on the choke opening'], ['none', 'Fixed gain']]),
@@ -2131,6 +2363,7 @@ const INPUTS = [
     { key: 'override', label: 'High separator level overrides the choke', type: 'bool', value: true },
     { key: 'feedForward', label: 'Feed-forward of the liquid inflow to the level valve', type: 'bool', value: false },
     { key: 'tCtl', label: 'Control simulation length', unit: 'h', value: 12, min: 1, max: 72 },
+    { key: 'slugFitFlow', label: 'Tune the riser model to the minimum stable rate of the flow suite when it is linked', type: 'bool', value: true, help: 'The level factor and the low-point liquid coefficient are adjusted so that the riser model loses stability at that rate with the choke fully open.' },
     { key: 'kL', label: 'Low-point liquid orifice coefficient', unit: '–', value: 0.3, min: 0.01, max: 2 },
     { key: 'kH', label: 'Level correction factor', unit: '–', value: 0.7, min: 0.1, max: 1.5 },
     { key: 'topsideLen', label: 'Topside piping upstream of the choke', unit: 'm', value: 150, min: 5, max: 2000 },
@@ -2473,52 +2706,132 @@ export const HS = {
   HS100: { f: (x) => (x[0] - 10) ** 2 + 5 * (x[1] - 12) ** 2 + x[2] ** 4 + 3 * (x[3] - 11) ** 2 + 10 * x[4] ** 6 + 7 * x[5] ** 2 + x[6] ** 4 - 4 * x[5] * x[6] - 10 * x[5] - 8 * x[6], ineq: [(x) => 127 - 2 * x[0] ** 2 - 3 * x[1] ** 4 - x[2] - 4 * x[3] ** 2 - 5 * x[4], (x) => 282 - 7 * x[0] - 3 * x[1] - 10 * x[2] ** 2 - x[3] + x[4], (x) => 196 - 23 * x[0] - x[1] ** 2 - 6 * x[5] ** 2 + 8 * x[6], (x) => -4 * x[0] ** 2 - x[1] ** 2 + 3 * x[0] * x[1] - 2 * x[2] ** 2 - 5 * x[5] + 11 * x[6]], x0: [1, 2, 0, 4, 0, 1, 1] },
 };
 const once = (fn) => { let r, done = false; return () => { if (!done) { r = fn(); done = true; } return r; }; };
-/** Blind prediction of the nitrogen vessel blowdown with the suite's blowdown model and its default gas-to-wall film coefficient (25 W/m²K). */
-const n2Run = once(() => {
-  const g = REF.n2.vessel, fl = makeFluid({ comp: { N2: 100 } }), Zc = new Map(), Zf = (P, T) => { const k = Math.round(P / 2e4) + ':' + Math.round(T); if (!Zc.has(k)) Zc.set(k, phaseProps(fl, [1], Math.max(P, 1e4) / 1e5, T - KEL, 'vapour').Z); return Zc.get(k); };
-  const V = (Math.PI / 4) * g.diameter ** 2 * g.length, Ain = Math.PI * g.diameter * g.length + (Math.PI / 2) * g.diameter ** 2, mSteel = g.rho * ((Math.PI / 4) * ((g.diameter + 2 * g.thickness) ** 2 - g.diameter ** 2) * g.length + (Math.PI / 2) * g.diameter ** 2 * g.thickness);
-  return blowdown({ V, P0: g.P0, T0: g.T0, pBack: g.pBack, area: (Math.PI / 4) * g.orifice ** 2, cd: g.cd, k: 1.4, mw: 0.028013, Z: Zf, mode: 'wall', wallC: mSteel * g.cp, wallUA: DEFAULTS.hGasWall * Ain, extUA: 5 * Ain, tAmb: g.tAmb, dt: 0.1, n: 1100, maxFactor: 1, pEnd: g.pBack * 1.0001 });
+const memoBy = (fn) => { const m = new Map(); return (k, ...a) => { const key = k + '|' + a.join('|'); if (!m.has(key)) m.set(key, fn(k, ...a)); return m.get(key); }; };
+/**
+ * One of the bundled vessel experiments with the blowdown engine of this suite (flat-ended vertical cylinder; wall conduction with 45 W/m/K).
+ * mode 'file': discharge coefficient of the cited input file with the orifice relation that file belongs to (ideal-gas k);
+ * mode 'fit': real-gas isentropic nozzle with the discharge coefficient identified from the pressure trace.
+ */
+const bdRun = memoBy((key, mode) => {
+  const c = REF.bd.cases[key], V = (Math.PI / 4) * c.D ** 2 * c.L, aIn = Math.PI * c.D * c.L + (Math.PI / 2) * c.D ** 2, wallVol = (Math.PI / 4) * ((c.D + 2 * c.t) ** 2 * (c.L + 2 * c.t) - c.D ** 2 * c.L);
+  return vesselBlowdown({ comp: c.comp, V, P0: c.P0, T0: c.T0, pBack: c.pBack, area: (Math.PI / 4) * c.d ** 2, cd: mode === 'fit' ? REF.bd.cdFit[key] : c.cd, nozzle: mode === 'fit' ? 'isentrope' : 'ideal-k', Lc: c.L, aIn, ri: c.D / 2, layers: [{ t: c.t, k: 45, rho: c.rho, cp: c.cp }], wallC: c.rho * c.cp * wallVol, hOut: c.hOut, tAmb: c.tAmb, dt: c.tEnd / 500, tEnd: c.tEnd, pEnd: c.pBack * 1.00001 });
 });
-const atTime = (b, arr, t) => interp1(b.t, arr, clamp(t, 0, b.t[b.t.length - 1]));
-/** Riser model with the published parameter set of the pipeline–riser test case: critical opening, period, steady state and slug-cycle extremes. */
-const riserRun = once(() => {
-  const o = REF.riser.olga, pNom = REF.riser.rows.find((r) => r.q === 'ssPin').value * 1e5, rg = (pNom * o.mwG) / (R * o.Tp), aLp = (rg * o.wL) / (rg * o.wL + o.rhoL * o.wG), sm = slugModel({ ...o, aLp }), zc = sm.critical(0.02, 1, 13);
-  const pl = sm.poles(0.05).filter((e) => Math.abs(e[1]) > 1e-9).sort((a, b) => b[0] - a[0])[0], e1 = sm.steady(1), f = sm.f(1), dt = 0.25, n = Math.round((1.5 * HOUR) / dt), mn = { Pp: 1e99, Prb: 1e99, Prt: 1e99, w: 1e99 }, mx = { Pp: 0, Prb: 0, Prt: 0, w: 0 };
-  let y = e1.y.map((x, i) => x * (i === 1 ? 1.05 : 1));
-  for (let k = 0; k < n; k++) { y = ros2Step(f, 0, y, dt).y.map((x) => Math.max(x, 1e-9)); if (k * dt > 0.75 * HOUR) { const a = sm.alg(y, 1); for (const q of ['Pp', 'Prb', 'Prt', 'w']) { mn[q] = Math.min(mn[q], a[q]); mx[q] = Math.max(mx[q], a[q]); } } }
-  // laboratory rig: flows from the stated volumetric rates (air taken at atmospheric conditions); the feed liquid fraction is made consistent with the model's own inlet pressure
-  const g = REF.riser.rig, wL = (g.qWaterLmin / 60000) * g.rhoL, wG = (g.qAirLmin / 60000) * ((g.PsAtm * 0.029) / (R * g.Tp));
-  let zr = null, pIn = 1.3 * g.PsAtm;
-  for (let it = 0; it < 4; it++) { const rgr = (pIn * g.mwG) / (R * g.Tp), sr = slugModel({ ...g, wL, wG, Ps: g.PsAtm, aLp: (rgr * wL) / (rgr * wL + g.rhoL * wG) }); zr = sr.critical(0.03, 1, 13); try { pIn = sr.steady(zr ?? 0.2).Pp; } catch { break; } }
-  return { zCrit: zc === null ? 100 : 100 * zc, period: pl ? (2 * Math.PI) / Math.abs(pl[1]) / 60 : 0, ssPin: e1.Pp / 1e5, ssPrb: e1.Prb / 1e5, ssPrt: e1.Prt / 1e5, minPin: mn.Pp / 1e5, minPrb: mn.Prb / 1e5, minPrt: mn.Prt / 1e5, minW: mn.w, maxPin: mx.Pp / 1e5, maxPrb: mx.Prb / 1e5, maxPrt: mx.Prt / 1e5, maxW: mx.w, zCritRig: zr === null ? 100 : 100 * zr };
+const bdAt = (key, mode, series, t) => { const b = bdRun(key, mode); return interp1(b.t, b[series], clamp(t, 0, b.t[b.t.length - 1])); };
+const BD_SERIES = { wall_inner: 'Tw', wall_outer: 'Two', wall_mean: 'Twm' }, BD_SENSOR = { gas_high: 'gas, upper', gas_low: 'gas, lower', gas_mean: 'gas, mean', wall_inner: 'wall, inner surface', wall_outer: 'wall, outer surface', wall_mean: 'wall, mean' };
+/** Pressure rows of the listed experiments; points below 2 % of the initial pressure are left out (their digitisation uncertainty exceeds a quarter of the value). */
+const bdRowsP = (keys) => keys.flatMap((k) => { const c = REF.bd.cases[k]; return c.P.filter(([t, P]) => t > 0 && P >= 0.02 * (c.P0 / 1e5)).map(([t, P]) => ({ key: k, test: c.label, t, P })); });
+const bdRowsT = (keys, pick) => keys.flatMap((k) => { const c = REF.bd.cases[k]; return Object.entries(c.T).filter(([s]) => pick(s)).flatMap(([s, pts]) => pts.filter(([t]) => t > 0).map(([t, T]) => ({ key: k, test: c.label, sensor: BD_SENSOR[s] || s, series: BD_SERIES[s] || 'T', t, T }))); });
+const bdRowsHd = (q) => Object.keys(REF.bd.cases).flatMap((k) => { const c = REF.bd.cases[k]; return c.hd.t.map((t, i) => ({ key: k, test: c.label, t, value: c.hd[q][i] })); });
+const BD_COLS_P = [{ key: 'test', label: 'Experiment' }, { key: 't', label: 'Time', unit: 's' }, { key: 'P', label: 'Measured pressure', unit: 'bar' }], BD_COLS_T = [{ key: 'test', label: 'Experiment' }, { key: 'sensor', label: 'Thermocouple' }, { key: 't', label: 'Time', unit: 's' }, { key: 'T', label: 'Measured temperature', unit: 'K' }];
+const BD_FILE_NOTE = 'Blind prediction with the vessel-blowdown engine (real-gas energy balance on the kernel Peng–Robinson equation, natural-convection film Nu = 0.13 Ra^⅓ on the vessel height with film-temperature properties, conduction through the wall). The discharge coefficient and the orifice relation are those of the cited input file (Yellow Book relation with the ideal-gas heat-capacity ratio): they are that file\'s assumptions, not measured values.';
+/** Limit cycle of the riser model at opening z: extremes of inlet, riser-base and top pressure and of the outlet rate over the second half of the run. */
+function riserCycle(sm, z, tEnd) {
+  const e = sm.steady(z), r = integrateStiff(sm.f(z), e.y.map((x, i) => x * (i === 1 ? 1.02 : 1)), 0, tEnd, { rtol: 1e-4, atol: 1e-9, hInit: tEnd / 1e5, hMax: tEnd / 1500, maxSteps: 200000 }), mn = { Pp: Infinity, Prb: Infinity, Prt: Infinity, w: Infinity }, mx = { Pp: 0, Prb: 0, Prt: 0, w: 0 };
+  for (let k = 0; k < r.t.length; k++) if (r.t[k] > 0.5 * tEnd) { const a = sm.alg(r.y[k], z); for (const q of ['Pp', 'Prb', 'Prt', 'w']) { mn[q] = Math.min(mn[q], a[q]); mx[q] = Math.max(mx[q], a[q]); } }
+  return { mn, mx, steady: e };
+}
+/** OLGA test case: parameters fitted to the steady point at 4 % opening and to the bifurcation point (5 %, 15.6 min); everything at 100 % opening is then predicted. */
+const riserOlga = once(() => {
+  const d = REF.riser.olga, fit = fitSlugModel(d.geo, d.fit, { kH: d.posted.kH }), c = riserCycle(fit.model, 1, 1.25 * HOUR), e = c.steady, b = 1e5;
+  return { fit, zCrit: 100 * (fit.model.critical(0.02, 1, 25) ?? 1), period: fit.model.period(d.fit.zCrit) / 60, ssPin: e.Pp / b, ssPrb: e.Prb / b, ssPrt: e.Prt / b, minPin: c.mn.Pp / b, minPrb: c.mn.Prb / b, minPrt: c.mn.Prt / b, minW: c.mn.w, maxPin: c.mx.Pp / b, maxPrb: c.mx.Prb / b, maxPrt: c.mx.Prt / b, maxW: c.mx.w };
 });
+/** NTNU small-scale rig: liquid orifice correction fitted to the steady point at 10 % opening and to the measured critical opening (15 %); the slugging pressures at larger openings are predicted. */
+const riserRig = once(() => { const d = REF.riser.rig, fit = fitSlugModel(d.geo, d.fit, { kH: d.posted.kH, tune: ['cL'] }); return { fit, zCrit: 100 * (fit.model.critical(0.03, 1, 25) ?? 1), at: memoBy((z) => { const c = riserCycle(fit.model, z / 100, 300); return { min: (c.mn.Pp - 101325) / 1e3, max: (c.mx.Pp - 101325) / 1e3, steady: (c.steady.Pp - 101325) / 1e3 }; }) }; });
+/** Rows and model of the code-to-code comparison with the independent Python solution of the same model equations. */
+const RISER_PY_ROWS = ['olga', 'rig'].flatMap((c) => { const P = REF.riser.py[c], lab = c === 'olga' ? 'OLGA case' : 'Small-scale rig', cyc = c === 'olga' ? [1] : [0.3];
+  return [...P.rows.map((r) => ({ c, system: lab, z: r.z, q: 'Pin', quantity: 'Steady inlet pressure (bar)', value: r.Pin })), { c, system: lab, z: 0, q: 'zCrit', quantity: 'Critical opening (%)', value: 100 * P.zCrit }, { c, system: lab, z: P.zCrit, q: 'period', quantity: 'Period at the critical opening (min)', value: P.periodMin },
+    ...P.rows.filter((r) => cyc.includes(r.z) && r.PinMin).flatMap((r) => [{ c, system: lab, z: r.z, q: 'PinMin', quantity: 'Slug cycle: minimum inlet pressure (bar)', value: r.PinMin }, { c, system: lab, z: r.z, q: 'PinMax', quantity: 'Slug cycle: maximum inlet pressure (bar)', value: r.PinMax }, { c, system: lab, z: r.z, q: 'wMax', quantity: 'Slug cycle: maximum outlet rate (kg/s)', value: r.wMax }])]; });
+const riserPy = memoBy((c, z, q) => {
+  const P = REF.riser.py[c], geo = REF.riser[c].geo, aOf = (zz) => interp1(P.rows.map((r) => r.z), P.rows.map((r) => r.aLp), zz), mk = (zz) => slugModel({ ...geo, kH: P.par.kH, kG: P.par.kG, kL: P.par.kL, Kpc: P.par.Kpc, aLp: aOf(zz) });
+  if (q === 'Pin') return mk(z).steady(z).Pp / 1e5;
+  if (q === 'zCrit') { const g = (zz) => mk(zz).growth(zz), zs = P.rows.map((r) => r.z), k = zs.findIndex((zz) => g(zz) > 0); return 100 * brent(g, zs[k - 1], zs[k], 1e-6); }
+  if (q === 'period') return mk(z).period(z) / 60;
+  const cy = riserCycle(mk(z), z, c === 'olga' ? 1.25 * HOUR : 300); return q === 'PinMin' ? cy.mn.Pp / 1e5 : q === 'PinMax' ? cy.mx.Pp / 1e5 : cy.mx.w;
+});
+/** Solid cylinder with surface convection through the cooldown solver: a bore of one thousandth of the radius holding a negligible fluid mass. */
+const cylRun = memoBy((Bi, Fo) => {
+  const a = 0.1, k = 1, rhoCp = 1e6, ri = 1e-4, h = (Bi * k) / a, tEnd = (Fo * a * a * rhoCp) / k, c = cooldown({ ri, layers: [{ t: a - ri, k, rho: 1000, cp: rhoCp / 1000 }], nr: 120, hIn: 1e5, hOut: h, T0: 1, tAmb: 0, cFluid: 1e-3, dt: tEnd / 400, nSteps: 400, theta: 0.5, init: 'uniform' }), N = c.cells.length, TN = c.cells[N - 1];
+  return { centre: c.Tf[400], surface: (TN * c.grid.G[N]) / (h * 2 * Math.PI * a) };
+});
+const lqRun = once(() => { const d = REF.bench.data.lq, Q = d.Q.map((q, i) => d.Q.map((_, j) => (i === j ? q : 0))), K = lqFinite(d.A, d.B, Q, [[d.R]], 600).K0[0], n = d.A.length;
+  const kf = kalman({ A: d.A, C: d.C, Q: d.Qn.map((q, i) => d.Qn.map((_, j) => (i === j ? q : 0))), R: d.Rn.map((q, i) => d.Rn.map((_, j) => (i === j ? q : 0))), x0: new Array(n).fill(0), P0: eye(n) }, null, Array.from({ length: 600 }, () => [0, 0]));
+  const Acl = d.A.map((r, i) => r.map((v, j) => v - d.B[i][0] * K[j])); return { K, L: mm(d.A, kf.K), poles: eig(Acl).map((e) => Math.hypot(e[0], e[1])).sort((x, y) => x - y) }; });
+const LQ_ROWS = (() => { const d = REF.bench.data.lq; return [...d.K[0].map((v, j) => ({ q: 'K', i: 0, j, quantity: `LQR gain K[${j + 1}]`, value: v })), ...d.L.flatMap((r, i) => r.map((v, j) => ({ q: 'L', i, j, quantity: `Kalman predictor gain L[${i + 1}][${j + 1}]`, value: v }))), ...d.clPoles.map((v, i) => ({ q: 'poles', i, j: 0, quantity: `Closed-loop pole magnitude ${i + 1}`, value: v }))]; })();
+const stepRun = memoBy((kind) => { const d = REF.bench.data.step; return pidLoop({ K: d.K, tau: d.tau, theta: d.theta, kc: d.kc, ti: d.ti, td: 0, dt: 0.005, tEnd: 40, sp: kind === 'sp' ? 1 : 0, ...(kind === 'sp' ? {} : { dist: () => 1 }) }); });
 /** Travelling front of the advection–dispersion solver far from the inlet: C/C0 against ξ = (x − U t)/(2 √(D t)). */
 const frontRun = once(() => { const U = 1, D = 5, f = inhibitorFront({ U, L: 12000, D, n: 600, tEnd: 6000, rows: 2 }), i = f.t.length - 1; return { U, D, t: f.t[i], xc: f.xc, c: f.c[i] }; });
 const hsRun = new Map();
+const BD_ALL = Object.keys(REF.bd.cases), HYD = ['b7', 'b8', 'b9', 'wf'];
 const VALIDATION = [
+  { id: 'haque-n2-blowdown-pressure', title: 'Nitrogen vessel blowdown from 150 bara: pressure against time (experiment I1)', quantity: 'Pressure', unit: 'bar', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_P, rows: bdRowsP(['n2']), target: 'P', model: (r) => bdAt(r.key, 'file', 'P', r.t) / 1e5, tolerance: {},
+    note: BD_FILE_NOTE + ' NOTE_N2P' },
+  { id: 'haque-n2-blowdown-gas-temperature', title: 'Nitrogen vessel blowdown from 150 bara: gas temperature (upper and lower thermocouples)', quantity: 'Gas temperature', unit: 'K', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_T, rows: bdRowsT(['n2'], (s) => s.startsWith('gas')), target: 'T', model: (r) => bdAt(r.key, 'file', r.series, r.t), tolerance: {},
+    note: 'Same run as the pressure set. The model has one bulk gas temperature; the experiment shows 20–30 K of stratification between the two thermocouples, so half of that spread is the floor of this comparison. NOTE_N2T' },
+  { id: 'haque-n2-blowdown-wall-temperature', title: 'Nitrogen vessel blowdown from 150 bara: inner and outer wall surface temperature', quantity: 'Wall temperature', unit: 'K', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_T, rows: bdRowsT(['n2'], (s) => s.startsWith('wall')), target: 'T', model: (r) => bdAt(r.key, 'file', r.series, r.t), tolerance: {},
+    note: 'Same run. The wall is resolved by one-dimensional conduction (eight cells, 45 W/m/K assumed for the steel: the cited file gives only density and heat capacity). NOTE_N2W' },
+  { id: 'hydrocarbon-blowdown-pressure', title: 'Hydrocarbon vessel blowdowns from 120 bara (methane–ethane and methane–ethane–propane): pressure', quantity: 'Pressure', unit: 'bar', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_P, rows: bdRowsP(['ng', 's9']), target: 'P', model: (r) => bdAt(r.key, 'file', 'P', r.t) / 1e5, tolerance: {},
+    note: BD_FILE_NOTE + ' NOTE_HCP' },
+  { id: 'hydrocarbon-blowdown-temperature', title: 'Hydrocarbon vessel blowdowns from 120 bara: gas and wall temperature', quantity: 'Temperature', unit: 'K', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_T, rows: bdRowsT(['ng', 's9'], () => true), target: 'T', model: (r) => bdAt(r.key, 'file', r.series, r.t), tolerance: {},
+    note: 'Same runs as the pressure set. The gas is treated as single-phase: in the propane-bearing experiment S9 some liquid condenses below about 260 K, whose latent heat this model does not release (the gas is predicted 2 K colder than by a code with a phase-equilibrium flash). NOTE_HCT' },
+  { id: 'hydrogen-blowdown-pressure', title: 'Hydrogen cylinder discharges from 100–138 bara (three runs of Byrnes et al.; Woodfield et al.): pressure', quantity: 'Pressure', unit: 'bar', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_P, rows: bdRowsP(HYD), target: 'P', model: (r) => bdAt(r.key, 'file', 'P', r.t) / 1e5, tolerance: {},
+    note: BD_FILE_NOTE + ' Hydrogen is not a kernel component: critical constants and ideal-gas heat capacity from CoolProp, volume shift and transport factors fitted to its reference values (see the provenance list). NOTE_H2P' },
+  { id: 'hydrogen-blowdown-temperature', title: 'Hydrogen cylinder discharges: gas and wall temperature', quantity: 'Temperature', unit: 'K', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_T, rows: bdRowsT(HYD, () => true), target: 'T', model: (r) => bdAt(r.key, 'file', r.series, r.t), tolerance: {},
+    note: 'Same runs as the pressure set. NOTE_H2T' },
+  { id: 'blowdown-gas-temperature-identified-cd', title: 'Gas temperature of the seven vessel blowdowns with the discharge coefficient identified from each pressure trace', quantity: 'Gas temperature', unit: 'K', kind: 'experiment', source: REF.bd.source,
+    columns: BD_COLS_T, rows: bdRowsT(BD_ALL, (s) => s.startsWith('gas')), target: 'T', model: (r) => bdAt(r.key, 'fit', 'T', r.t), tolerance: {},
+    note: `One parameter per experiment is identified, not predicted: the discharge coefficient, by least squares on the measured pressure trace with the real-gas isentropic nozzle of this suite (${BD_ALL.map((k) => `${REF.bd.cases[k].file.replace('.yml', '')} ${REF.bd.cdFit[k]}`).join(', ')}; the cited files assume ${BD_ALL.map((k) => REF.bd.cases[k].cd).join(', ')}). The temperatures were not used in that fit, so this set tests the thermal model (film coefficient, wall conduction, real-gas expansion) with the mass flow taken from the measurement. NOTE_FIT` },
+  { id: 'hyddown-blowdown-pressure', title: 'Vessel blowdown against the HydDown package: pressure of seven cases at nine times', quantity: 'Pressure', unit: 'bar', kind: 'benchmark', source: REF.bd.benchSource,
+    columns: [{ key: 'test', label: 'Case' }, { key: 't', label: 'Time', unit: 's' }, { key: 'value', label: 'HydDown pressure', unit: 'bar' }], rows: bdRowsHd('P').filter((r) => r.value >= 0.02 * (REF.bd.cases[r.key].P0 / 1e5)), target: 'value', model: (r) => bdAt(r.key, 'file', 'P', r.t) / 1e5, tolerance: {},
+    note: 'Code-to-code: the same input files run with HydDown (reference-quality Helmholtz equations of CoolProp, lumped wall) and with this suite (Peng–Robinson with volume shift, conduction through the wall), both with the natural-convection film and the orifice relation of the files. NOTE_HDP' },
+  { id: 'hyddown-blowdown-gas-temperature', title: 'Vessel blowdown against the HydDown package: gas temperature of seven cases at nine times', quantity: 'Gas temperature', unit: 'K', kind: 'benchmark', source: REF.bd.benchSource,
+    columns: [{ key: 'test', label: 'Case' }, { key: 't', label: 'Time', unit: 's' }, { key: 'value', label: 'HydDown gas temperature', unit: 'K' }], rows: bdRowsHd('Tg'), target: 'value', model: (r) => bdAt(r.key, 'file', 'T', r.t), tolerance: {},
+    note: 'Same runs as the pressure benchmark. NOTE_HDT' },
+  { id: 'jahanshahi-riser-olga', title: 'Pipeline–riser slugging test case at 100 % valve opening: steady state and slug-cycle extremes (OLGA reference values)', quantity: 'Mixed quantities (see rows)', unit: 'as listed', kind: 'benchmark', source: REF.riser.olgaSource,
+    columns: [{ key: 'quantity', label: 'Quantity' }, { key: 'unit', label: 'Unit' }, { key: 'value', label: 'OLGA reference value' }], rows: REF.riser.olga.rows, target: 'value',
+    model: (r) => riserOlga()[r.q], tolerance: {},
+    note: 'NOTE_OLGA' },
+  { id: 'ntnu-rig-riser-slugging', title: 'NTNU small-scale riser rig: measured inlet pressure of the slug cycle and of the stabilised flow against valve opening', quantity: 'Inlet pressure', unit: 'kPa gauge', kind: 'experiment', source: REF.riser.rigSource,
+    columns: [{ key: 'z', label: 'Valve opening', unit: '%' }, { key: 'q', label: 'Minimum / maximum of the oscillation, or stabilised (steady) value' }, { key: 'value', label: 'Measured inlet pressure', unit: 'kPa gauge' }], rows: REF.riser.rig.rows, target: 'value',
+    model: (r) => riserRig().at(r.z)[r.q], tolerance: {},
+    note: 'NOTE_RIG' },
+  { id: 'riser-model-scipy', title: 'Four-state riser model against an independent Python (scipy) solution of the same equations', quantity: 'Mixed quantities (see rows)', unit: 'as listed', kind: 'benchmark', source: REF.riser.pySource,
+    columns: [{ key: 'system', label: 'System' }, { key: 'z', label: 'Valve opening (fraction)' }, { key: 'quantity', label: 'Quantity' }, { key: 'value', label: 'scipy value' }], rows: RISER_PY_ROWS, target: 'value',
+    model: (r) => riserPy(r.c, r.z, r.q), tolerance: {},
+    note: 'Equilibria, stability limit, period and limit-cycle extremes of both systems with the coefficients of the posted parameter files. The Python solution uses nested Brent root finding, numpy eigenvalues and LSODA (rtol 1e-8); this suite uses its own Brent solver, Durand–Kerner eigenvalues and an adaptive Rosenbrock integrator (rtol 1e-4). NOTE_RPY' },
+  { id: 'conduction-cylinder-series', title: 'Cooldown solver against the Bessel-series solution of a convectively cooled solid cylinder', quantity: '(T − Ta)/(T0 − Ta)', unit: '–', kind: 'benchmark', source: REF.bench.source,
+    columns: [{ key: 'Bi', label: 'Biot number h a/k' }, { key: 'Fo', label: 'Fourier number α t/a²' }, { key: 'where', label: 'Position' }, { key: 'theta', label: 'Series value' }], rows: REF.bench.data.cylinder, target: 'theta',
+    model: (r) => cylRun(r.Bi, r.Fo)[r.where], tolerance: {},
+    note: 'Radial finite-volume conduction (120 cells, Crank–Nicolson, 400 steps) with a bore of one thousandth of the radius, against the series of Carslaw & Jaeger summed in scipy. NOTE_CYL' },
+  { id: 'loop-shaping-python-control', title: 'Sensitivity peaks and stability margins of fifteen PI / PID loops against python-control', quantity: 'Ms, Mt, gain margin, phase margin (°)', unit: 'as listed', kind: 'benchmark', source: REF.bench.source,
+    columns: [{ key: 'case', label: 'Process and controller' }, { key: 'kc', label: 'Kc' }, { key: 'ti', label: 'τI' }, { key: 'td', label: 'τD (ideal form, N = 10)' }, { key: 'q', label: 'Quantity' }, { key: 'value', label: 'python-control value' }], rows: REF.bench.data.loops, target: 'value',
+    model: (r) => loopAnalysis({ k: r.k, lags: r.lags, zeros: r.zeros, ints: r.ints, delay: r.delay }, { kc: r.kc, ti: r.ti, td: r.td, N: 10 }, { n: 2400 })[r.q === 'Ms' ? 'ms' : r.q === 'Mt' ? 'mt' : r.q], tolerance: {},
+    note: 'Loop-analysis routine (logarithmic frequency scan with golden-section refinement of the peaks) against the exact frequency response evaluated with python-control and numpy. SIMC settings computed from the rule; the other settings are arbitrary test values. NOTE_LOOP' },
+  { id: 'lq-kalman-python-control', title: 'Discrete LQR gain, steady Kalman gain and closed-loop poles against python-control (dlqr, dlqe)', quantity: 'Gains and pole magnitudes', unit: '–', kind: 'benchmark', source: REF.bench.source,
+    columns: [{ key: 'quantity', label: 'Quantity' }, { key: 'value', label: 'python-control value' }], rows: LQ_ROWS, target: 'value',
+    model: (r) => (r.q === 'K' ? lqRun().K[r.j] : r.q === 'L' ? lqRun().L[r.i][r.j] : lqRun().poles[r.i]), tolerance: {},
+    note: 'Three-state, one-input, two-output test system. This suite: Riccati recursion over 600 steps (lqFinite) and the gain of the Kalman filter after 600 updates; python-control: algebraic Riccati solutions. NOTE_LQ' },
+  { id: 'closed-loop-step-python-control', title: 'Closed-loop set-point and disturbance step of PI on a first-order process with delay against python-control', quantity: 'Controlled variable', unit: '–', kind: 'benchmark', source: REF.bench.source,
+    columns: [{ key: 'kind', label: 'Step' }, { key: 't', label: 'Time' }, { key: 'y', label: 'python-control value' }], rows: [...REF.bench.data.step.rows.map((r) => ({ kind: 'set-point', k: 'sp', ...r })), ...REF.bench.data.dist.map((r) => ({ kind: 'input disturbance', k: 'dist', ...r }))].filter((r) => Math.abs(r.y) > 0.02), target: 'y',
+    model: (r) => { const s = stepRun(r.k); return interp1(s.t, s.y, Math.max(r.t - (r.k === 'dist' ? REF.bench.data.step.theta : 0), 0)); }, tolerance: {},
+    note: 'K = 2, τ = 10, θ = 1.5 with the SIMC PI settings. This suite: discrete PID (5 ms sample) with the exact delay; python-control: continuous loop with a 12th-order Padé approximant of the delay. Rows with |y| below 0.02 are left out (the Padé approximant rings there). NOTE_STEP' },
   { id: REF.simc.id, title: REF.simc.title, quantity: 'Ms', unit: '–', kind: 'benchmark', source: REF.simc.source,
     columns: [{ key: 'id', label: 'Case' }, { key: 'process', label: 'Process' }, { key: 'kc', label: 'Kc' }, { key: 'ti', label: 'τI' }, { key: 'td', label: 'τD (series form)' }, { key: 'Ms', label: 'Published Ms' }],
     rows: REF.simc.rows, target: 'Ms',
     model: (r) => loopAnalysis({ k: r.k, lags: r.lags, zeros: r.zeros, ints: r.ints, delay: r.delay }, r.ki ? { ki: r.ki } : { kc: r.kc, ti: r.ti, td: r.td, form: 'series' }, { n: 2400 }).ms,
-    tolerance: { mape: 1.5, maxAbs: 0.06 },
-    note: 'Sensitivity peaks recomputed by the loop-analysis routine (frequency scan of the published process and controller) against the published values, which are printed to two decimals. Process E5 is entered as printed (smallest time constant 0.0008); the half-rule approximation printed in the same row corresponds to 0.008, with which the PID case gives Ms 1.83. Achieved: mean error 0.5 %, largest 0.04.' },
-  { id: REF.n2.idP, title: 'Nitrogen vessel blowdown from 150 bara: pressure against time (experiment I1)', quantity: 'Pressure', unit: 'bara', kind: 'experiment', source: REF.n2.source,
-    columns: [{ key: 't', label: 'Time', unit: 's' }, { key: 'P', label: 'Measured pressure', unit: 'bara' }], rows: REF.n2.pressure, target: 'P',
-    model: (r) => atTime(n2Run(), n2Run().P, r.t) / 1e5, tolerance: { mape: 25, bias: 4 },
-    note: 'Blind prediction with the lumped blowdown model (real-gas Z from the kernel equation of state, k = 1.4, discharge coefficient 0.8 from the cited input file, wall heat sink with the suite default film coefficient of 25 W/m²K). The model empties the vessel too fast: within 3 % for the first 10 s, then 10–28 % low from 15 s onwards (mean error 18 %), probably because the fixed film coefficient under-states the natural convection in dense cold nitrogen and the measured gas stays warmer. The tolerance states that miss; it is not a design-accuracy claim.' },
-  { id: REF.n2.idT, title: 'Nitrogen vessel blowdown from 150 bara: gas temperature (upper and lower thermocouples)', quantity: 'Gas temperature', unit: 'K', kind: 'experiment', source: REF.n2.source,
-    columns: [{ key: 't', label: 'Time', unit: 's' }, { key: 'sensor', label: 'Thermocouple' }, { key: 'T', label: 'Measured temperature', unit: 'K' }], rows: REF.n2.temperature, target: 'T',
-    model: (r) => atTime(n2Run(), n2Run().T, r.t), tolerance: { mape: 12, bias: 30 },
-    note: 'The model has one bulk gas temperature; the experiment shows 20–30 K of stratification between the two thermocouples. The predicted minimum is 15–35 K colder than the measured range (conservative for minimum-metal-temperature screening), for the same reason as the pressure miss.' },
-  { id: REF.riser.id, title: 'Pipeline–riser slugging test case: stability limit, period and slug-cycle extremes (OLGA reference values; rig experiment)', quantity: 'Mixed quantities (see rows)', unit: 'as listed', kind: 'benchmark', source: REF.riser.source,
-    columns: [{ key: 'quantity', label: 'Quantity' }, { key: 'unit', label: 'Unit' }, { key: 'value', label: 'Reference value' }], rows: REF.riser.rows, target: 'value',
-    model: (r) => riserRun()[r.q], tolerance: { mape: 40 },
-    note: 'The four-state riser model run with the published parameter set (orifice coefficients, level factor and valve constant of the cited authors; friction and feed liquid fraction by their relations). The first thirteen rows are OLGA simulation values, the last is the measured critical opening of the laboratory rig. For the OLGA case the critical opening (4.6 against 5 %), the period, the steady state and the pressure extremes agree within 12 %. Three rows are missed and dominate the mean error: the minimum outlet rate (0 against 0.79 kg/s), the maximum outlet rate (about 70 % too high; the published model itself reports 68 % and 32 % on these two) and the rig, where the model with the published rig parameters gives 35 % against the measured 15 % (the basis of the stated air rate and the rig valve characteristic are not given in the source). The model is therefore suited to locating the stability limit of a tuned case, not to predicting slug flow peaks.' },
-  { id: REF.hs.id, title: 'Hock–Schittkowski constrained test problems: optimal objective values', quantity: 'f*', unit: '–', kind: 'benchmark', source: REF.hs.source,
-    columns: [{ key: 'problem', label: 'Problem' }, { key: 'n', label: 'Variables' }, { key: 'm', label: 'Constraints' }, { key: 'fStar', label: 'Best known objective' }], rows: REF.hs.rows, target: 'fStar',
+    tolerance: { mape: 1, maxAbs: 0.03 },
+    note: 'Sensitivity peaks recomputed by the loop-analysis routine against twelve published values (printed to two decimals). The larger set of loops is covered by the python-control benchmark.' },
+  { id: REF.hs.id, title: 'Hock–Schittkowski constrained test problems: optimal objective values against scipy (SLSQP)', quantity: 'f*', unit: '–', kind: 'benchmark', source: REF.hs.source,
+    columns: [{ key: 'problem', label: 'Problem' }, { key: 'n', label: 'Variables' }, { key: 'm', label: 'Constraints' }, { key: 'fStar', label: 'scipy optimum' }], rows: REF.hs.rows, target: 'fStar',
     model: (r) => { if (!hsRun.has(r.problem)) { const p = HS[r.problem]; hsRun.set(r.problem, sqp(p.f, p.x0, { eq: p.eq || [], ineq: p.ineq || [], lo: p.lo, hi: p.hi }).f); } return hsRun.get(r.problem); },
     tolerance: { mape: 0.01, maxAbs: 1e-3 },
-    note: 'The SQP solver started from the standard starting points with finite-difference derivatives. All thirteen optima are reproduced to five significant figures or better.' },
+    note: 'The SQP solver of this suite started from the standard starting points with finite-difference derivatives, against the optima found independently with scipy. All thirteen agree to five significant figures or better.' },
   { id: REF.erfc.id, title: 'Advection–dispersion front against the tabulated complementary error function', quantity: 'erfc ξ = 2 C/C0', unit: '–', kind: 'benchmark', source: REF.erfc.source,
     columns: [{ key: 'xi', label: 'ξ = (x − U t) / (2 √(D t))' }, { key: 'erfc', label: 'Tabulated erfc ξ' }], rows: REF.erfc.rows, target: 'erfc',
     model: (r) => { const f = frontRun(); return 2 * interp1(f.xc, f.c, f.U * f.t + 2 * r.xi * Math.sqrt(f.D * f.t)); }, tolerance: { mape: 3, maxAbs: 0.01 },
@@ -2608,6 +2921,10 @@ const suite = {
     offer('depRateMmD', s.waxRate, 'Solids suite: wax deposition rate', isNum(s.waxRate) && s.waxRate >= 0 && s.waxRate <= 50);
     offer('burial', n.burial, 'Network suite: burial depth', isNum(n.burial) && n.burial >= 0);
     offer('tSeabed', n.tSeabed, 'Network suite: seabed temperature'); offer('tSurface', n.tSeaSurface, 'Network suite: sea-surface temperature');
+    { const lf = n.lift || {}, ty = lf.type === 'gaslift' || lf.type === 'gas lift' ? 'gaslift' : lf.type === 'boost' ? 'boost' : lf.type === 'none' ? 'none' : null;
+      if (ty) items.push({ key: 'liftType', value: ty, from: 'Network suite: artificial lift' });
+      offer('liftGas', lf.gasMass, 'Network suite: lift gas rate', ty === 'gaslift' && isNum(lf.gasMass) && lf.gasMass >= 0 && lf.gasMass <= 500); offer('liftDp', lf.dp, 'Network suite: boosting pressure rise', ty === 'boost' && isNum(lf.dp) && lf.dp >= 0 && lf.dp <= 400); offer('liftPower', lf.power, 'Network suite: lift power', !!ty && ty !== 'none' && isNum(lf.power) && lf.power >= 0 && lf.power <= 1e6); }
+    offer('prodIndex', n.ipr?.pi, 'Network suite: productivity index', isNum(n.ipr?.pi) && n.ipr.pi > 0 && n.ipr.pi <= 1e6);
     offer('slugSurge', f.slug?.surge, 'Flow suite: slug surge volume', isNum(f.slug?.surge) && f.slug.surge >= 0);
     if (typeof f.severeSlugging === 'boolean') items.push({ key: 'severeSlugging', value: f.severeSlugging, from: 'Flow suite: severe slugging' });
     offer('turndown', f.turndownRate, 'Flow suite: minimum stable rate', isNum(f.turndownRate) && f.turndownRate >= 0 && f.turndownRate <= 1);
